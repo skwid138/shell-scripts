@@ -1,0 +1,59 @@
+# Dependabot config — keeps CI workflow actions and bats test
+# submodules current with minimal noise.
+#
+# Why these two ecosystems:
+#   - github-actions: catches deprecations like gitleaks-action's
+#     Node.js 20 warning surfaced in CI run 25139023922 (April 2026).
+#     PRs land on Mondays so they batch into the weekly review cadence.
+#   - gitsubmodule: tracks bats-core, bats-support, bats-assert in
+#     tests/test_helper/. Quarterly is plenty — bats moves slowly and
+#     a stale submodule is never a security risk, just a missing
+#     feature/bug-fix opportunity.
+#
+# Why no `npm`, `pip`, `docker`, etc: this repo has no such
+# dependencies. shellcheck/shfmt/gitleaks are installed by the runner
+# (apt/brew), not pinned here.
+#
+# Reviewers/assignees omitted: solo-maintainer repo, PRs come straight
+# to the default reviewer.
+
+version: 2
+updates:
+  # GitHub Actions used in .github/workflows/ci.yml
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "ci"
+    groups:
+      # Batch all minor/patch action bumps into one PR to cut review noise.
+      # Major bumps still come as individual PRs (potential breaking changes).
+      actions-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # bats-core / bats-support / bats-assert under tests/test_helper/
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "test"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "tests"
