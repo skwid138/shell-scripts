@@ -47,12 +47,30 @@ FETCH_COMMITS=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --owner) OWNER="$2"; shift 2 ;;
-    --repo) REPO="$2"; shift 2 ;;
-    --pr) PR_NUMBER="$2"; shift 2 ;;
-    --no-diff) FETCH_DIFF=0; shift ;;
-    --no-commits) FETCH_COMMITS=0; shift ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --owner)
+      OWNER="$2"
+      shift 2
+      ;;
+    --repo)
+      REPO="$2"
+      shift 2
+      ;;
+    --pr)
+      PR_NUMBER="$2"
+      shift 2
+      ;;
+    --no-diff)
+      FETCH_DIFF=0
+      shift
+      ;;
+    --no-commits)
+      FETCH_COMMITS=0
+      shift
+      ;;
     *)
       if [[ -z "$PR_NUMBER" ]]; then
         _parse_pr_ref "$1"
@@ -80,8 +98,8 @@ fi
 REPO_SLUG="${OWNER}/${REPO}"
 
 # --- Verify PR exists ---
-gh pr view "$PR_NUMBER" --repo "$REPO_SLUG" --json number,title >/dev/null 2>&1 \
-  || die "Could not access PR #${PR_NUMBER} in ${REPO_SLUG}. Verify it exists and you have access."
+gh pr view "$PR_NUMBER" --repo "$REPO_SLUG" --json number,title >/dev/null 2>&1 ||
+  die "Could not access PR #${PR_NUMBER} in ${REPO_SLUG}. Verify it exists and you have access."
 
 # --- Fetch metadata ---
 info "Fetching PR #${PR_NUMBER} from ${REPO_SLUG}..."

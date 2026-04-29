@@ -29,10 +29,10 @@ EOF
 
 # --- Project key lookup ---
 declare -A PROJECT_KEYS=(
-  [client-portal]="wpromote_client-portal"
+  [client - portal]="wpromote_client-portal"
   [kraken]="wpromote_kraken"
-  [polaris-api]="wpromote_polaris-api"
-  [polaris-web]="wpromote_polaris-web"
+  [polaris - api]="wpromote_polaris-api"
+  [polaris - web]="wpromote_polaris-web"
 )
 
 SEVERITY_ORDER=("BLOCKER" "CRITICAL" "MAJOR" "MINOR" "INFO")
@@ -56,10 +56,22 @@ FORMAT="json"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --project) PROJECT="$2"; shift 2 ;;
-    --severity) SEVERITY_FLOOR="${2^^}"; shift 2 ;;
-    --format) FORMAT="$2"; shift 2 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --project)
+      PROJECT="$2"
+      shift 2
+      ;;
+    --severity)
+      SEVERITY_FLOOR="${2^^}"
+      shift 2
+      ;;
+    --format)
+      FORMAT="$2"
+      shift 2
+      ;;
     *)
       if [[ "$1" =~ ^[0-9]+$ && -z "$PR_NUMBER" ]]; then
         PR_NUMBER="$1"
@@ -95,7 +107,7 @@ if sonar_check="$(gh pr checks "$PR_NUMBER" --json name,status,conclusion 2>/dev
     case "$sonar_line" in
       "completed success"*) ci_status="passed" ;;
       "completed failure"*) ci_status="failed" ;;
-      *"in_progress"*|*"queued"*) ci_status="running" ;;
+      *"in_progress"* | *"queued"*) ci_status="running" ;;
       *) ci_status="completed" ;;
     esac
   else
@@ -109,8 +121,8 @@ info "Fetching SonarCloud issues for ${PROJECT} PR #${PR_NUMBER}..."
 all_issues="[]"
 page=1
 while true; do
-  result="$(sonar list issues -p "$PROJECT" --pull-request "$PR_NUMBER" --format json --page "$page" 2>&1)" \
-    || die "sonar CLI failed: $result"
+  result="$(sonar list issues -p "$PROJECT" --pull-request "$PR_NUMBER" --format json --page "$page" 2>&1)" ||
+    die "sonar CLI failed: $result"
 
   issues="$(echo "$result" | jq '.issues // []')"
   all_issues="$(echo "$all_issues $issues" | jq -s '.[0] + .[1]')"

@@ -15,7 +15,7 @@ if [ -n "$ZSH_VERSION" ]; then
     SCRIPTS_DIR="$HOME/code/scripts/shell"
   fi
 elif [ -n "$BASH_VERSION" ]; then
-  SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+  SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 else
   SCRIPTS_DIR="$HOME/code/scripts/shell"
 fi

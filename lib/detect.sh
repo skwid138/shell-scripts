@@ -59,9 +59,9 @@ detect_pr_number() {
   # Disambiguate by inspecting stderr.
   local stderr_content
   stderr_content="$(cat "$stderr_file")"
-  if [[ "$stderr_content" == *"no pull requests found"* ]] \
-    || [[ "$stderr_content" == *"no PR found"* ]] \
-    || [[ "$stderr_content" == *"no open pull request"* ]]; then
+  if [[ "$stderr_content" == *"no pull requests found"* ]] ||
+    [[ "$stderr_content" == *"no PR found"* ]] ||
+    [[ "$stderr_content" == *"no open pull request"* ]]; then
     return 1
   fi
 

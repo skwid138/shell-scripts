@@ -2,12 +2,12 @@
 
 ## Count all files including hidden in a given directory
 countf() {
-    ls -lAR "$1" | grep '^-' | wc -l
+  ls -lAR "$1" | grep '^-' | wc -l
 }
 
 ## Count all non-hidden files in a given directory
 countf_a() {
-    ls -lR \$1 | grep '^-' | wc -l
+  ls -lR \$1 | grep '^-' | wc -l
 }
 
 ## Debug key codes
@@ -23,7 +23,7 @@ key_debug() {
 ## Example: clipflip input.mov output.mp4
 # The first argument is the input file, and the second argument is the output file
 clipflip() {
-    local input="$1"
-    local output="$2"
-    ffmpeg -i "$input" -c:v libx264 -c:a aac "$output"
+  local input="$1"
+  local output="$2"
+  ffmpeg -i "$input" -c:v libx264 -c:a aac "$output"
 }

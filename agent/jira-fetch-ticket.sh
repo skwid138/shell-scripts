@@ -41,12 +41,32 @@ FETCH_JSON_FIELDS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --all) FETCH_COMMENTS=1; FETCH_LINKS=1; FETCH_ATTACHMENTS=1; shift ;;
-    --comments) FETCH_COMMENTS=1; shift ;;
-    --links) FETCH_LINKS=1; shift ;;
-    --attachments) FETCH_ATTACHMENTS=1; shift ;;
-    --json-fields) FETCH_JSON_FIELDS=1; shift ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --all)
+      FETCH_COMMENTS=1
+      FETCH_LINKS=1
+      FETCH_ATTACHMENTS=1
+      shift
+      ;;
+    --comments)
+      FETCH_COMMENTS=1
+      shift
+      ;;
+    --links)
+      FETCH_LINKS=1
+      shift
+      ;;
+    --attachments)
+      FETCH_ATTACHMENTS=1
+      shift
+      ;;
+    --json-fields)
+      FETCH_JSON_FIELDS=1
+      shift
+      ;;
     *)
       if [[ -z "$TICKET_ID" && "$1" =~ ^[A-Za-z]+-[0-9]+$ ]]; then
         TICKET_ID="${1^^}"
@@ -75,8 +95,8 @@ require_auth "acli" "acli auth status" "acli auth login"
 info "Fetching ${TICKET_ID}..."
 
 # Plain text view for readable description
-plain_view="$(acli jira workitem view "$TICKET_ID" 2>&1)" \
-  || die "Failed to fetch ${TICKET_ID}: $plain_view"
+plain_view="$(acli jira workitem view "$TICKET_ID" 2>&1)" ||
+  die "Failed to fetch ${TICKET_ID}: $plain_view"
 
 # Extract description (everything after the header fields)
 description="$(echo "$plain_view" | sed -n '/^Description:/,$ p' | tail -n +2)"

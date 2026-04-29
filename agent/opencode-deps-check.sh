@@ -148,15 +148,27 @@ FORMAT="human"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --human) FORMAT="human"; shift ;;
-    --json) FORMAT="json"; shift ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --human)
+      FORMAT="human"
+      shift
+      ;;
+    --json)
+      FORMAT="json"
+      shift
+      ;;
     --config-dir)
       [[ $# -ge 2 ]] || die "--config-dir requires an argument"
       OPENCODE_CONFIG_DIR="$2"
       shift 2
       ;;
-    --) shift; break ;;
+    --)
+      shift
+      break
+      ;;
     -*)
       die "Unknown option: $1 (try --help)"
       ;;
@@ -168,13 +180,13 @@ done
 
 # --- Preflight: required commands ---
 require_cmd "node" "Install Node 24+ (recommended via nvm: nvm install --lts)"
-require_cmd "npm"  "npm ships with Node.js — reinstall Node if missing"
-require_cmd "jq"   "Install: brew install jq"
+require_cmd "npm" "npm ships with Node.js — reinstall Node if missing"
+require_cmd "jq" "Install: brew install jq"
 require_cmd "perl" "perl ships with macOS — if missing, install via brew"
 
 # --- Preflight: paths ---
-[[ -d "$OPENCODE_CONFIG_DIR" ]] \
-  || die "OpenCode config dir not found: $OPENCODE_CONFIG_DIR"
+[[ -d "$OPENCODE_CONFIG_DIR" ]] ||
+  die "OpenCode config dir not found: $OPENCODE_CONFIG_DIR"
 
 PKG_JSON="$OPENCODE_CONFIG_DIR/package.json"
 OC_JSON="$OPENCODE_CONFIG_DIR/opencode.json"
@@ -186,8 +198,8 @@ fi
 
 # Validate package.json JSON early
 if [[ -f "$PKG_JSON" ]]; then
-  jq empty "$PKG_JSON" 2>/dev/null \
-    || die "package.json is not valid JSON: $PKG_JSON"
+  jq empty "$PKG_JSON" 2>/dev/null ||
+    die "package.json is not valid JSON: $PKG_JSON"
 fi
 
 # Validate opencode.json JSONC (after stripping comments)
@@ -308,7 +320,7 @@ while IFS=$'\t' read -r name version location; do
     '{package: $pkg, current: $current, latest: $latest, outdated: $outdated, unpinned: $unpinned, location: $location}')"
 
   results_json="$(jq --argjson e "$entry" '. + [$e]' <<<"$results_json")"
-done <<< "$entries"
+done <<<"$entries"
 
 # Warn (to stderr) if any registry lookups failed — does not affect exit code.
 if [[ "$lookup_failures" -gt 0 ]]; then
@@ -373,8 +385,8 @@ jq -r '.deps[] |
   case "$status" in
     OUTDATED) color="${YELLOW}" ;;
     UNPINNED) color="${RED}" ;;
-    UNKNOWN)  color="${YELLOW}" ;;
-    ok)       color="${GREEN}" ;;
+    UNKNOWN) color="${YELLOW}" ;;
+    ok) color="${GREEN}" ;;
   esac
   printf "%-40s %-12s %-12s %b%-10s%b %s\n" "$pkg" "$cur" "$lat" "$color" "$status" "${NC}" "$loc"
 done

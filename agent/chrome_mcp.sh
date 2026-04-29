@@ -81,10 +81,10 @@ matching_instance_running() {
   local port_flag="--remote-debugging-port=${PORT}"
   local profile_flag="--user-data-dir=${USER_DATA_DIR}"
 
-  ps ax -o command= \
-    | grep -F -- "$port_flag" \
-    | grep -F -- "$profile_flag" \
-    >/dev/null 2>&1
+  ps ax -o command= |
+    grep -F -- "$port_flag" |
+    grep -F -- "$profile_flag" \
+      >/dev/null 2>&1
 }
 
 open_url_in_new_tab_applescript() {
@@ -107,56 +107,56 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -F|--foreground)
+    -F | --foreground)
       MODE="foreground"
       shift
       ;;
-    -D|--detached)
+    -D | --detached)
       MODE="detached"
       shift
       ;;
-    -v|--verbose)
+    -v | --verbose)
       VERBOSE=1
       shift
       ;;
-    -U|--url)
+    -U | --url)
       [[ $# -ge 2 ]] || die_usage "Missing value for $1"
       URL="$2"
       shift 2
       ;;
-    -C|--check)
+    -C | --check)
       if matching_instance_running; then
         exit 0
       else
         exit 1
       fi
       ;;
-    -K|--kill)
+    -K | --kill)
       pkill -f "remote-debugging-port=${PORT}" 2>/dev/null || true
       info "Killed Chrome on port ${PORT}"
       exit 0
       ;;
-    -T|--new-tab)
+    -T | --new-tab)
       [[ "$OPEN_TARGET" == "window" ]] && die_usage "Cannot use --new-tab and --new-window together"
       OPEN_TARGET="tab"
       shift
       ;;
-    -W|--new-window)
+    -W | --new-window)
       [[ "$OPEN_TARGET" == "tab" ]] && die_usage "Cannot use --new-tab and --new-window together"
       OPEN_TARGET="window"
       shift
       ;;
-    -p|--port)
+    -p | --port)
       [[ $# -ge 2 ]] || die_usage "Missing value for $1"
       PORT="$2"
       shift 2
       ;;
-    -u|--user-data-dir)
+    -u | --user-data-dir)
       [[ $# -ge 2 ]] || die_usage "Missing value for $1"
       USER_DATA_DIR="$2"
       shift 2
       ;;
-    -h|--help)
+    -h | --help)
       usage
       exit 0
       ;;

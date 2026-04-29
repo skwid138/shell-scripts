@@ -26,8 +26,8 @@ fi
 require_auth "gh" "gh auth status" "gh auth login"
 
 if [[ "${1:-}" == "--json" ]]; then
-  gh pr view --json number,url,headRefName,baseRefName 2>/dev/null \
-    || die "No open PR found for current branch '$(detect_branch)'"
+  gh pr view --json number,url,headRefName,baseRefName 2>/dev/null ||
+    die "No open PR found for current branch '$(detect_branch)'"
 else
   detect_pr_number || die "No open PR found for current branch '$(detect_branch)'"
 fi

@@ -2,7 +2,7 @@
 
 # Homebrew zsh completions (Apple Silicon path)
 if [[ -d "/opt/homebrew/share/zsh/site-functions" ]] && [[ ":$FPATH:" != *":/opt/homebrew/share/zsh/site-functions:"* ]]; then
-    FPATH="/opt/homebrew/share/zsh/site-functions:${FPATH}"
+  FPATH="/opt/homebrew/share/zsh/site-functions:${FPATH}"
 fi
 
 # Case-insensitive completion
@@ -44,9 +44,9 @@ clear_message_and_self_insert() {
 zle -N clear_message_and_self_insert
 
 # Add fn+left/right shortcuts with reminder to use native shortcuts
-bindkey '^[[H' beginning_of_line_with_reminder  # fn+left arrow 
-bindkey '^[[F' end_of_line_with_reminder        # fn+right arrow
+bindkey '^[[H' beginning_of_line_with_reminder # fn+left arrow
+bindkey '^[[F' end_of_line_with_reminder       # fn+right arrow
 
 # Word navigation with Ctrl+Shift+F and Ctrl+Shift+B (Native equivilant (option + b or option + f))
-bindkey '^[[102;6u' forward-word    # Ctrl+Shift+F (forward one word)
-bindkey '^[[98;6u' backward-word    # Ctrl+Shift+B (backward one word)
+bindkey '^[[102;6u' forward-word # Ctrl+Shift+F (forward one word)
+bindkey '^[[98;6u' backward-word # Ctrl+Shift+B (backward one word)
