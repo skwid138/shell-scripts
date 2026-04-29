@@ -18,8 +18,7 @@ SHELL-LAYER-PLAN.md
 .vscode/
 
 # Test artifacts
-tests/test_helper/bats-core/
-tests/test_helper/bats-support/
-tests/test_helper/bats-assert/
+# Bats test helpers are tracked as git submodules (see .gitmodules).
+# Do not gitignore tests/test_helper/* — keep submodule pointers committed.
 # (Kept as git submodules — actual tracking happens via .gitmodules; this entry
 #  is a safety net in case they're ever cloned without --recurse-submodules.)
