@@ -21,6 +21,7 @@ follow [`../docs/ADDING-A-SCRIPT.md`](../docs/ADDING-A-SCRIPT.md).
 | [`gh-pr-comments.sh`](gh-pr-comments.sh) | Fetch all review comments, threads, reviews, and review metadata for a PR via gh's GraphQL API. Handles large diff hunks via `--rawfile`. | `gh-fetch-pr-comments` skill |
 | [`jira-fetch-ticket.sh`](jira-fetch-ticket.sh) | Fetch a Jira ticket (description, AC, comments, links, attachments) via `acli`. Multiple output modes: full / summary / fields-only. | `jira-ticket`, `jira-enhance`, `ticket-plan` skills |
 | [`opencode-deps-check.sh`](opencode-deps-check.sh) | Audit `~/.config/opencode/opencode.json` for outdated or unpinned MCP-server / plugin / agent dependencies. | `update-opencode-deps` command |
+| [`scripts-doctor.sh`](scripts-doctor.sh) | Health-check this repo (and the private wpro-shell mirror) against project conventions: required tooling, CI workflow, per-script `--help` / strict-mode / lib-source / bats coverage. Text and JSON output. | `scripts-doctor` slash command |
 | [`sonar-pr-issues.sh`](sonar-pr-issues.sh) | Fetch SonarCloud issues for a PR, classified by severity and impact. Includes CI-status rollup via `gh-pr-checks-summary.sh`. | `sonarcloud` skill |
 
 ## Common invocation pattern
