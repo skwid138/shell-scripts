@@ -16,11 +16,24 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install shellcheck and shfmt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          # shfmt: install latest binary release directly (apt version often stale)
+          SHFMT_VERSION="3.13.1"
+          curl -fsSL -o /tmp/shfmt \
+            "https://github.com/mvdan/sh/releases/download/v$SHFMT_VERSION/shfmt_v${SHFMT_VERSION}_linux_amd64"
+          chmod +x /tmp/shfmt
+          sudo mv /tmp/shfmt /usr/local/bin/shfmt
+          shellcheck --version
+          shfmt --version
 
       - name: Lint (errors only)
         run: make lint-strict
+
+      - name: Format check
+        run: make fmt-check
 
       - name: Run tests
         run: make test
