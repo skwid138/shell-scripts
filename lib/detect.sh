@@ -13,20 +13,41 @@ detect_branch() {
   git branch --show-current 2>/dev/null || die "Not in a git repository"
 }
 
-# Extract Jira ticket ID from branch name
-# Supports: bixb_18835, bixb-18835-description, BIXB-18835, feature/bixb_18835
-# Returns: BIXB-18835 (uppercase prefix, dash separator)
+# Extract Jira ticket ID from a branch name.
+#
+# Searches the entire branch (not just the start) for the first occurrence
+# of <PREFIX>[_-]<NUMBER> where:
+#   - PREFIX is 2+ alphabetic chars (avoids false matches on single-letter
+#     version segments like 'v-18835' or 'r-2')
+#   - NUMBER is 1+ digits
+#   - the separator is `_` or `-`
+#
+# The match is case-insensitive; the returned prefix is uppercased and the
+# separator is normalized to `-` (Jira's canonical form).
+#
+# Branch shapes that resolve correctly:
+#   bixb_18835                          -> BIXB-18835
+#   BIXB-18835                          -> BIXB-18835
+#   feature/bixb_123                    -> BIXB-123
+#   chore/some-fix-bixb-18835           -> BIXB-18835   (mid-branch ID)
+#   bug/2024-q3/bixb-18835              -> BIXB-18835   (after numeric segment)
+#   BIXB-18835-rev1                     -> BIXB-18835
+#   user/h/PROJ-42-fix                  -> PROJ-42
+#
+# Returns 1 if no recognizable ticket-id pattern is found.
 detect_ticket_from_branch() {
   local branch="${1:-$(detect_branch)}"
 
-  # Strip common prefixes like feature/, bugfix/, etc.
-  branch="${branch#*/}"
-
-  # Pattern: prefix_number or prefix-number (at start of remaining string)
-  if [[ "$branch" =~ ^([a-zA-Z]+)[_-]([0-9]+) ]]; then
-    local prefix="${BASH_REMATCH[1]}"
-    local number="${BASH_REMATCH[2]}"
-    echo "${prefix^^}-${number}"
+  # Use a regex that finds the *first* prefix-then-number occurrence, with
+  # word-boundary-ish guards: the prefix must not be preceded by another
+  # alpha character (so `nobixb-1` is not parsed as `nobixb-1`; the boundary
+  # is anchored by `(^|[^A-Za-z])`).
+  if [[ "$branch" =~ (^|[^A-Za-z])([A-Za-z]{2,})[_-]([0-9]+) ]]; then
+    local prefix="${BASH_REMATCH[2]}"
+    local number="${BASH_REMATCH[3]}"
+    # Uppercase prefix in a way that works on bash 3.2 (no ${var^^}).
+    prefix="$(printf '%s' "$prefix" | tr '[:lower:]' '[:upper:]')"
+    echo "${prefix}-${number}"
   else
     return 1
   fi

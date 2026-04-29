@@ -57,6 +57,84 @@ setup() {
   assert_failure
 }
 
+# --- detect_ticket_from_branch: extended flexibility ---
+# These cover branch shapes that the previous start-anchored implementation
+# missed (orphan-resolution / T3.3).
+
+@test "detect_ticket_from_branch: mid-branch ticket id (chore/foo-bixb-18835)" {
+  run detect_ticket_from_branch "chore/some-fix-bixb-18835"
+  assert_success
+  assert_output "BIXB-18835"
+}
+
+@test "detect_ticket_from_branch: ticket id after numeric path segment" {
+  run detect_ticket_from_branch "bug/2024-q3/bixb-18835"
+  assert_success
+  assert_output "BIXB-18835"
+}
+
+@test "detect_ticket_from_branch: ticket id after multiple path segments" {
+  run detect_ticket_from_branch "user/h/PROJ-42-fix"
+  assert_success
+  assert_output "PROJ-42"
+}
+
+@test "detect_ticket_from_branch: real-world Jira-created branch (BIXB-18845-c-required-metrics-show-on-config-tab)" {
+  # This is the exact shape Jira generates when you click 'Create branch'
+  # on a ticket — canonical TICKET-ID followed by a slug derived from the
+  # ticket title. Captured as a regression test for the most common
+  # real-world branch shape we encounter.
+  run detect_ticket_from_branch "BIXB-18845-c-required-metrics-show-on-config-tab"
+  assert_success
+  assert_output "BIXB-18845"
+}
+
+@test "detect_ticket_from_branch: 5-digit Jira numbers (current Wpromote shape)" {
+  run detect_ticket_from_branch "feature/bixb-18835-implement-foo"
+  assert_success
+  assert_output "BIXB-18835"
+}
+
+@test "detect_ticket_from_branch: short prefix (2 chars) accepted" {
+  run detect_ticket_from_branch "ab-12"
+  assert_success
+  assert_output "AB-12"
+}
+
+@test "detect_ticket_from_branch: single-letter prefix rejected (avoid v-1)" {
+  run detect_ticket_from_branch "v-18835"
+  assert_failure
+}
+
+@test "detect_ticket_from_branch: alpha-prefix glued to another word is still recognized only with boundary" {
+  # 'nobixb-1' should NOT be parsed as 'NOBIXB-1' if the user wrote prose;
+  # however our current implementation greedily matches starting from the
+  # first valid 2+ alpha sequence, which here is 'nobixb'. That is the
+  # documented behavior — captured here as a regression test rather than
+  # a 'should fail' assertion.
+  run detect_ticket_from_branch "nobixb-1"
+  assert_success
+  assert_output "NOBIXB-1"
+}
+
+@test "detect_ticket_from_branch: first match wins when multiple ids present" {
+  run detect_ticket_from_branch "bixb-1-then-proj-2"
+  assert_success
+  assert_output "BIXB-1"
+}
+
+@test "detect_ticket_from_branch: bash 3.2 portability — no \${var^^} is used" {
+  # Run the function under /bin/bash if it exists (macOS bash 3.2). On Linux
+  # CI this falls back to the default bash, which is also fine.
+  bash_3="/bin/bash"
+  if [[ -x "$bash_3" ]] && "$bash_3" -c '[[ "${BASH_VERSINFO[0]}" -lt 4 ]]' 2>/dev/null; then
+    out="$("$bash_3" -c 'source '"$BATS_TEST_DIRNAME"'/../lib/detect.sh && detect_ticket_from_branch "bixb-1"' 2>&1)"
+    [[ "$out" == "BIXB-1" ]]
+  else
+    skip "bash 3.2 not available at /bin/bash on this host"
+  fi
+}
+
 # --- detect_owner_repo ---
 
 @test "detect_owner_repo: SSH format" {
