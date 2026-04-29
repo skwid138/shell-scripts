@@ -19,8 +19,11 @@ Options:
   -h, --help          Show this help
 
 Output:
-  JSON object with keys: ticket, description, fields
-  With --all: adds comments, links, attachments
+  JSON object with keys: ticket_id, plain_view, description, fields
+  With --comments:    adds .comments    (Atlassian envelope: {comments[], isLast, maxResults, startAt, total})
+  With --links:       adds .links       (Atlassian envelope; shape varies by Jira instance)
+  With --attachments: adds .attachments (Atlassian envelope; shape varies by Jira instance)
+  Empty / missing data is represented as [] (acli returns no JSON or non-JSON output).
 
 Examples:
   jira-fetch-ticket BIXB-18835
@@ -87,40 +90,27 @@ fi
 # --- Optional: comments ---
 comments="[]"
 if [[ "$FETCH_COMMENTS" -eq 1 ]]; then
-  raw_comments="$(acli jira workitem comment list --key "$TICKET_ID" 2>/dev/null)" || raw_comments=""
-  if [[ -n "$raw_comments" ]]; then
-    # Try to parse as JSON; if acli outputs plain text, wrap it
-    if echo "$raw_comments" | jq empty 2>/dev/null; then
-      comments="$raw_comments"
-    else
-      comments="$(echo "$raw_comments" | jq -Rs '[split("\n") | .[] | select(length > 0)]')"
-    fi
+  raw_comments="$(acli jira workitem comment list --key "$TICKET_ID" --json 2>/dev/null)" || raw_comments=""
+  if [[ -n "$raw_comments" ]] && echo "$raw_comments" | jq empty 2>/dev/null; then
+    comments="$raw_comments"
   fi
 fi
 
 # --- Optional: links ---
 links="[]"
 if [[ "$FETCH_LINKS" -eq 1 ]]; then
-  raw_links="$(acli jira workitem link list --key "$TICKET_ID" 2>/dev/null)" || raw_links=""
-  if [[ -n "$raw_links" ]]; then
-    if echo "$raw_links" | jq empty 2>/dev/null; then
-      links="$raw_links"
-    else
-      links="$(echo "$raw_links" | jq -Rs '[split("\n") | .[] | select(length > 0)]')"
-    fi
+  raw_links="$(acli jira workitem link list --key "$TICKET_ID" --json 2>/dev/null)" || raw_links=""
+  if [[ -n "$raw_links" ]] && echo "$raw_links" | jq empty 2>/dev/null; then
+    links="$raw_links"
   fi
 fi
 
 # --- Optional: attachments ---
 attachments="[]"
 if [[ "$FETCH_ATTACHMENTS" -eq 1 ]]; then
-  raw_attachments="$(acli jira workitem attachment list --key "$TICKET_ID" 2>/dev/null)" || raw_attachments=""
-  if [[ -n "$raw_attachments" ]]; then
-    if echo "$raw_attachments" | jq empty 2>/dev/null; then
-      attachments="$raw_attachments"
-    else
-      attachments="$(echo "$raw_attachments" | jq -Rs '[split("\n") | .[] | select(length > 0)]')"
-    fi
+  raw_attachments="$(acli jira workitem attachment list --key "$TICKET_ID" --json 2>/dev/null)" || raw_attachments=""
+  if [[ -n "$raw_attachments" ]] && echo "$raw_attachments" | jq empty 2>/dev/null; then
+    attachments="$raw_attachments"
   fi
 fi
 

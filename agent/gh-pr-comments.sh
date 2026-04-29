@@ -33,24 +33,9 @@ EOF
 }
 
 # Parse a PR reference into OWNER, REPO, PR_NUMBER
+# Implementation lives in lib/detect.sh::parse_pr_ref
 _parse_pr_ref() {
-  local ref="$1"
-  # Full URL: https://github.com/owner/repo/pull/123
-  if [[ "$ref" =~ github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
-    OWNER="${OWNER:-${BASH_REMATCH[1]}}"
-    REPO="${REPO:-${BASH_REMATCH[2]}}"
-    PR_NUMBER="${BASH_REMATCH[3]}"
-  # owner/repo#number
-  elif [[ "$ref" =~ ^([^/]+)/([^#]+)#([0-9]+)$ ]]; then
-    OWNER="${OWNER:-${BASH_REMATCH[1]}}"
-    REPO="${REPO:-${BASH_REMATCH[2]}}"
-    PR_NUMBER="${BASH_REMATCH[3]}"
-  # Just a number (strip leading #)
-  elif [[ "${ref#\#}" =~ ^[0-9]+$ ]]; then
-    PR_NUMBER="${ref#\#}"
-  else
-    die "Cannot parse PR reference: $ref"
-  fi
+  parse_pr_ref "$@"
 }
 
 # --- Parse arguments ---
@@ -193,9 +178,15 @@ if [[ "$FETCH_COMMITS" -eq 1 ]]; then
 fi
 
 # --- Fetch diff (optional) ---
-diff=""
+# Write diff to a tempfile so jq can ingest it via --rawfile, bypassing the
+# ARG_MAX limit on --arg (~256KB on macOS). Real PRs frequently exceed this.
+diff_file="$(mktemp -t gh-pr-comments-diff.XXXXXX)"
+trap 'rm -f "$diff_file"' EXIT
+
 if [[ "$FETCH_DIFF" -eq 1 ]]; then
-  diff="$(gh pr diff "$PR_NUMBER" --repo "$REPO_SLUG" 2>/dev/null)" || diff=""
+  gh pr diff "$PR_NUMBER" --repo "$REPO_SLUG" >"$diff_file" 2>/dev/null || : >"$diff_file"
+else
+  : >"$diff_file"
 fi
 
 # --- Assemble output ---
@@ -205,7 +196,7 @@ jq -n \
   --argjson threads "$all_threads" \
   --argjson files "$files" \
   --argjson commits "$commits" \
-  --arg diff "$diff" \
+  --rawfile diff "$diff_file" \
   '{
     metadata: $metadata,
     reviews: $reviews,

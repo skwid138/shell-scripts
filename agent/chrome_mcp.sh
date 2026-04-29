@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
+
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/common.sh"
 
 CHROME_APP="Google Chrome"
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -58,6 +61,12 @@ Examples:
   chrome_mcp -D -u /tmp/my-chrome-mcp-profile -U "https://example.com"
   chrome_mcp --check              # exits 0 if running, 1 if not
   chrome_mcp --kill               # kill existing instance on port
+
+Exit codes:
+  0   Success / Chrome running (--check)
+  1   Chrome not running (--check)
+  2   Usage error
+  3   Missing dependency (Chrome binary not found)
 EOF
 }
 
@@ -111,7 +120,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -U|--url)
-      [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }
+      [[ $# -ge 2 ]] || die_usage "Missing value for $1"
       URL="$2"
       shift 2
       ;;
@@ -124,32 +133,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     -K|--kill)
       pkill -f "remote-debugging-port=${PORT}" 2>/dev/null || true
-      echo "Killed Chrome on port ${PORT}"
+      info "Killed Chrome on port ${PORT}"
       exit 0
       ;;
     -T|--new-tab)
-      [[ "$OPEN_TARGET" == "window" ]] && {
-        echo "Cannot use --new-tab and --new-window together" >&2
-        exit 1
-      }
+      [[ "$OPEN_TARGET" == "window" ]] && die_usage "Cannot use --new-tab and --new-window together"
       OPEN_TARGET="tab"
       shift
       ;;
     -W|--new-window)
-      [[ "$OPEN_TARGET" == "tab" ]] && {
-        echo "Cannot use --new-tab and --new-window together" >&2
-        exit 1
-      }
+      [[ "$OPEN_TARGET" == "tab" ]] && die_usage "Cannot use --new-tab and --new-window together"
       OPEN_TARGET="window"
       shift
       ;;
     -p|--port)
-      [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }
+      [[ $# -ge 2 ]] || die_usage "Missing value for $1"
       PORT="$2"
       shift 2
       ;;
     -u|--user-data-dir)
-      [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }
+      [[ $# -ge 2 ]] || die_usage "Missing value for $1"
       USER_DATA_DIR="$2"
       shift 2
       ;;
@@ -158,18 +161,15 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "Unknown option: $1" >&2
-      echo >&2
+      printf 'Unknown option: %s\n\n' "$1" >&2
       usage >&2
-      exit 1
+      exit 2
       ;;
   esac
 done
 
 if [[ ! -x "$CHROME_BIN" ]]; then
-  echo "Chrome binary not found or not executable:" >&2
-  echo "  $CHROME_BIN" >&2
-  exit 1
+  die_missing_dep "Chrome binary not found or not executable: $CHROME_BIN"
 fi
 
 COMMON_ARGS=(
@@ -198,57 +198,57 @@ if [[ "$OPEN_TARGET" == "window" ]]; then
 fi
 
 if [[ "$MODE" == "foreground" ]]; then
-  echo "Starting Chrome in foreground mode on port ${PORT}"
-  echo "Profile: ${USER_DATA_DIR}"
+  info "Starting Chrome in foreground mode on port ${PORT}"
+  info "Profile: ${USER_DATA_DIR}"
 
   if [[ "$VERBOSE" -eq 1 ]]; then
-    echo "Verbose logging: terminal (stderr)"
+    info "Verbose logging: terminal (stderr)"
   fi
 
   case "$OPEN_TARGET" in
     tab)
-      echo "Open target: new tab (Chrome default URL behavior)"
+      info "Open target: new tab (Chrome default URL behavior)"
       ;;
     window)
-      echo "Open target: new window"
+      info "Open target: new window"
       ;;
   esac
 
   if [[ -n "$URL" ]]; then
-    echo "Opening URL: ${URL}"
+    info "Opening URL: ${URL}"
     exec "$CHROME_BIN" "${COMMON_ARGS[@]}" "$URL"
   else
     exec "$CHROME_BIN" "${COMMON_ARGS[@]}"
   fi
 else
-  echo "Starting Chrome in detached mode on port ${PORT}"
-  echo "Profile: ${USER_DATA_DIR}"
+  info "Starting Chrome in detached mode on port ${PORT}"
+  info "Profile: ${USER_DATA_DIR}"
 
   if [[ "$VERBOSE" -eq 1 ]]; then
-    echo "Verbose logging: written under the Chrome user data directory"
+    info "Verbose logging: written under the Chrome user data directory"
   fi
 
   case "$OPEN_TARGET" in
     tab)
-      echo "Open target: new tab"
+      info "Open target: new tab"
       ;;
     window)
-      echo "Open target: new window"
+      info "Open target: new window"
       ;;
   esac
 
   if [[ "$OPEN_TARGET" == "tab" && -n "$URL" ]]; then
     if matching_instance_running; then
-      echo "Matching Chrome instance found; opening URL in a new tab"
+      info "Matching Chrome instance found; opening URL in a new tab"
       open_url_in_new_tab_applescript "$URL"
       exit 0
     else
-      echo "No matching Chrome instance found; falling back to launching a new window"
+      warn "No matching Chrome instance found; falling back to launching a new window"
     fi
   fi
 
   if [[ -n "$URL" ]]; then
-    echo "Opening URL: ${URL}"
+    info "Opening URL: ${URL}"
     open -na "$CHROME_APP" "$URL" --args "${COMMON_ARGS[@]}"
   else
     open -na "$CHROME_APP" --args "${COMMON_ARGS[@]}"

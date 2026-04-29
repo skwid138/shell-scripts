@@ -97,3 +97,92 @@ setup() {
   assert_output "polaris-api"
   unset -f git
 }
+
+# --- parse_pr_ref ------------------------------------------------------------
+# parse_pr_ref mutates caller-scope OWNER/REPO/PR_NUMBER, so each test sources
+# fresh and inspects the resulting variables.
+
+@test "parse_pr_ref: bare number sets PR_NUMBER only" {
+  OWNER=""; REPO=""; PR_NUMBER=""
+  parse_pr_ref "275"
+  [[ "$PR_NUMBER" == "275" ]]
+  [[ -z "$OWNER" ]]
+  [[ -z "$REPO" ]]
+}
+
+@test "parse_pr_ref: #275 strips the hash" {
+  OWNER=""; REPO=""; PR_NUMBER=""
+  parse_pr_ref "#275"
+  [[ "$PR_NUMBER" == "275" ]]
+}
+
+@test "parse_pr_ref: owner/repo#number form" {
+  OWNER=""; REPO=""; PR_NUMBER=""
+  parse_pr_ref "wpromote/polaris-web#275"
+  [[ "$OWNER" == "wpromote" ]]
+  [[ "$REPO" == "polaris-web" ]]
+  [[ "$PR_NUMBER" == "275" ]]
+}
+
+@test "parse_pr_ref: full GitHub URL" {
+  OWNER=""; REPO=""; PR_NUMBER=""
+  parse_pr_ref "https://github.com/wpromote/polaris-api/pull/123"
+  [[ "$OWNER" == "wpromote" ]]
+  [[ "$REPO" == "polaris-api" ]]
+  [[ "$PR_NUMBER" == "123" ]]
+}
+
+@test "parse_pr_ref: pre-set OWNER/REPO are not overwritten" {
+  OWNER="myowner"; REPO="myrepo"; PR_NUMBER=""
+  parse_pr_ref "wpromote/polaris-web#275"
+  [[ "$OWNER" == "myowner" ]]
+  [[ "$REPO" == "myrepo" ]]
+  [[ "$PR_NUMBER" == "275" ]]
+}
+
+@test "parse_pr_ref: garbage input exits 2 (usage error)" {
+  run parse_pr_ref "not a pr ref"
+  assert_failure 2
+  assert_output --partial "Usage error:"
+}
+
+# --- detect_pr_number error categorization -----------------------------------
+
+@test "detect_pr_number: 'no pull requests found' returns 1, not 5" {
+  # Stub gh: simulate 'no PR' upstream message and exit non-zero.
+  gh() {
+    if [[ "$1" == "auth" ]]; then return 0; fi
+    echo "no pull requests found for branch 'feature/foo'" >&2
+    return 1
+  }
+  export -f gh
+  run detect_pr_number
+  assert_failure 1
+  unset -f gh
+}
+
+@test "detect_pr_number: real upstream error exits 5 (die_upstream)" {
+  gh() {
+    if [[ "$1" == "auth" ]]; then return 0; fi
+    echo "HTTP 502: bad gateway" >&2
+    return 1
+  }
+  export -f gh
+  run detect_pr_number
+  assert_failure 5
+  assert_output --partial "Upstream failure:"
+  unset -f gh
+}
+
+@test "detect_pr_number: success prints number" {
+  gh() {
+    if [[ "$1" == "auth" ]]; then return 0; fi
+    echo "275"
+    return 0
+  }
+  export -f gh
+  run detect_pr_number
+  assert_success
+  assert_output "275"
+  unset -f gh
+}
