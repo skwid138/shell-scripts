@@ -51,3 +51,22 @@ jobs:
 
       - name: Run tests
         run: make test
+
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # gitleaks needs full history to scan the diff and (if configured)
+          # the historical commits. fetch-depth: 0 disables the default
+          # shallow clone.
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          # GITHUB_TOKEN lets gitleaks-action post a check-run summary on PRs.
+          # No org-level GITLEAKS_LICENSE is needed for public repos.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
