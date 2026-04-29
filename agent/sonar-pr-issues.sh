@@ -78,7 +78,9 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --severity)
-      SEVERITY_FLOOR="${2^^}"
+      # Uppercase the severity for case-insensitive --severity acceptance.
+      # bash 3.2 doesn't support ${var^^}; use tr (T7.4 portability).
+      SEVERITY_FLOOR="$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]')"
       shift 2
       ;;
     --format)
