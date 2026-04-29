@@ -103,19 +103,24 @@ if [[ -z "$PR_NUMBER" ]]; then
 fi
 
 # --- Check CI status ---
+# Delegated to agent/gh-pr-checks-summary.sh, which classifies bucket=pass/fail/
+# pending into a single status word. Translate its vocabulary to ours:
+#   passed   -> passed
+#   failed   -> failed
+#   running  -> running
+#   not_found -> no_check_found
+#   (anything else, including a script failure) -> unknown
 ci_status="unknown"
-if sonar_check="$(gh pr checks "$PR_NUMBER" --json name,status,conclusion 2>/dev/null)"; then
-  sonar_line="$(echo "$sonar_check" | jq -r '.[] | select(.name | test("sonar"; "i")) | "\(.status) \(.conclusion)"' | head -1)"
-  if [[ -n "$sonar_line" ]]; then
-    case "$sonar_line" in
-      "completed success"*) ci_status="passed" ;;
-      "completed failure"*) ci_status="failed" ;;
-      *"in_progress"* | *"queued"*) ci_status="running" ;;
-      *) ci_status="completed" ;;
-    esac
-  else
-    ci_status="no_check_found"
-  fi
+checks_script="$(dirname "$0")/gh-pr-checks-summary.sh"
+if [[ -x "$checks_script" ]]; then
+  raw_status="$("$checks_script" --filter sonar --status "$PR_NUMBER" 2>/dev/null)" || raw_status=""
+  case "$raw_status" in
+    passed) ci_status="passed" ;;
+    failed) ci_status="failed" ;;
+    running) ci_status="running" ;;
+    not_found) ci_status="no_check_found" ;;
+    *) ci_status="unknown" ;;
+  esac
 fi
 
 # --- Fetch issues (with pagination) ---
