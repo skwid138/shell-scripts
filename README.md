@@ -71,10 +71,29 @@ Every script takes `-h` / `--help`.
 make lint           # shellcheck (advisory; warning-level findings shown)
 make lint-strict    # shellcheck (CI gate; errors only)
 make test           # bats — auto-installs submodules on first run
+make fmt            # apply shfmt formatting
+make check          # full CI gate: lint-strict + fmt-check + test
 make help           # list all targets
 ```
 
-CI runs `lint-strict` and `test` on every push and PR.
+CI runs `lint-strict`, `fmt-check`, and `test` on every push and PR
+(macOS + Ubuntu matrix), plus a separate gitleaks job for secret
+scanning.
+
+### Pre-commit hook (optional)
+
+Install a fast pre-commit hook that lints, format-checks, and
+secret-scans only the **staged** shell files (no full-tree work):
+
+```bash
+make install-hook   # enables .githooks/pre-commit via core.hooksPath
+make uninstall-hook # disables it
+```
+
+The hook is a no-op when no shell files are staged. It runs `shellcheck`
+(errors only — matches CI), `shfmt -d` (formatting drift), and
+`gitleaks protect --staged` (if installed). Bypass with
+`git commit --no-verify` for emergency commits.
 
 ## Conventions
 

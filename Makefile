@@ -11,7 +11,7 @@ SCRIPTS := $(wildcard shell/*.sh) $(wildcard agent/*.sh) $(wildcard lib/*.sh)
 # Notably NOT -sr (we keep redirects unspaced, e.g. >/dev/null)
 SHFMT_FLAGS := -i 2 -ci
 
-.PHONY: help test install-bats lint lint-strict fmt fmt-check check clean
+.PHONY: help test install-bats lint lint-strict fmt fmt-check check clean install-hook uninstall-hook
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -47,6 +47,26 @@ fmt-check: ## Verify shfmt formatting (CI gate; exits non-zero on diff)
 	fi
 
 check: lint-strict fmt-check test ## Full CI gate: strict lint + format check + tests
+
+install-hook: ## Enable .githooks/pre-commit (sets git core.hooksPath)
+	@# Use git's native core.hooksPath (Git 2.9+) instead of symlinking
+	@# .git/hooks/pre-commit. This:
+	@#   1) auto-picks-up future .githooks/pre-commit edits (no re-install).
+	@#   2) survives 'rm -rf .git/hooks' / fresh clones if re-run.
+	@#   3) is per-repo (not global), so no risk to other repos.
+	@# Bypass any time with: git commit --no-verify
+	@if [ ! -x .githooks/pre-commit ]; then \
+		echo "error: .githooks/pre-commit not found or not executable"; \
+		exit 1; \
+	fi
+	@git config core.hooksPath .githooks
+	@echo "✓ pre-commit hook enabled (git config core.hooksPath = .githooks)"
+	@echo "  Bypass with: git commit --no-verify"
+	@echo "  Disable with: make uninstall-hook"
+
+uninstall-hook: ## Disable the pre-commit hook (unsets git core.hooksPath)
+	@git config --unset core.hooksPath 2>/dev/null || true
+	@echo "✓ pre-commit hook disabled (core.hooksPath unset; git falls back to .git/hooks/)"
 
 clean: ## Remove test artifacts
 	rm -rf tests/test_helper/bats-core tests/test_helper/bats-support tests/test_helper/bats-assert

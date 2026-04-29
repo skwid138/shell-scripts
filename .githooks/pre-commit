@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Project pre-commit hook for ~/code/scripts.
+#
+# Runs only on staged shell files (fast). To install:
+#
+#   make install-hook
+#
+# The installed hook is a symlink to this file, so future updates to
+# this script are picked up automatically — no need to re-run install.
+#
+# Bypass for emergency commits with: git commit --no-verify
+#
+# Checks performed:
+#   1. shellcheck (errors only — warnings are advisory; matches CI gate)
+#   2. shfmt -d   (formatting drift)
+#   3. gitleaks protect --staged (if installed; warns if missing)
+#
+# Each check operates on staged files only. If no shell files are
+# staged, the hook is a no-op.
+
+# CONVENTIONS forbids 'set -e' (BashFAQ/105); use pipefail + explicit
+# error handling. We also need to track a single overall fail status
+# across multiple checks so we can run them ALL and report everything
+# at once, rather than bailing on the first failure (better UX —
+# devs see every issue in one pass).
+set -uo pipefail
+
+# Resolve the repo root regardless of where git invokes us from.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "pre-commit: not inside a git repo; aborting" >&2
+  exit 1
+}
+cd "$repo_root" || exit 1
+
+# Collect staged shell files. We look at .sh / .bats extension AND files
+# with a bash/sh shebang (catches scripts without an extension). Use
+# --diff-filter=ACMR to skip deletions (D) and renames where the new path
+# doesn't exist yet.
+#
+# Use a 'while read' loop instead of mapfile/readarray for bash 3.2
+# portability per CONVENTIONS T7.4 (macOS /bin/bash is 3.2).
+staged_sh=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && staged_sh+=("$line")
+done < <(
+  git diff --cached --name-only --diff-filter=ACMR 2>/dev/null |
+    grep -E '\.sh$|\.bats$' || true
+)
+
+# Also grab non-extension scripts via shebang sniff (slower; only run if
+# there are unaccounted-for staged files).
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  # Skip files we already have, plus anything not-a-regular-file.
+  [[ -f "$f" ]] || continue
+  case "$f" in *.sh | *.bats) continue ;; esac
+  # First line shebang check (cheap).
+  read -r first <"$f" 2>/dev/null || continue
+  case "$first" in
+    "#!/usr/bin/env bash" | "#!/bin/bash" | "#!/usr/bin/env sh" | "#!/bin/sh")
+      staged_sh+=("$f")
+      ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+
+if [[ ${#staged_sh[@]} -eq 0 ]]; then
+  # Nothing shell-y staged — nothing to do. Stay quiet so we don't
+  # spam non-shell commits.
+  exit 0
+fi
+
+echo "pre-commit: checking ${#staged_sh[@]} staged shell file(s)..."
+
+overall_fail=0
+fail() {
+  overall_fail=1
+  echo "" >&2
+  echo "  ✗ $1" >&2
+}
+pass() {
+  echo "  ✓ $1"
+}
+
+# --- 1. shellcheck (errors only) -------------------------------------------
+if command -v shellcheck >/dev/null 2>&1; then
+  # -x lets shellcheck follow source directives across files.
+  # --severity=error matches the CI lint-strict gate so the hook never
+  # blocks something CI would let through.
+  if shellcheck -x --severity=error "${staged_sh[@]}"; then
+    pass "shellcheck (errors only)"
+  else
+    fail "shellcheck reported errors above. Fix them or run with --no-verify to bypass."
+  fi
+else
+  echo "  ! shellcheck not installed; skipping (install: brew install shellcheck)" >&2
+fi
+
+# --- 2. shfmt -d (format drift) --------------------------------------------
+# Match Makefile's SHFMT_FLAGS exactly. Hard-coded here rather than
+# parsed out of the Makefile because hooks should be standalone (the
+# Makefile or shell rule could be missing in a partial checkout).
+SHFMT_FLAGS=(-i 2 -ci)
+if command -v shfmt >/dev/null 2>&1; then
+  drift="$(shfmt "${SHFMT_FLAGS[@]}" -l "${staged_sh[@]}" 2>&1)"
+  if [[ -z "$drift" ]]; then
+    pass "shfmt (formatting clean)"
+  else
+    echo "$drift" | sed 's/^/    /' >&2
+    fail "shfmt drift in the files above. Run 'make fmt' and re-stage."
+  fi
+else
+  echo "  ! shfmt not installed; skipping (install: brew install shfmt)" >&2
+fi
+
+# --- 3. gitleaks protect --staged (secret scan) ----------------------------
+# 'protect --staged' is the gitleaks idiom for staged-only scanning.
+# It exits 0 if clean, non-zero if it finds something.
+if command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks protect --staged --no-banner --redact 2>&1; then
+    pass "gitleaks (no secrets in staged diff)"
+  else
+    fail "gitleaks found potential secrets above. Review carefully — if false positive, add to .gitleaksignore and re-stage. To bypass deliberately: git commit --no-verify."
+  fi
+else
+  echo "  ! gitleaks not installed; skipping (install: brew install gitleaks)" >&2
+fi
+
+if [[ $overall_fail -ne 0 ]]; then
+  echo "" >&2
+  echo "pre-commit: one or more checks failed. Commit aborted." >&2
+  exit 1
+fi
+
+echo "pre-commit: all checks passed."
+exit 0
