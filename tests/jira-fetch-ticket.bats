@@ -94,6 +94,25 @@ get_json() {
   get_json | jq -e '.ticket_id == "BIXB-1"' >/dev/null
 }
 
+@test "jira-fetch-ticket: bash 3.2 portability — lowercase ticket-id upcases under /bin/bash" {
+  # Regression guard for T7.4: ${var^^} was a bash-4-only expansion that
+  # silently produced empty values on macOS's default /bin/bash (3.2),
+  # which CI's macos-latest runner uses. The script now goes through
+  # 'tr [:lower:] [:upper:]' which is portable. This test re-runs the
+  # uppercase check explicitly under /bin/bash when it's bash 3.x.
+  write_acli_stub
+  bash_3="/bin/bash"
+  if [[ -x "$bash_3" ]] && "$bash_3" -c '[[ "${BASH_VERSINFO[0]}" -lt 4 ]]' 2>/dev/null; then
+    out="$(PATH="$STUBDIR:$PATH" "$bash_3" "$SCRIPT" bixb-1 2>&1)"
+    echo "$out" | awk '/^\{/,/^\}$/' | jq -e '.ticket_id == "BIXB-1"' >/dev/null || {
+      echo "expected ticket_id BIXB-1 from bash 3.2 run; got: $out" >&2
+      return 1
+    }
+  else
+    skip "bash 3.2 not available at /bin/bash on this host"
+  fi
+}
+
 @test "jira-fetch-ticket: Atlassian URL extracts ticket-id" {
   write_acli_stub
   run "$SCRIPT" "https://wpromote.atlassian.net/browse/BIXB-1"

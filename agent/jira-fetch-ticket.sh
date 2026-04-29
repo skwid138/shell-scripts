@@ -69,11 +69,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       if [[ -z "$TICKET_ID" && "$1" =~ ^[A-Za-z]+-[0-9]+$ ]]; then
-        TICKET_ID="${1^^}"
+        # bash 3.2 doesn't support ${var^^}; use tr for portability
+        # (T7.4 / CONVENTIONS bash-portability rule).
+        TICKET_ID="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
       elif [[ -z "$TICKET_ID" ]]; then
         # Try to extract from URL
         if [[ "$1" =~ atlassian\.net/browse/([A-Za-z]+-[0-9]+) ]]; then
-          TICKET_ID="${BASH_REMATCH[1]^^}"
+          TICKET_ID="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')"
         else
           die "Cannot parse ticket ID from: $1"
         fi
