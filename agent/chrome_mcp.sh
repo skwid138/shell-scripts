@@ -12,6 +12,7 @@ MODE="detached"
 VERBOSE=0
 URL=""
 OPEN_TARGET="default" # default | tab | window
+ACTION="run"          # run | check | kill
 
 usage() {
   cat <<'EOF'
@@ -125,16 +126,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -C | --check)
-      if matching_instance_running; then
-        exit 0
-      else
-        exit 1
-      fi
+      ACTION="check"
+      shift
       ;;
     -K | --kill)
-      pkill -f "remote-debugging-port=${PORT}" 2>/dev/null || true
-      info "Killed Chrome on port ${PORT}"
-      exit 0
+      ACTION="kill"
+      shift
       ;;
     -T | --new-tab)
       [[ "$OPEN_TARGET" == "window" ]] && die_usage "Cannot use --new-tab and --new-window together"
@@ -167,6 +164,23 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Side-effect actions (--check / --kill) are dispatched after full arg parse
+# so flag ordering does not matter (e.g. `--check --port 9333` works).
+case "$ACTION" in
+  check)
+    if matching_instance_running; then
+      exit 0
+    else
+      exit 1
+    fi
+    ;;
+  kill)
+    pkill -f "remote-debugging-port=${PORT}" 2>/dev/null || true
+    info "Killed Chrome on port ${PORT}"
+    exit 0
+    ;;
+esac
 
 if [[ ! -x "$CHROME_BIN" ]]; then
   die_missing_dep "Chrome binary not found or not executable: $CHROME_BIN"
