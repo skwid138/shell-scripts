@@ -9,6 +9,7 @@ vars.local.sh
 # Working docs not for publication (private restructure plans, etc.)
 REPO-ORGANIZATION-PLAN.md
 SHELL-LAYER-PLAN.md
+EXECUTION-PLAN.md
 
 # OS / editor cruft
 .DS_Store
