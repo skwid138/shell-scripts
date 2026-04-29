@@ -28,15 +28,25 @@ EOF
 }
 
 # --- Project key lookup ---
-# Note: keys MUST be quoted. Without quotes shfmt parses them as arithmetic
-# expressions (treating '-' as subtraction), corrupting "client-portal" into
-# "client - portal" and silently breaking lookups.
-declare -A PROJECT_KEYS=(
-  ["client-portal"]="wpromote_client-portal"
-  ["kraken"]="wpromote_kraken"
-  ["polaris-api"]="wpromote_polaris-api"
-  ["polaris-web"]="wpromote_polaris-web"
-)
+# Use a function with case statement for bash 3.2 portability (declare -A
+# associative arrays are bash 4+, which excludes macOS's default
+# /bin/bash and CONVENTIONS T7.4 forbids unconditional bash-4 features
+# in agent scripts).
+#
+# Returns the SonarCloud project key on stdout, or empty + nonzero exit
+# when the repo isn't supported. Add new repos here.
+project_key_for_repo() {
+  case "$1" in
+    client-portal) echo "wpromote_client-portal" ;;
+    kraken) echo "wpromote_kraken" ;;
+    polaris-api) echo "wpromote_polaris-api" ;;
+    polaris-web) echo "wpromote_polaris-web" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Space-separated list of supported repo names (used in error messages).
+SUPPORTED_REPOS="client-portal kraken polaris-api polaris-web"
 
 SEVERITY_ORDER=("BLOCKER" "CRITICAL" "MAJOR" "MINOR" "INFO")
 
@@ -93,8 +103,8 @@ require_auth "sonar" "sonar auth status" "sonar auth login -o wpromote --with-to
 # Detect project key
 if [[ -z "$PROJECT" ]]; then
   repo_name="$(detect_repo_name)"
-  PROJECT="${PROJECT_KEYS[$repo_name]:-}"
-  [[ -n "$PROJECT" ]] || die "Repo '$repo_name' has no SonarCloud project. Supported: ${!PROJECT_KEYS[*]}"
+  PROJECT="$(project_key_for_repo "$repo_name" || true)"
+  [[ -n "$PROJECT" ]] || die "Repo '$repo_name' has no SonarCloud project. Supported: $SUPPORTED_REPOS"
 fi
 
 # Detect PR number

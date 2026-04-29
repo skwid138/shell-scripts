@@ -2,10 +2,12 @@
 # CLI / behavior tests for agent/sonar-pr-issues.sh.
 # Stubs `sonar` and `gh` so no network calls happen.
 #
-# Note: the project-key lookup tests double as a regression test for the
-# shfmt assoc-array corruption bug (commit 87c6eb1 fix). If shfmt ever
-# rewrites the keys back into arithmetic form, "client-portal", "polaris-api",
-# and "polaris-web" lookups will fail and these tests will catch it.
+# Historical note: the project-key lookup originally used `declare -A`
+# and these tests doubled as a regression guard for the shfmt
+# assoc-array arithmetic-expression corruption bug. The script now uses
+# a portable `case` statement (bash 3.2-compatible per CONVENTIONS T7.4),
+# but the lookup tests remain valuable: they're the only thing that
+# exercises the four supported repo names end-to-end.
 
 setup() {
   load 'test_helper/bats-support/load'

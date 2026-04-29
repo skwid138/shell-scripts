@@ -89,10 +89,27 @@ to fail fast before doing real work.
 ## Quoting
 
 - Always `"$var"`. Always `"${arr[@]}"` for arrays.
-- For associative arrays, **always quote the key when it contains `-`**.
-  `shfmt` will otherwise reformat `MAP[foo-bar]` as if `foo-bar` were
-  arithmetic and corrupt the script. There is a regression test for this
-  (`tests/sonar-pr-issues.bats`). The rule:
+- For fixed string-to-string lookups (e.g. repo name → SonarCloud project key),
+  prefer a function with a `case` statement over `declare -A`. It's bash 3.2-
+  portable, doesn't trip shfmt's arithmetic-expression bug on dashed keys,
+  and reads cleanly:
+
+  ```bash
+  project_key_for_repo() {
+    case "$1" in
+      client-portal) echo "wpromote_client-portal" ;;
+      kraken)        echo "wpromote_kraken" ;;
+      *) return 1 ;;
+    esac
+  }
+  ```
+
+- If you do need `declare -A` (dynamic keys, runtime accumulation), gate
+  the script on bash 4+ per the portability rule below, **and always quote
+  the key when it contains `-`**. `shfmt` will otherwise reformat
+  `MAP[foo-bar]` as if `foo-bar` were arithmetic and corrupt the script.
+  There is a regression test for this (`tests/sonar-pr-issues.bats`).
+  The rule:
 
   ```bash
   declare -A MAP=(
