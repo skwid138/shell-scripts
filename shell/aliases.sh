@@ -6,13 +6,17 @@ alias lsf="ls -apx | grep -v /"
 ## List only directories in current path
 alias lsd="ls -d -1 */ | lolcat"
 
+# Aliases below use single quotes so $HOME expands at *use time*, not at
+# alias-definition time (silences ShellCheck SC2139). Behaviorally
+# identical for stable vars like $HOME, but stylistically correct.
+
 ## Git rev list gist
-[[ ! -f "$HOME/code/scripts/personal/git_rev_list.sh" ]] || alias git_rev_list="$HOME/code/scripts/personal/git_rev_list.sh"
+[[ ! -f "$HOME/code/scripts/personal/git_rev_list.sh" ]] || alias git_rev_list='"$HOME/code/scripts/personal/git_rev_list.sh"'
 
 ## Github workflow tail gist
-[[ ! -f "$HOME/code/scripts/personal/github_workflow_tail.sh" ]] || alias gh_wt="$HOME/code/scripts/personal/github_workflow_tail.sh"
+[[ ! -f "$HOME/code/scripts/personal/github_workflow_tail.sh" ]] || alias gh_wt='"$HOME/code/scripts/personal/github_workflow_tail.sh"'
 
-[[ ! -f "$HOME/code/scripts/personal/mov2gif.sh" ]] || alias mov2gif="$HOME/code/scripts/personal/mov2gif.sh"
+[[ ! -f "$HOME/code/scripts/personal/mov2gif.sh" ]] || alias mov2gif='"$HOME/code/scripts/personal/mov2gif.sh"'
 
 ## Start Chrome Devtools MCP
-[[ ! -f "$HOME/code/scripts/agent/chrome_mcp.sh" ]] || alias chrome_mcp="$HOME/code/scripts/agent/chrome_mcp.sh"
+[[ ! -f "$HOME/code/scripts/agent/chrome_mcp.sh" ]] || alias chrome_mcp='"$HOME/code/scripts/agent/chrome_mcp.sh"'

@@ -5,8 +5,11 @@ LAST_NVM_DIR=""
 
 # Load the correct Node.js version based on the `.nvmrc` file
 load_nvmrc() {
-  # Get the current working directory
-  local current_dir="$(pwd)"
+  # Get the current working directory.
+  # Split declaration from assignment so a non-zero exit from $(pwd)
+  # propagates correctly (ShellCheck SC2155).
+  local current_dir
+  current_dir="$(pwd)"
 
   # Check if the directory is the same as the last checked directory
   if [[ "$current_dir" == "$LAST_NVM_DIR" ]]; then
