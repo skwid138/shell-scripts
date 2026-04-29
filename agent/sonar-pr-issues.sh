@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source "$(dirname "$0")/lib/detect.sh"
+source "$(dirname "$0")/../lib/detect.sh"
 
 usage() {
   cat <<'EOF'

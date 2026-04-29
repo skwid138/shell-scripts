@@ -6,7 +6,7 @@ setup() {
   load 'test_helper/bats-assert/load'
 
   # Source the script in library mode (it returns early when sourced).
-  source "$BATS_TEST_DIRNAME/../opencode-deps-check.sh"
+  source "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh"
 
   # Per-test scratch dir for fixture configs
   TMP_CFG="$BATS_TEST_TMPDIR/cfg"
@@ -203,38 +203,38 @@ EOF
 # lookups are deterministic.
 
 @test "script: --help exits 0 and prints usage" {
-  run "$BATS_TEST_DIRNAME/../opencode-deps-check.sh" --help
+  run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --help
   assert_success
   assert_output --partial "Usage: opencode-deps-check"
 }
 
 @test "script: unknown flag exits 1" {
-  run "$BATS_TEST_DIRNAME/../opencode-deps-check.sh" --bogus
+  run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --bogus
   assert_failure
   assert_output --partial "Unknown option"
 }
 
 @test "script: --config-dir without arg exits 1" {
-  run "$BATS_TEST_DIRNAME/../opencode-deps-check.sh" --config-dir
+  run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --config-dir
   assert_failure
   assert_output --partial "requires an argument"
 }
 
 @test "script: missing config dir exits 1 with clear error" {
-  run "$BATS_TEST_DIRNAME/../opencode-deps-check.sh" --config-dir /no/such/dir
+  run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --config-dir /no/such/dir
   assert_failure
   assert_output --partial "config dir not found"
 }
 
 @test "script: empty config dir (no package.json or opencode.json) exits 1" {
-  run "$BATS_TEST_DIRNAME/../opencode-deps-check.sh" --config-dir "$TMP_CFG"
+  run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --config-dir "$TMP_CFG"
   assert_failure
   assert_output --partial "Neither package.json nor opencode.json found"
 }
 
 @test "script: invalid package.json JSON exits 1" {
   echo "not json {" >"$TMP_CFG/package.json"
-  run "$BATS_TEST_DIRNAME/../opencode-deps-check.sh" --config-dir "$TMP_CFG"
+  run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --config-dir "$TMP_CFG"
   assert_failure
   assert_output --partial "package.json is not valid JSON"
 }
@@ -271,7 +271,7 @@ fi
 exit 0
 EOF
   chmod +x "$STUB_DIR/npm"
-  PATH="$STUB_DIR:$PATH" run "$BATS_TEST_DIRNAME/../opencode-deps-check.sh" --json --config-dir "$TMP_CFG"
+  PATH="$STUB_DIR:$PATH" run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --json --config-dir "$TMP_CFG"
   assert_success
   # Output must be valid JSON
   echo "$output" | jq empty
@@ -294,7 +294,7 @@ EOF
 exit 0
 EOF
   chmod +x "$STUB_DIR/npm"
-  PATH="$STUB_DIR:$PATH" run "$BATS_TEST_DIRNAME/../opencode-deps-check.sh" --config-dir "$TMP_CFG"
+  PATH="$STUB_DIR:$PATH" run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --config-dir "$TMP_CFG"
   assert_success
   assert_output --partial "PACKAGE"
   assert_output --partial "STATUS"

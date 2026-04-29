@@ -2,9 +2,24 @@
 # macOS Keychain helpers for secret retrieval and storage
 # Source this file to use keychain_get and keychain_set functions.
 
-# Ensure common.sh is loaded for die()
+# Ensure common.sh is loaded for die().
+# Resolving our own location must work under both bash (BASH_SOURCE) and zsh
+# (where BASH_SOURCE is unset and we fall back to %x via eval to avoid parse
+# errors in non-zsh shells).
 if [[ -z "${_LIB_COMMON_LOADED:-}" ]]; then
-  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+  if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    _keychain_self="${BASH_SOURCE[0]}"
+  elif [[ -n "${ZSH_VERSION:-}" ]]; then
+    # In zsh, %x expands to the path of the file currently being sourced.
+    # eval keeps the zsh-only syntax out of the bash parser.
+    eval '_keychain_self="${(%):-%x}"'
+  else
+    _keychain_self="$HOME/code/scripts/lib/keychain.sh"
+  fi
+  _keychain_dir="$(cd "$(dirname "$_keychain_self")" && pwd)"
+  # shellcheck source=common.sh
+  source "$_keychain_dir/common.sh"
+  unset _keychain_self _keychain_dir
 fi
 
 # Retrieve a secret from macOS Keychain

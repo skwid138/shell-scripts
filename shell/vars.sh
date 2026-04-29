@@ -28,4 +28,4 @@ export HF_READ_TOKEN="$(keychain_get huggingface-read)"
 export SONARQUBE_TOKEN="$(keychain_get sonarqube-token)"
 
 # Local, machine-specific overrides (gitignored). Optional.
-[[ -f "$HOME/code/scripts/vars.local.sh" ]] && source "$HOME/code/scripts/vars.local.sh"
+[[ -f "$HOME/code/scripts/shell/vars.local.sh" ]] && source "$HOME/code/scripts/shell/vars.local.sh"

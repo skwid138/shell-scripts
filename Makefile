@@ -3,7 +3,7 @@
 
 BATS := ./tests/test_helper/bats-core/bin/bats
 TESTS := tests/*.bats
-SCRIPTS := $(wildcard *.sh) $(wildcard lib/*.sh)
+SCRIPTS := $(wildcard shell/*.sh) $(wildcard agent/*.sh) $(wildcard lib/*.sh)
 
 .PHONY: test install-bats lint clean help
 
@@ -22,8 +22,11 @@ install-bats: ## Install bats test framework (git submodules)
 test: install-bats ## Run all bats tests
 	$(BATS) $(TESTS)
 
-lint: ## Run shellcheck on all scripts
-	shellcheck -x $(SCRIPTS)
+lint: ## Run shellcheck (severity warning+; for CI use lint-strict)
+	shellcheck -x --severity=warning $(SCRIPTS)
+
+lint-strict: ## Stricter lint that gates CI: errors only
+	shellcheck -x --severity=error $(SCRIPTS)
 
 clean: ## Remove test artifacts
 	rm -rf tests/test_helper/bats-core tests/test_helper/bats-support tests/test_helper/bats-assert

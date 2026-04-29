@@ -1,0 +1,13 @@
+# shellcheck configuration for shell-scripts repo.
+# https://www.shellcheck.net/wiki/Directive
+
+# External sources (lib/, etc.) are dynamic via "$DIR/file.sh" patterns.
+# SC1091: "Not following: file was not specified as input" — universally noisy.
+disable=SC1091
+
+# Spaceship prompt config and similar set many vars consumed by external code.
+# SC2034: "var appears unused" — too many false positives in this codebase.
+disable=SC2034
+
+# Allow shell-specific dialect features (e.g. zsh blocks guarded by $ZSH_VERSION).
+# external-sources=true would require -x; covered by Makefile invocation.
