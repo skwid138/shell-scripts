@@ -25,6 +25,17 @@ REPO_ROOT="$(dirname "$SCRIPTS_DIR")"
 # root without re-deriving it. Currently unused by shell/* but stable contract.
 export REPO_ROOT
 
+## Shared logging helpers (warn / info / debug) for shell/*.sh files.
+##
+## Sourced ONCE here at startup so every subsequent shell/*.sh has access
+## with zero per-file overhead (lib/common.sh has a re-source guard).
+##
+## CAUTION: lib/common.sh also defines die / die_usage / die_missing_dep /
+## die_unauthed / die_upstream — DO NOT call those from shell/*.sh. They
+## call `exit`, which would kill the user's interactive shell. Use `warn`
+## (yellow stderr message) for non-fatal conditions in this layer.
+[[ ! -f "$REPO_ROOT/lib/common.sh" ]] || source "$REPO_ROOT/lib/common.sh"
+
 ## Core environment
 [[ ! -f "$SCRIPTS_DIR/vars.sh" ]] || source "$SCRIPTS_DIR/vars.sh"
 [[ ! -f "$SCRIPTS_DIR/paths.sh" ]] || source "$SCRIPTS_DIR/paths.sh"

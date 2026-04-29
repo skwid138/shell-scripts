@@ -45,7 +45,13 @@ if command -v brew &>/dev/null; then
   done
   unset pg_prefix
 else
-  echo "Warning: brew command not found. Some PATH configurations skipped." >&2
+  # `warn` is sourced from lib/common.sh via shell/init.sh. Falls back to
+  # plain echo-to-stderr if common.sh hasn't been sourced (defensive).
+  if command -v warn >/dev/null 2>&1; then
+    warn "brew command not found. Some PATH configurations skipped."
+  else
+    echo "Warning: brew command not found. Some PATH configurations skipped." >&2
+  fi
 fi
 
 # User-local installs (pipx, Cursor Agent, etc.) if duplicates homebrew versions would be used instead

@@ -33,5 +33,12 @@ if command -v fortune >/dev/null 2>&1 &&
   #fortune | cowsay -f "$(ls /opt/homebrew/Cellar/cowsay/*/share/cows/*.cow | sort -R | head -1)" | lolcat
 
 else
-  echo "Required commands (fortune, cowsay, lolcat) are not installed or not in your PATH."
+  # `warn` is sourced from lib/common.sh via shell/init.sh. Falls back to
+  # plain echo if common.sh hasn't been sourced (defensive: this file
+  # might be sourced standalone for testing).
+  if command -v warn >/dev/null 2>&1; then
+    warn "Required commands (fortune, cowsay, lolcat) are not installed or not in your PATH."
+  else
+    echo "Required commands (fortune, cowsay, lolcat) are not installed or not in your PATH." >&2
+  fi
 fi
