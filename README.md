@@ -18,6 +18,7 @@ agent/         # opencode-coupled tools; call directly
 lib/           # shared helpers sourced by agent/ and shell/
 personal/      # personal utilities (gist-linked tools, helpers)
 tests/         # bats test suites + bats submodules
+docs/          # project docs (CONVENTIONS, EXIT-CODES, ADDING-A-SCRIPT)
 ```
 
 `lib/common.sh` provides `die`, `warn`, `info`, `require_cmd`, `require_auth`.
@@ -29,7 +30,11 @@ tests/         # bats test suites + bats submodules
 - macOS (primary). Linux works for most things; Keychain-backed secrets are
   macOS-only.
 - `zsh` 5.8+ (only for `shell/`)
-- `bash` 4+ (for the standalone scripts under `agent/` and `personal/`)
+- `bash` 3.2+ for the standalone scripts under `agent/` and `personal/`.
+  Most agent scripts work under macOS `/bin/bash` (3.2). Scripts that
+  genuinely require bash 4+ (e.g. for `declare -A` associative arrays)
+  guard with an explicit `BASH_VERSINFO` check and emit a `brew install bash`
+  hint on failure. See `docs/CONVENTIONS.md` for the portability rule.
 - Optional per-script: `gh`, `jq`, `acli` (Atlassian), `gcloud`, Chrome.
 
 ## Setup
