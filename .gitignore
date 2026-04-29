@@ -1,0 +1,25 @@
+# Local, machine-specific overrides (sourced by vars.sh and friends, never committed)
+vars.local.sh
+*.local.sh
+
+# Snapshots / backups
+*.backup-*
+.backup-*
+
+# Working docs not for publication (private restructure plans, etc.)
+REPO-ORGANIZATION-PLAN.md
+SHELL-LAYER-PLAN.md
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Test artifacts
+tests/test_helper/bats-core/
+tests/test_helper/bats-support/
+tests/test_helper/bats-assert/
+# (Kept as git submodules — actual tracking happens via .gitmodules; this entry
+#  is a safety net in case they're ever cloned without --recurse-submodules.)
