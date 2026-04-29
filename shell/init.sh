@@ -50,4 +50,4 @@ export REPO_ROOT
 [[ ! -f "$SCRIPTS_DIR/auto_nvm.sh" ]] || source "$SCRIPTS_DIR/auto_nvm.sh"
 
 ## Wpromote scripts, functions, and aliases (private repo, optional)
-[[ ! -f "$HOME/code/wpromote/scripts/init.sh" ]] || source "$HOME/code/wpromote/scripts/init.sh"
+[[ ! -f "$HOME/code/wpromote/scripts/shell/init.sh" ]] || source "$HOME/code/wpromote/scripts/shell/init.sh"
