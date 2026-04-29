@@ -63,12 +63,17 @@ setup() {
 
 @test "branch-to-ticket: empty arg falls back to current branch (no-arg path)" {
   # Run from a temporary git repo with a branch we control.
+  # CI runners often have no global git identity, so set author/committer
+  # identity via env vars (scoped to this subshell) — this avoids
+  # mutating global git config and works on any git version.
   tmpdir="$(mktemp -d)"
   (
     cd "$tmpdir"
     git init -q
     git checkout -q -b proj-456-feature 2>/dev/null
-    git commit -q --allow-empty -m init
+    GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com \
+    GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com \
+      git commit -q --allow-empty -m init
   )
   cd "$tmpdir"
   run "$SCRIPT"
