@@ -8,15 +8,20 @@ on:
 
 jobs:
   lint-test:
-    name: shellcheck + bats
-    runs-on: ubuntu-latest
+    name: shellcheck + bats (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: Install shellcheck and shfmt
+      - name: Install shellcheck and shfmt (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
@@ -26,6 +31,15 @@ jobs:
             "https://github.com/mvdan/sh/releases/download/v$SHFMT_VERSION/shfmt_v${SHFMT_VERSION}_linux_amd64"
           chmod +x /tmp/shfmt
           sudo mv /tmp/shfmt /usr/local/bin/shfmt
+          shellcheck --version
+          shfmt --version
+
+      - name: Install shellcheck and shfmt (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # macOS runners have brew preinstalled. shellcheck and shfmt are
+          # both available as bottles, so this is fast.
+          brew install shellcheck shfmt
           shellcheck --version
           shfmt --version
 
