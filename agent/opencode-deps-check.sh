@@ -8,9 +8,10 @@
 #
 # Default output: human-readable table. Use --json for machine output.
 
-# Guard `set -e` to allow library-mode sourcing (for tests).
+# Guard strict mode to allow library-mode sourcing (for tests).
+# CONVENTIONS forbids 'set -e' (BashFAQ/105); use 'set -uo pipefail'.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  set -euo pipefail
+  set -uo pipefail
 fi
 
 # shellcheck source=../lib/common.sh

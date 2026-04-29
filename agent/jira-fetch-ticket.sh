@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 source "$(dirname "$0")/../lib/detect.sh"
 
 usage() {
