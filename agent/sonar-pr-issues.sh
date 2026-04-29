@@ -28,11 +28,14 @@ EOF
 }
 
 # --- Project key lookup ---
+# Note: keys MUST be quoted. Without quotes shfmt parses them as arithmetic
+# expressions (treating '-' as subtraction), corrupting "client-portal" into
+# "client - portal" and silently breaking lookups.
 declare -A PROJECT_KEYS=(
-  [client - portal]="wpromote_client-portal"
-  [kraken]="wpromote_kraken"
-  [polaris - api]="wpromote_polaris-api"
-  [polaris - web]="wpromote_polaris-web"
+  ["client-portal"]="wpromote_client-portal"
+  ["kraken"]="wpromote_kraken"
+  ["polaris-api"]="wpromote_polaris-api"
+  ["polaris-web"]="wpromote_polaris-web"
 )
 
 SEVERITY_ORDER=("BLOCKER" "CRITICAL" "MAJOR" "MINOR" "INFO")
