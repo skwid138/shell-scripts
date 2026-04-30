@@ -20,3 +20,34 @@ alias lsd="ls -d -1 */ | lolcat"
 
 ## Start Chrome Devtools MCP
 [[ ! -f "$HOME/code/scripts/agent/chrome_mcp.sh" ]] || alias chrome_mcp='"$HOME/code/scripts/agent/chrome_mcp.sh"'
+
+## ───────────────────────────────────────────────────────────────────
+## Neovim
+## ───────────────────────────────────────────────────────────────────
+alias v='nvim'
+alias vim='nvim'
+
+## Update nvim plugins and commit lockfile in dotfiles
+## Runs :Lazy sync headless, then auto-commits lazy-lock.json if changed.
+alias nvim-update='nvim --headless "+Lazy! sync" +qa && \
+  cd "$HOME/code/dotfiles" && \
+  { git diff --quiet nvim/.config/nvim/lazy-lock.json || \
+    (git add nvim/.config/nvim/lazy-lock.json && \
+     git commit -m "nvim: bump plugin lockfile"); } && \
+  cd - >/dev/null'
+
+## ───────────────────────────────────────────────────────────────────
+## tmux helpers (sessionizer is bound in tmux.conf, but also from shell)
+## ───────────────────────────────────────────────────────────────────
+[[ ! -f "$HOME/code/scripts/personal/tmux-sessionizer.sh" ]] || alias tms='"$HOME/code/scripts/personal/tmux-sessionizer.sh"'
+
+## ───────────────────────────────────────────────────────────────────
+## BQ wrappers (bqx, not bq — bq is the actual gcloud binary; we don't shadow it)
+## ───────────────────────────────────────────────────────────────────
+[[ ! -f "$HOME/code/scripts/personal/bq.sh" ]] || alias bqx='"$HOME/code/scripts/personal/bq.sh"'
+
+## ───────────────────────────────────────────────────────────────────
+## GCP project map (only if wpromote/scripts is cloned)
+## ───────────────────────────────────────────────────────────────────
+[[ ! -f "$HOME/code/wpromote/scripts/agent/gcp-project-map.sh" ]] ||
+  alias gcp-map='"$HOME/code/wpromote/scripts/agent/gcp-project-map.sh"'
