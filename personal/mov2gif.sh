@@ -1,49 +1,64 @@
 #!/usr/bin/env bash
+# mov2gif — convert a video to an optimized GIF using FFmpeg.
 #
-# mov2gif - Convert a video to an optimized GIF using FFmpeg.
-#           Utilizes a two-pass palette generation method.
+# Behavior:
+#   - Uses FFmpeg's two-pass palette generation method for high-quality output.
+#   - Pass 1: generate a palette PNG from the input at the chosen fps/scale.
+#   - Pass 2: apply the palette to render the GIF.
+#   - Cleans up the temp palette afterwards.
+#
+# Examples:
+#   mov2gif.sh input.mov                # default fps=10, scale=320, output=./input.gif
+#   mov2gif.sh -f 5 -s 240 myclip.mov   # 5fps, width=240
+#   mov2gif.sh -o /tmp/out.gif clip.mov # explicit output path
+#
+# Exit codes (per docs/EXIT-CODES.md):
+#   0  success
+#   1  generic runtime failure (ffmpeg failed)
+#   2  usage error (missing input file, bad flag)
+#   3  missing dependency (ffmpeg)
 
-# Default values
+set -uo pipefail
+source "$(dirname "$0")/../lib/common.sh"
+
+# Defaults.
 FPS=10
 SCALE=320
 OUTPUT=""
 
-# Print usage instructions
 usage() {
-  echo "Usage: mov2gif [options] <input_file>"
-  echo
-  echo "Converts a video file (e.g., .mov) to a high-quality GIF using FFmpeg."
-  echo
-  echo "Options:"
-  echo "  -h, --help              Show this help message and exit."
-  echo "  -f, --fps <number>      Frames per second (default: ${FPS})."
-  echo "  -s, --scale <width>     GIF width in pixels (default: ${SCALE})."
-  echo "                          Height is scaled automatically."
-  echo "  -o, --output <path>     Output GIF file name (default: input file name and location with .gif extension)."
-  echo
-  echo "Notes:"
-  echo "  - This script uses a two-pass palette generation for improved color and size."
-  echo "  - For best results, you may want to pick an FPS based on video length:"
-  echo "      Up to ~60s  => ~5fps"
-  echo "      Up to ~30s  => ~10fps"
-  echo "      Up to ~15s  => ~20fps"
-  echo "      Up to ~10s  => ~33fps"
-  echo "    Lower FPS yields smaller files but choppier motion."
-  echo
-  echo "Examples:"
-  echo "  mov2gif input.mov                # uses default FPS=10, scale=320, output=./input.gif"
-  echo "  mov2gif -f 5 -s 240 myclip.mov   # 5fps, width=240, auto-scale height, output=./myclip.gif"
-  echo
+  cat <<EOF
+Usage: mov2gif.sh [OPTIONS] <input_file>
+
+Convert a video file (e.g., .mov) to a high-quality GIF using FFmpeg's
+two-pass palette generation.
+
+Arguments:
+  input_file              Path to the source video.
+
+Options:
+  -h, --help              Show this help and exit.
+  -f, --fps NUMBER        Frames per second (default: ${FPS}).
+  -s, --scale WIDTH       GIF width in pixels (default: ${SCALE}).
+                          Height is scaled automatically.
+  -o, --output PATH       Output GIF file (default: <input>.gif next to input).
+
+Notes:
+  Pick FPS based on clip length:
+    Up to ~60s  =>  ~5fps
+    Up to ~30s  =>  ~10fps
+    Up to ~15s  =>  ~20fps
+    Up to ~10s  =>  ~33fps
+  Lower FPS yields smaller files but choppier motion.
+
+Examples:
+  mov2gif.sh input.mov
+  mov2gif.sh -f 5 -s 240 myclip.mov
+  mov2gif.sh -o /tmp/out.gif clip.mov
+EOF
 }
 
-# Check if FFmpeg is installed
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "Error: FFmpeg is not installed or not in your PATH."
-  echo "       Please install FFmpeg (e.g., via Homebrew: brew install ffmpeg) and try again."
-  exit 1
-fi
-
-# Parse arguments
+# Parse arguments.
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,58 +67,58 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     -f | --fps)
-      shift
-      FPS="$1"
-      shift
+      [[ -n "${2:-}" ]] || die_usage "--fps requires a value"
+      FPS="$2"
+      shift 2
       ;;
     -s | --scale)
-      shift
-      SCALE="$1"
-      shift
+      [[ -n "${2:-}" ]] || die_usage "--scale requires a value"
+      SCALE="$2"
+      shift 2
       ;;
     -o | --output)
-      shift
-      OUTPUT="$1"
-      shift
+      [[ -n "${2:-}" ]] || die_usage "--output requires a value"
+      OUTPUT="$2"
+      shift 2
+      ;;
+    -*)
+      die_usage "unknown flag: $1 (try --help)"
       ;;
     *)
-      # Assume anything else is the input file
       POSITIONAL+=("$1")
       shift
       ;;
   esac
 done
-set -- "${POSITIONAL[@]}" # Restore positional arguments
 
 if [[ ${#POSITIONAL[@]} -lt 1 ]]; then
-  echo "Error: Missing input file."
-  usage
-  exit 1
+  die_usage "missing input file (try --help)"
 fi
 
-INPUT_FILE="$1"
+require_cmd "ffmpeg" "brew install ffmpeg"
 
-# Derive default output filename if not supplied
+INPUT_FILE="${POSITIONAL[0]}"
+
+# Derive default output filename if not supplied.
 if [[ -z "$OUTPUT" ]]; then
-  # Remove existing extension if any, then add .gif
   BASENAME="${INPUT_FILE%.*}"
   OUTPUT="${BASENAME}.gif"
 fi
 
-# Temporary palette file
+# Temporary palette file.
 PALETTE="/tmp/palette-$$.png"
 
-# First pass: Generate palette
+# Pass 1: generate palette.
 ffmpeg -y -i "$INPUT_FILE" \
   -vf "fps=${FPS},scale=${SCALE}:-1:force_original_aspect_ratio=decrease,palettegen" \
-  "$PALETTE"
+  "$PALETTE" || die "ffmpeg palette generation failed"
 
-# Second pass: Apply palette to create GIF
+# Pass 2: apply palette to create GIF.
 ffmpeg -y -i "$INPUT_FILE" -i "$PALETTE" \
   -lavfi "fps=${FPS},scale=${SCALE}:-1:force_original_aspect_ratio=decrease[x]; [x][1:v] paletteuse" \
-  "$OUTPUT"
+  "$OUTPUT" || die "ffmpeg gif render failed"
 
-# Clean up
+# Clean up.
 rm -f "$PALETTE"
 
 echo "GIF created: $OUTPUT"

@@ -1,56 +1,88 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# git-rev-list — list commits between a base branch and a compare branch.
+#
+# Behavior:
+#   - Determines a base branch (default: origin/develop, then origin/main,
+#     then origin/master) unless one is passed via --base.
+#   - Uses the current branch as the compare branch unless --compare is set.
+#   - Runs `git fetch --all` to make sure refs are current.
+#   - Reports how many commits compare is behind/ahead of base via
+#     `git rev-list --left-right --count`.
+#
+# Examples:
+#   git_rev_list.sh
+#   git_rev_list.sh --base origin/main
+#   git_rev_list.sh -b origin/develop -c feature/foo
+#
+# Exit codes (per docs/EXIT-CODES.md):
+#   0  success
+#   1  generic runtime failure (not a git repo, base/compare invalid, fetch failed)
+#   2  usage error
+#   3  missing dependency (git)
 
-# Latest version: https://gist.github.com/skwid138/5905e2179b5682666ca6be7502409cf9
+set -uo pipefail
+source "$(dirname "$0")/../lib/common.sh"
 
-# Default values
+usage() {
+  cat <<'EOF'
+Usage: git_rev_list.sh [OPTIONS]
+
+Compare the commits between a base branch and a compare branch in the current
+Git repository.
+
+Arguments:
+  (none)
+
+Options:
+  -b, --base BRANCH      Base branch to compare against.
+                         Default: origin/develop, then origin/main, then origin/master.
+  -c, --compare BRANCH   Branch to compare with the base.
+                         Default: current branch (HEAD).
+  -h, --help             Show this help and exit.
+
+Examples:
+  git_rev_list.sh
+  git_rev_list.sh --base origin/main
+  git_rev_list.sh -b origin/develop -c feature/foo
+EOF
+}
+
 base_branch=""
 compare_branch=""
 
-# Help documentation
-usage() {
-  echo "Usage: $0 [OPTIONS]"
-  echo ""
-  echo "Options:"
-  echo "  --base, -b       Specify the base branch to compare against (default: origin/develop, origin/main, or origin/master)"
-  echo "  --compare, -c    Specify the branch to compare with the base branch (default: current branch)"
-  echo "  --help, -h       Display this help message"
-  echo ""
-  echo "Description:"
-  echo "This script compares the number of commits between a base branch and a compare branch"
-  echo "within the current Git repository. If no compare branch is specified, the current branch"
-  echo "is used."
-  echo ""
-  exit 0
-}
-
-# Parse arguments
-while [[ "$#" -gt 0 ]]; do
-  case $1 in
-    --base | -b)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -b | --base)
+      [[ -n "${2:-}" ]] || die_usage "--base requires a value"
       base_branch="$2"
       shift 2
       ;;
-    --compare | -c)
+    -c | --compare)
+      [[ -n "${2:-}" ]] || die_usage "--compare requires a value"
       compare_branch="$2"
       shift 2
       ;;
-    --help | -h)
-      usage
+    -*)
+      die_usage "unknown flag: $1 (try --help)"
       ;;
     *)
-      echo "Unknown option: $1"
-      usage
+      die_usage "unexpected argument: $1 (try --help)"
       ;;
   esac
 done
 
-# Check if we're in a Git repository
+require_cmd "git"
+
+# Must be inside a Git work tree.
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "Error: Not inside a Git repository." >&2
-  exit 1
+  die "Not inside a Git repository."
 fi
 
-# Determine the base branch if not explicitly set
+# Determine the base branch if not explicitly set.
 if [[ -z "$base_branch" ]]; then
   echo "Determining the base branch..."
   if git show-ref --verify --quiet refs/remotes/origin/develop; then
@@ -60,35 +92,28 @@ if [[ -z "$base_branch" ]]; then
   elif git show-ref --verify --quiet refs/remotes/origin/master; then
     base_branch="origin/master"
   else
-    echo "Error: No base branch found. This repository doesn't have 'origin/develop', 'origin/main', or 'origin/master'."
-    echo "Please specify a base branch explicitly using --base or -b."
-    exit 1
+    die "No base branch found. Repo lacks origin/develop, origin/main, and origin/master. Pass --base explicitly."
   fi
 fi
 
-# Get the current branch if compare branch is not provided
+# Get the current branch if compare branch is not provided.
 if [[ -z "$compare_branch" ]]; then
-  compare_branch=$(git rev-parse --abbrev-ref HEAD)
+  compare_branch="$(git rev-parse --abbrev-ref HEAD)"
 fi
 
-# Ensure you have the latest changes before comparing
+# Ensure refs are current before comparing.
 echo "Fetching latest changes..."
-git fetch --all
+git fetch --all || die "git fetch --all failed"
 
-# Run the git rev-list command
+# Run the git rev-list command.
 echo "Comparing $base_branch to $compare_branch..."
-behind_ahead=$(git rev-list --left-right --count "$base_branch...$compare_branch" 2>/dev/null)
+behind_ahead="$(git rev-list --left-right --count "$base_branch...$compare_branch" 2>/dev/null)" ||
+  die "Failed to compare $base_branch and $compare_branch. Ensure both branches exist."
 
-# Check for errors in the rev-list command
-if [[ $? -ne 0 ]]; then
-  echo "Error: Failed to compare $base_branch and $compare_branch. Ensure both branches exist."
-  exit 1
-fi
+# Split the output into variables for clarity.
+behind="$(echo "$behind_ahead" | awk '{print $1}')"
+ahead="$(echo "$behind_ahead" | awk '{print $2}')"
 
-# Split the output into variables for clarity
-behind=$(echo "$behind_ahead" | awk '{print $1}')
-ahead=$(echo "$behind_ahead" | awk '{print $2}')
-
-# Display the formatted output
+# Display the formatted output.
 echo "Behind $base_branch by: $behind commits"
 echo "Ahead of $base_branch by: $ahead commits"

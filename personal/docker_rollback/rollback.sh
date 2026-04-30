@@ -1,31 +1,75 @@
 #!/usr/bin/env bash
-
-#######################################################################
-# Docker Desktop Rollback Script for macOS (Homebrew)
+# rollback — interactive Docker Desktop rollback for macOS via Homebrew.
 #
-# This script helps you rollback from Docker Desktop 4.48.0 to 4.47.0
+# Behavior:
+#   - Stops a running Docker Desktop, uninstalls the current cask, then
+#     attempts to install a target version using a known cask-commit hash,
+#     a user-supplied commit hash, or a direct download from Docker's CDN.
+#   - Default target is 4.47.0 (override by passing a version argument).
+#   - Prompts for confirmation and (when needed) for a commit hash.
 #
-# Usage: ./rollback.sh [VERSION]
-# Example: ./rollback.sh 4.47.0
+# Examples:
+#   rollback.sh                # rollback to default version (4.47.0)
+#   rollback.sh 4.46.0         # rollback to a specific version
 #
-# If no version is provided, defaults to 4.47.0
-#######################################################################
+# Exit codes (per docs/EXIT-CODES.md):
+#   0  success
+#   1  generic runtime failure (all install methods failed, etc.)
+#   2  usage error
+#   3  missing dependency (brew, curl)
 
-set -euo pipefail
+set -uo pipefail
+source "$(dirname "$0")/../../lib/common.sh"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+usage() {
+  cat <<'EOF'
+Usage: rollback.sh [VERSION]
 
-# Default version to rollback to
+Interactively rollback Docker Desktop to a specified version on macOS.
+
+Arguments:
+  VERSION   Target Docker Desktop version (default: 4.47.0).
+
+Options:
+  -h, --help    Show this help and exit.
+
+Examples:
+  rollback.sh
+  rollback.sh 4.46.0
+EOF
+}
+
+# Default version to rollback to.
 DEFAULT_VERSION="4.47.0"
-TARGET_VERSION="${1:-$DEFAULT_VERSION}"
+TARGET_VERSION=""
 
-# Known version to commit hash mappings for docker-desktop cask
-# These are from the Homebrew/homebrew-cask repository history
+# Parse args.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      die_usage "unknown flag: $1 (try --help)"
+      ;;
+    *)
+      if [[ -n "$TARGET_VERSION" ]]; then
+        die_usage "unexpected extra argument: $1 (try --help)"
+      fi
+      TARGET_VERSION="$1"
+      shift
+      ;;
+  esac
+done
+
+TARGET_VERSION="${TARGET_VERSION:-$DEFAULT_VERSION}"
+
+require_cmd "brew" "https://brew.sh"
+require_cmd "curl"
+
+# Known version → commit hash mappings for docker-desktop cask.
+# Update as new known-good cask commits are discovered.
 declare -A VERSION_COMMITS
 VERSION_COMMITS["4.47.0"]="e76f6ccff64e9f1eac44e59f2bb5c06c3dd2e0e7" # We'll need to find this
 VERSION_COMMITS["4.46.0"]="PLACEHOLDER"                              # Backup option
@@ -46,26 +90,17 @@ log_error() {
   echo -e "${RED}✗${NC} $1"
 }
 
-# Check if Homebrew is installed
-check_homebrew() {
-  if ! command -v brew &>/dev/null; then
-    log_error "Homebrew is not installed. Please install it first: https://brew.sh"
-    exit 1
-  fi
-  log_success "Homebrew is installed"
-}
-
-# Check current Docker Desktop version
+# Check current Docker Desktop version.
 check_current_version() {
   if [ -d "/Applications/Docker.app" ]; then
-    CURRENT_VERSION=$(defaults read /Applications/Docker.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo "unknown")
+    CURRENT_VERSION="$(defaults read /Applications/Docker.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo "unknown")"
     log_info "Current Docker Desktop version: $CURRENT_VERSION"
   else
     log_warning "Docker Desktop not found in /Applications"
   fi
 }
 
-# Stop Docker Desktop if running
+# Stop Docker Desktop if running.
 stop_docker() {
   log_info "Stopping Docker Desktop..."
 
@@ -73,7 +108,7 @@ stop_docker() {
     osascript -e 'quit app "Docker Desktop"' 2>/dev/null || true
     sleep 5
 
-    # Force quit if still running
+    # Force quit if still running.
     if pgrep -x "Docker Desktop" >/dev/null; then
       killall "Docker Desktop" 2>/dev/null || true
       sleep 2
@@ -83,11 +118,10 @@ stop_docker() {
   log_success "Docker Desktop stopped"
 }
 
-# Uninstall current Docker Desktop via Homebrew
+# Uninstall current Docker Desktop via Homebrew.
 uninstall_docker() {
   log_info "Uninstalling current Docker Desktop..."
 
-  # Check if installed via Homebrew
   if brew list --cask docker-desktop &>/dev/null; then
     brew uninstall --cask docker-desktop --force
     log_success "Docker Desktop uninstalled via Homebrew"
@@ -97,7 +131,7 @@ uninstall_docker() {
   else
     log_warning "Docker Desktop not found in Homebrew cask list"
 
-    # Manual removal if needed
+    # Manual removal if needed.
     if [ -d "/Applications/Docker.app" ]; then
       log_info "Removing /Applications/Docker.app manually..."
       sudo rm -rf /Applications/Docker.app
@@ -105,16 +139,15 @@ uninstall_docker() {
   fi
 }
 
-# Method 1: Install specific version using GitHub commit
+# Method 1: install specific version using GitHub commit.
 install_from_github_commit() {
-  local version=$1
-  local commit_hash=$2
+  local version="$1"
+  local commit_hash="$2"
 
   log_info "Attempting to install Docker Desktop $version using GitHub commit method..."
 
   local raw_url="https://raw.githubusercontent.com/Homebrew/homebrew-cask/${commit_hash}/Casks/d/docker-desktop.rb"
 
-  # Try to install from the raw URL
   if brew install --cask "$raw_url" 2>/dev/null; then
     log_success "Successfully installed Docker Desktop $version"
     return 0
@@ -124,16 +157,16 @@ install_from_github_commit() {
   fi
 }
 
-# Method 2: Direct download and install from Docker's CDN
+# Method 2: direct download and install from Docker's CDN.
 install_from_docker_cdn() {
-  local version=$1
+  local version="$1"
 
   log_info "Attempting direct download from Docker CDN..."
   log_warning "We need to find the build number for version $version"
 
-  # Known build numbers (these would need to be updated)
+  # Known build numbers (these would need to be updated).
   local build_number
-  case $version in
+  case "$version" in
     "4.48.0") build_number="207573" ;;
     "4.47.0") build_number="UNKNOWN" ;; # We need to find this
     *)
@@ -147,7 +180,7 @@ install_from_docker_cdn() {
     return 1
   fi
 
-  # Determine architecture
+  # Determine architecture.
   local arch
   if [ "$(uname -m)" == "arm64" ]; then
     arch="arm64"
@@ -163,7 +196,6 @@ install_from_docker_cdn() {
   if curl -fL -o "$dmg_path" "$download_url"; then
     log_success "Download complete"
 
-    # Mount and install
     log_info "Installing Docker Desktop..."
     hdiutil attach "$dmg_path" -nobrowse -quiet
 
@@ -184,25 +216,15 @@ install_from_docker_cdn() {
   fi
 }
 
-# Method 3: Use Homebrew extract (for formulae, not casks)
-# This method doesn't work well for casks, but included for completeness
-info_homebrew_extract() {
-  log_warning "Note: 'brew extract' works for formulae but not for casks like docker-desktop"
-  log_warning "If you need a formula-based Docker CLI (without Desktop), you can use:"
-  echo "  brew tap-new \$USER/local-docker"
-  echo "  brew extract --version=XX.XX.XX docker \$USER/local-docker"
-  echo "  brew install docker@XX.XX.XX"
-}
-
-# Search for the correct commit hash for a version
+# Search for the correct commit hash for a version (interactive).
 find_version_commit() {
-  local version=$1
+  local version="$1"
 
   log_info "Searching for commit hash for version $version..."
   log_info "Please visit: https://github.com/Homebrew/homebrew-cask/commits/master/Casks/d/docker-desktop.rb"
   log_info "Look for the commit that updated docker-desktop to version $version"
   echo ""
-  read -p "Enter the commit hash (or press Enter to try direct download): " user_commit
+  read -rp "Enter the commit hash (or press Enter to try direct download): " user_commit
 
   if [ -n "$user_commit" ]; then
     echo "$user_commit"
@@ -219,11 +241,10 @@ main() {
   log_info "==================================================================="
   echo ""
 
-  # Pre-flight checks
-  check_homebrew
+  # Pre-flight checks.
   check_current_version
 
-  # Confirm with user
+  # Confirm with user.
   echo ""
   log_warning "This script will:"
   echo "  1. Stop Docker Desktop if running"
@@ -238,15 +259,15 @@ main() {
     exit 0
   fi
 
-  # Stop and uninstall
+  # Stop and uninstall.
   stop_docker
   uninstall_docker
 
-  # Try to install the target version
+  # Try to install the target version.
   echo ""
   log_info "Attempting to install Docker Desktop $TARGET_VERSION..."
 
-  # Check if we have a known commit hash
+  # Check if we have a known commit hash.
   if [ -n "${VERSION_COMMITS[$TARGET_VERSION]:-}" ] && [ "${VERSION_COMMITS[$TARGET_VERSION]}" != "PLACEHOLDER" ]; then
     if install_from_github_commit "$TARGET_VERSION" "${VERSION_COMMITS[$TARGET_VERSION]}"; then
       log_success "Installation complete!"
@@ -256,9 +277,9 @@ main() {
     fi
   fi
 
-  # If GitHub method failed, ask user for commit hash
-  if commit_hash=$(find_version_commit "$TARGET_VERSION"); then
-    VERSION_COMMITS[$TARGET_VERSION]=$commit_hash
+  # If GitHub method failed, ask user for commit hash.
+  if commit_hash="$(find_version_commit "$TARGET_VERSION")"; then
+    VERSION_COMMITS[$TARGET_VERSION]="$commit_hash"
     if install_from_github_commit "$TARGET_VERSION" "$commit_hash"; then
       log_success "Installation complete!"
       echo ""
@@ -267,7 +288,7 @@ main() {
     fi
   fi
 
-  # Try direct download as fallback
+  # Try direct download as fallback.
   log_warning "GitHub method failed, trying direct download..."
   if install_from_docker_cdn "$TARGET_VERSION"; then
     log_success "Installation complete!"
@@ -276,7 +297,7 @@ main() {
     exit 0
   fi
 
-  # If all methods failed
+  # If all methods failed.
   log_error "All installation methods failed"
   echo ""
   log_info "Manual installation options:"
@@ -292,8 +313,7 @@ main() {
   echo "  3. Get the raw URL of docker-desktop.rb from that commit"
   echo "  4. Run: brew install --cask [RAW_URL]"
 
-  exit 1
+  die "all installation methods failed"
 }
 
-# Run main function
 main "$@"

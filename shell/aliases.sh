@@ -13,8 +13,28 @@ alias lsd="ls -d -1 */ | lolcat"
 ## Git rev list gist
 [[ ! -f "$HOME/code/scripts/personal/git_rev_list.sh" ]] || alias git_rev_list='"$HOME/code/scripts/personal/git_rev_list.sh"'
 
-## Github workflow tail gist
-[[ ! -f "$HOME/code/scripts/personal/github_workflow_tail.sh" ]] || alias gh_wt='"$HOME/code/scripts/personal/github_workflow_tail.sh"'
+## Watch the latest GitHub Actions run via `gh run watch` and `say` when done.
+## Replaces the old github_workflow_tail.sh (deleted; gh covers it natively).
+## Usage:
+##   gh-watch-say                          # watches latest run, says "workflow completed"
+##   gh-watch-say "deploy is green"        # custom message
+##   gh-watch-say "all good" Samantha      # custom message + voice
+gh-watch-say() {
+  local message="${1:-workflow completed}"
+  local voice="${2:-}"
+  command -v gh >/dev/null 2>&1 || {
+    echo "gh-watch-say: gh CLI not on PATH" >&2
+    return 127
+  }
+  gh run watch --exit-status
+  local rc=$?
+  if [[ -n "$voice" ]]; then
+    say -v "$voice" "$message"
+  else
+    say "$message"
+  fi
+  return "$rc"
+}
 
 [[ ! -f "$HOME/code/scripts/personal/mov2gif.sh" ]] || alias mov2gif='"$HOME/code/scripts/personal/mov2gif.sh"'
 
