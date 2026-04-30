@@ -235,22 +235,19 @@ check_script_has_test() {
 # Legacy personal/ scripts that predate the per-script invariant policy.
 # Listed by basename (with .sh). Failures on these scripts are downgraded
 # to a single warn ("legacy personal script") so they don't break CI but
-# stay visible. Refactor pending Phase 10 of NEOVIM-TMUX-PLAN.
+# stay visible.
 #
-# When a script in this list is brought up to standard (--help exits 0,
-# 'set -uo pipefail', sources lib/common.sh, has bats suite), remove its
-# entry here so it's audited fully going forward.
-LEGACY_PERSONAL_ALLOWLIST=(
-  # ~/code/scripts/personal/
-  "git_rev_list.sh"
-  "github_workflow_tail.sh"
-  "mov2gif.sh"
-  "get_docker_version_brew.sh"
-  "rollback.sh"
-  # ~/code/wpromote/scripts/personal/
-  "npm_cmd_docker.sh"
-  "init.sh"
-)
+# Currently empty: all previously-listed legacy personal/ scripts have been
+# brought up to standard as of Phase 10 of NEOVIM-TMUX-PLAN. The
+# is_legacy_personal() helper and the warn-branch logic in check_repo()
+# remain in place defensively in case future legacy entries need to be
+# tolerated temporarily.
+#
+# When a script needs to be added back here (e.g. a hand-written one-off
+# imported into personal/), list its basename below. When it is brought up
+# to standard (--help exits 0, 'set -uo pipefail', sources lib/common.sh,
+# has bats suite), remove its entry so it's audited fully going forward.
+LEGACY_PERSONAL_ALLOWLIST=()
 
 is_legacy_personal() {
   local name="$1" entry

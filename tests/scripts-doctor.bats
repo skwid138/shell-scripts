@@ -352,43 +352,48 @@ EOF
   assert_output --partial "broken-personal.sh: has bats suite"
 }
 
-@test "scripts-doctor: a legacy-allowlisted personal/ script emits one warn (not fail)" {
+@test "scripts-doctor: legacy allowlist is empty post-Phase 10 (former entries get full audit)" {
+  # As of Phase 10 of NEOVIM-TMUX-PLAN, LEGACY_PERSONAL_ALLOWLIST is
+  # intentionally empty. Names that USED to be allowlisted (e.g. mov2gif.sh)
+  # must now be audited like any other personal/ script. Drop a deliberately
+  # broken script with that name into a fixture repo and confirm the audit
+  # surfaces the violations rather than emitting a single "legacy" warn.
   write_valid_ci
   write_valid_script "agent-pass.sh"
   mkdir -p "$REPO/personal"
-  # 'mov2gif.sh' is in LEGACY_PERSONAL_ALLOWLIST.
   cat >"$REPO/personal/mov2gif.sh" <<'EOF'
 #!/bin/bash
 set -e
-echo "deliberately violates everything; should warn, not fail"
+echo "former-legacy name; must now be fully audited"
 EOF
   chmod +x "$REPO/personal/mov2gif.sh"
 
   run "$SCRIPT" --repo "$REPO"
-  assert_success
-  assert_output --partial "mov2gif.sh (personal, legacy)"
-  assert_output --partial "refactor pending Phase 10"
-  # Per-invariant lines must NOT appear for allowlisted scripts.
-  refute_output --partial "mov2gif.sh: --help exits 0"
-  refute_output --partial "mov2gif.sh: strict mode"
-  refute_output --partial "mov2gif.sh: has bats suite"
+  assert_failure
+  # Per-invariant violations must appear (NOT a single 'legacy' warn).
+  assert_output --partial "mov2gif.sh: no 'set -e'"
+  assert_output --partial "mov2gif.sh: has bats suite"
+  refute_output --partial "mov2gif.sh (personal, legacy)"
 }
 
-@test "scripts-doctor: legacy allowlist matches by basename even for subdirectory scripts" {
+@test "scripts-doctor: subdirectory personal/ scripts are audited fully (allowlist empty)" {
+  # Even though the legacy-warn branch in check_repo() remains in place
+  # defensively, with an empty allowlist subdirectory scripts get the full
+  # invariant treatment.
   write_valid_ci
   write_valid_script "agent-pass.sh"
   mkdir -p "$REPO/personal/docker_rollback"
-  # 'rollback.sh' is in LEGACY_PERSONAL_ALLOWLIST. Lives under a subdir.
   cat >"$REPO/personal/docker_rollback/rollback.sh" <<'EOF'
 #!/bin/bash
 set -e
-echo "subdir + legacy + violations -> single warn"
+echo "subdir + violations should fail audit, not warn"
 EOF
   chmod +x "$REPO/personal/docker_rollback/rollback.sh"
 
   run "$SCRIPT" --repo "$REPO"
-  assert_success
-  assert_output --partial "rollback.sh (personal, legacy)"
+  assert_failure
+  assert_output --partial "rollback.sh: no 'set -e'"
+  refute_output --partial "rollback.sh (personal, legacy)"
 }
 
 @test "scripts-doctor: repo without personal/ dir audits cleanly (skip silently)" {
