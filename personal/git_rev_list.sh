@@ -8,67 +8,67 @@ compare_branch=""
 
 # Help documentation
 usage() {
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  --base, -b       Specify the base branch to compare against (default: origin/develop, origin/main, or origin/master)"
-    echo "  --compare, -c    Specify the branch to compare with the base branch (default: current branch)"
-    echo "  --help, -h       Display this help message"
-    echo ""
-    echo "Description:"
-    echo "This script compares the number of commits between a base branch and a compare branch"
-    echo "within the current Git repository. If no compare branch is specified, the current branch"
-    echo "is used."
-    echo ""
-    exit 0
+  echo "Usage: $0 [OPTIONS]"
+  echo ""
+  echo "Options:"
+  echo "  --base, -b       Specify the base branch to compare against (default: origin/develop, origin/main, or origin/master)"
+  echo "  --compare, -c    Specify the branch to compare with the base branch (default: current branch)"
+  echo "  --help, -h       Display this help message"
+  echo ""
+  echo "Description:"
+  echo "This script compares the number of commits between a base branch and a compare branch"
+  echo "within the current Git repository. If no compare branch is specified, the current branch"
+  echo "is used."
+  echo ""
+  exit 0
 }
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
-    case $1 in
+  case $1 in
     --base | -b)
-        base_branch="$2"
-        shift 2
-        ;;
+      base_branch="$2"
+      shift 2
+      ;;
     --compare | -c)
-        compare_branch="$2"
-        shift 2
-        ;;
+      compare_branch="$2"
+      shift 2
+      ;;
     --help | -h)
-        usage
-        ;;
+      usage
+      ;;
     *)
-        echo "Unknown option: $1"
-        usage
-        ;;
-    esac
+      echo "Unknown option: $1"
+      usage
+      ;;
+  esac
 done
 
 # Check if we're in a Git repository
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    echo "Error: Not inside a Git repository." >&2
-    exit 1
+  echo "Error: Not inside a Git repository." >&2
+  exit 1
 fi
 
 # Determine the base branch if not explicitly set
 if [[ -z "$base_branch" ]]; then
-    echo "Determining the base branch..."
-    if git show-ref --verify --quiet refs/remotes/origin/develop; then
-        base_branch="origin/develop"
-    elif git show-ref --verify --quiet refs/remotes/origin/main; then
-        base_branch="origin/main"
-    elif git show-ref --verify --quiet refs/remotes/origin/master; then
-        base_branch="origin/master"
-    else
-        echo "Error: No base branch found. This repository doesn't have 'origin/develop', 'origin/main', or 'origin/master'."
-        echo "Please specify a base branch explicitly using --base or -b."
-        exit 1
-    fi
+  echo "Determining the base branch..."
+  if git show-ref --verify --quiet refs/remotes/origin/develop; then
+    base_branch="origin/develop"
+  elif git show-ref --verify --quiet refs/remotes/origin/main; then
+    base_branch="origin/main"
+  elif git show-ref --verify --quiet refs/remotes/origin/master; then
+    base_branch="origin/master"
+  else
+    echo "Error: No base branch found. This repository doesn't have 'origin/develop', 'origin/main', or 'origin/master'."
+    echo "Please specify a base branch explicitly using --base or -b."
+    exit 1
+  fi
 fi
 
 # Get the current branch if compare branch is not provided
 if [[ -z "$compare_branch" ]]; then
-    compare_branch=$(git rev-parse --abbrev-ref HEAD)
+  compare_branch=$(git rev-parse --abbrev-ref HEAD)
 fi
 
 # Ensure you have the latest changes before comparing
@@ -81,8 +81,8 @@ behind_ahead=$(git rev-list --left-right --count "$base_branch...$compare_branch
 
 # Check for errors in the rev-list command
 if [[ $? -ne 0 ]]; then
-    echo "Error: Failed to compare $base_branch and $compare_branch. Ensure both branches exist."
-    exit 1
+  echo "Error: Failed to compare $base_branch and $compare_branch. Ensure both branches exist."
+  exit 1
 fi
 
 # Split the output into variables for clarity

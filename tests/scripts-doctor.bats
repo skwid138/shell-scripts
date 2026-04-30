@@ -275,7 +275,7 @@ EOF
   REPO2="$(mktemp -d)"
   mkdir -p "$REPO2/agent" "$REPO2/tests" "$REPO2/.github/workflows"
   REPO_BACKUP="$REPO"
-  REPO="$REPO2" write_valid_ci   # use REPO2 for second one
+  REPO="$REPO2" write_valid_ci # use REPO2 for second one
   cat >"$REPO2/.github/workflows/ci.yml" <<'EOF'
 jobs:
   t:
@@ -302,4 +302,101 @@ EOF
   assert_output --partial "two.sh"
 
   rm -rf "$REPO2"
+}
+
+# --- personal/ scoping + legacy allowlist ------------------------------------
+#
+# scripts-doctor audits personal/ scripts with the same invariants as agent/
+# (--help exits 0, set -uo pipefail, sources lib, has bats suite), EXCEPT
+# scripts whose basename is in LEGACY_PERSONAL_ALLOWLIST emit a single
+# 'legacy personal script' warn instead. Allowlist matches by basename so
+# scripts in subdirectories (e.g. personal/docker_rollback/rollback.sh) are
+# covered.
+
+@test "scripts-doctor: a fully-compliant personal/ script passes all four invariants" {
+  write_valid_ci
+  write_valid_script "agent-pass.sh"
+  mkdir -p "$REPO/personal"
+  cat >"$REPO/personal/clean-personal.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+source "$(dirname "$0")/../lib/common.sh"
+case "${1:-}" in -h|--help) echo "u"; exit 0;; esac
+EOF
+  chmod +x "$REPO/personal/clean-personal.sh"
+  touch "$REPO/tests/clean-personal.bats"
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_success
+  assert_output --partial "clean-personal.sh: --help exits 0"
+  assert_output --partial "clean-personal.sh: strict mode"
+  assert_output --partial "clean-personal.sh: sources lib"
+  assert_output --partial "clean-personal.sh: has bats suite"
+  refute_output --partial "clean-personal.sh (personal, legacy)"
+}
+
+@test "scripts-doctor: a non-allowlisted personal/ script with violations FAILS the audit" {
+  write_valid_ci
+  write_valid_script "agent-pass.sh"
+  mkdir -p "$REPO/personal"
+  cat >"$REPO/personal/broken-personal.sh" <<'EOF'
+#!/bin/bash
+set -e
+echo "no help, no lib, no bats, wrong strict mode"
+EOF
+  chmod +x "$REPO/personal/broken-personal.sh"
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_failure
+  assert_output --partial "broken-personal.sh: no 'set -e'"
+  assert_output --partial "broken-personal.sh: has bats suite"
+}
+
+@test "scripts-doctor: a legacy-allowlisted personal/ script emits one warn (not fail)" {
+  write_valid_ci
+  write_valid_script "agent-pass.sh"
+  mkdir -p "$REPO/personal"
+  # 'mov2gif.sh' is in LEGACY_PERSONAL_ALLOWLIST.
+  cat >"$REPO/personal/mov2gif.sh" <<'EOF'
+#!/bin/bash
+set -e
+echo "deliberately violates everything; should warn, not fail"
+EOF
+  chmod +x "$REPO/personal/mov2gif.sh"
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_success
+  assert_output --partial "mov2gif.sh (personal, legacy)"
+  assert_output --partial "refactor pending Phase 10"
+  # Per-invariant lines must NOT appear for allowlisted scripts.
+  refute_output --partial "mov2gif.sh: --help exits 0"
+  refute_output --partial "mov2gif.sh: strict mode"
+  refute_output --partial "mov2gif.sh: has bats suite"
+}
+
+@test "scripts-doctor: legacy allowlist matches by basename even for subdirectory scripts" {
+  write_valid_ci
+  write_valid_script "agent-pass.sh"
+  mkdir -p "$REPO/personal/docker_rollback"
+  # 'rollback.sh' is in LEGACY_PERSONAL_ALLOWLIST. Lives under a subdir.
+  cat >"$REPO/personal/docker_rollback/rollback.sh" <<'EOF'
+#!/bin/bash
+set -e
+echo "subdir + legacy + violations -> single warn"
+EOF
+  chmod +x "$REPO/personal/docker_rollback/rollback.sh"
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_success
+  assert_output --partial "rollback.sh (personal, legacy)"
+}
+
+@test "scripts-doctor: repo without personal/ dir audits cleanly (skip silently)" {
+  write_valid_ci
+  write_valid_script "agent-pass.sh"
+  # Deliberately no $REPO/personal/ directory.
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_success
+  refute_output --partial "personal,"
 }

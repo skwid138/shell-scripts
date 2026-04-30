@@ -2,7 +2,7 @@
 
 ####################################################################
 # Docker Desktop Version Finder
-# 
+#
 # This helper script helps you find the Homebrew cask commit hash
 # for a specific Docker Desktop version
 #
@@ -35,12 +35,12 @@ echo "URL: $CASK_COMMITS_URL"
 echo ""
 
 # Try to open in default browser
-if command -v open &> /dev/null; then
-    open "$CASK_COMMITS_URL"
-elif command -v xdg-open &> /dev/null; then
-    xdg-open "$CASK_COMMITS_URL"
+if command -v open &>/dev/null; then
+  open "$CASK_COMMITS_URL"
+elif command -v xdg-open &>/dev/null; then
+  xdg-open "$CASK_COMMITS_URL"
 else
-    echo -e "${YELLOW}Please manually open: $CASK_COMMITS_URL${NC}"
+  echo -e "${YELLOW}Please manually open: $CASK_COMMITS_URL${NC}"
 fi
 
 echo -e "${GREEN}Step 2:${NC} What to do in GitHub:"
@@ -78,32 +78,32 @@ echo -e "${BLUE}Attempting to fetch recent commits via GitHub API...${NC}"
 echo ""
 
 TEMP_FILE=$(mktemp)
-if curl -s "https://api.github.com/repos/Homebrew/homebrew-cask/commits?path=Casks/d/docker-desktop.rb&per_page=20" > "$TEMP_FILE"; then
-    echo "Recent commits:"
-    echo ""
-    
-    # Parse and display commits
-    grep -E '"sha"|"message"' "$TEMP_FILE" | paste - - | head -n 10 | while IFS= read -r line; do
-        sha=$(echo "$line" | grep -oE '"sha": "[^"]+' | cut -d'"' -f4)
-        msg=$(echo "$line" | grep -oE '"message": "[^"]+"' | cut -d'"' -f4)
-        
-        # Highlight if it contains our version
-        if echo "$msg" | grep -q "$VERSION"; then
-            echo -e "${GREEN}✓ MATCH:${NC} $msg"
-            echo "  SHA: $sha"
-            echo "  URL: https://raw.githubusercontent.com/Homebrew/homebrew-cask/$sha/Casks/d/docker-desktop.rb"
-            echo ""
-        else
-            # Show version if present in message
-            if echo "$msg" | grep -qE "[0-9]+\.[0-9]+\.[0-9]+"; then
-                extracted_version=$(echo "$msg" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1)
-                echo "  Version $extracted_version: $sha"
-            fi
-        fi
-    done
+if curl -s "https://api.github.com/repos/Homebrew/homebrew-cask/commits?path=Casks/d/docker-desktop.rb&per_page=20" >"$TEMP_FILE"; then
+  echo "Recent commits:"
+  echo ""
+
+  # Parse and display commits
+  grep -E '"sha"|"message"' "$TEMP_FILE" | paste - - | head -n 10 | while IFS= read -r line; do
+    sha=$(echo "$line" | grep -oE '"sha": "[^"]+' | cut -d'"' -f4)
+    msg=$(echo "$line" | grep -oE '"message": "[^"]+"' | cut -d'"' -f4)
+
+    # Highlight if it contains our version
+    if echo "$msg" | grep -q "$VERSION"; then
+      echo -e "${GREEN}✓ MATCH:${NC} $msg"
+      echo "  SHA: $sha"
+      echo "  URL: https://raw.githubusercontent.com/Homebrew/homebrew-cask/$sha/Casks/d/docker-desktop.rb"
+      echo ""
+    else
+      # Show version if present in message
+      if echo "$msg" | grep -qE "[0-9]+\.[0-9]+\.[0-9]+"; then
+        extracted_version=$(echo "$msg" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+        echo "  Version $extracted_version: $sha"
+      fi
+    fi
+  done
 else
-    echo -e "${YELLOW}Could not fetch from GitHub API (you may be rate limited)${NC}"
-    echo "Please use the manual method in your browser."
+  echo -e "${YELLOW}Could not fetch from GitHub API (you may be rate limited)${NC}"
+  echo "Please use the manual method in your browser."
 fi
 
 rm -f "$TEMP_FILE"

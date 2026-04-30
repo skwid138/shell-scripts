@@ -2,13 +2,27 @@
 # scripts-doctor — health-check the shell-scripts ecosystem.
 #
 # Audits both ~/code/scripts (public layer) and ~/code/wpromote/scripts
-# (Wpromote layer) for invariants the rest of the project assumes:
+# (Wpromote layer) for invariants the rest of the project assumes.
+#
+# Per-script checks (applied to agent/ and personal/):
+#   - has a matching tests/<basename>.bats suite
+#   - accepts --help and exits 0
+#   - uses 'set -uo pipefail' (NOT '-e')
+#   - sources lib/common.sh (or lib/detect.sh, which loads it transitively)
+#
+# Repo-level checks:
 #   - required & recommended tooling installed
-#   - every agent/ script has a bats suite
-#   - every agent/ script accepts --help and exits 0
-#   - every agent/ script uses 'set -uo pipefail' (NOT '-e')
-#   - every agent/ script sources lib/common.sh
 #   - CI workflow exists and pins actions/checkout to a major version
+#
+# Why agent/ and personal/ but not shell/ or lib/:
+#   - shell/  — sourced by ~/.zshrc (init scripts, aliases). Not invoked
+#               directly; --help is meaningless.
+#   - lib/    — sourced by other scripts (helpers like die_*, require_cmd).
+#               Not invoked directly; --help is meaningless.
+#   - agent/  — user-facing CLIs invoked by humans / opencode. Full audit.
+#   - personal/ — user-facing CLIs (treated first-class). Full audit, with
+#                 a temporary LEGACY_PERSONAL_ALLOWLIST for scripts that
+#                 predate the policy (pending Phase 10 of NEOVIM-TMUX-PLAN).
 #
 # Exits 0 if all checks pass, 1 otherwise.
 # Outputs JSON to stdout when --json is set, human-readable text otherwise.
@@ -218,6 +232,34 @@ check_script_has_test() {
 
 # --- per-repo orchestration ---
 
+# Legacy personal/ scripts that predate the per-script invariant policy.
+# Listed by basename (with .sh). Failures on these scripts are downgraded
+# to a single warn ("legacy personal script") so they don't break CI but
+# stay visible. Refactor pending Phase 10 of NEOVIM-TMUX-PLAN.
+#
+# When a script in this list is brought up to standard (--help exits 0,
+# 'set -uo pipefail', sources lib/common.sh, has bats suite), remove its
+# entry here so it's audited fully going forward.
+LEGACY_PERSONAL_ALLOWLIST=(
+  # ~/code/scripts/personal/
+  "git_rev_list.sh"
+  "github_workflow_tail.sh"
+  "mov2gif.sh"
+  "get_docker_version_brew.sh"
+  "rollback.sh"
+  # ~/code/wpromote/scripts/personal/
+  "npm_cmd_docker.sh"
+  "init.sh"
+)
+
+is_legacy_personal() {
+  local name="$1" entry
+  for entry in "${LEGACY_PERSONAL_ALLOWLIST[@]}"; do
+    [[ "$name" == "$entry" ]] && return 0
+  done
+  return 1
+}
+
 check_repo() {
   local repo="$1"
   if [[ "$JSON" -eq 0 ]]; then
@@ -244,7 +286,7 @@ check_repo() {
     record "$repo" "CI workflow exists" "fail" "no $ci"
   fi
 
-  # Per-script checks.
+  # Per-script checks for agent/ — full standard, no allowlist.
   local script
   for script in "$repo/agent"/*.sh; do
     [[ -f "$script" ]] || continue
@@ -253,6 +295,27 @@ check_repo() {
     check_script_sources_common "$repo" "$script"
     check_script_has_test "$repo" "$script"
   done
+
+  # Per-script checks for personal/ — same invariants apply (this repo
+  # treats personal/ as first-class), but legacy scripts are temporarily
+  # exempt via LEGACY_PERSONAL_ALLOWLIST. Recurses into subdirectories
+  # because some personal/ scripts live in subdirs (docker_rollback/, etc.).
+  if [[ -d "$repo/personal" ]]; then
+    while IFS= read -r script; do
+      [[ -f "$script" ]] || continue
+      local name
+      name="$(basename "$script")"
+      if is_legacy_personal "$name"; then
+        record "$repo" "$name (personal, legacy)" "warn" \
+          "legacy personal script — refactor pending Phase 10 of NEOVIM-TMUX-PLAN"
+        continue
+      fi
+      check_script_help "$repo" "$script"
+      check_script_strict_mode "$repo" "$script"
+      check_script_sources_common "$repo" "$script"
+      check_script_has_test "$repo" "$script"
+    done < <(find "$repo/personal" -name '*.sh' -type f 2>/dev/null)
+  fi
 }
 
 # --- run ---

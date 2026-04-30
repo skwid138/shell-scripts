@@ -21,23 +21,23 @@ function show_help() {
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
   case $1 in
-  -w | --workflow)
-    WORKFLOW_NAME="$2"
-    shift
-    ;;
-  -v | --voice)
-    VOICE="$2"
-    shift
-    ;;
-  -m | --message)
-    MESSAGE="$2"
-    shift
-    ;;
-  -h | --help) show_help ;;
-  *)
-    echo "Unknown option: $1"
-    show_help
-    ;;
+    -w | --workflow)
+      WORKFLOW_NAME="$2"
+      shift
+      ;;
+    -v | --voice)
+      VOICE="$2"
+      shift
+      ;;
+    -m | --message)
+      MESSAGE="$2"
+      shift
+      ;;
+    -h | --help) show_help ;;
+    *)
+      echo "Unknown option: $1"
+      show_help
+      ;;
   esac
   shift
 done

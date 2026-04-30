@@ -3,7 +3,15 @@
 
 BATS    := ./tests/test_helper/bats-core/bin/bats
 TESTS   := tests/*.bats
-SCRIPTS := $(wildcard shell/*.sh) $(wildcard agent/*.sh) $(wildcard lib/*.sh)
+# Collect all *.sh scripts under the four script-bearing directories.
+# `find` (rather than $(wildcard)) is used uniformly for two reasons:
+#   1. Uniformity / readability — one idiom rather than mixed wildcard+find.
+#   2. Recursion — personal/ has subdirs (e.g. personal/docker_rollback/),
+#      and we don't want lint coverage to silently miss a script just because
+#      someone nests it. The other dirs (shell/, agent/, lib/) are flat today
+#      but recursion costs nothing if that ever changes.
+# The 2>/dev/null protects against any of the dirs being absent.
+SCRIPTS := $(shell find shell agent lib personal -name '*.sh' -type f 2>/dev/null)
 
 # shfmt formatting flags (project convention):
 #   -i 2  : 2-space indent (matches .editorconfig)
