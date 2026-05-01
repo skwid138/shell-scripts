@@ -37,7 +37,7 @@ typeset -gA _BREW_PREFIX
 _BREW_PREFIX=(
   coreutils "/opt/homebrew/opt/coreutils"
   grep "/opt/homebrew/opt/grep"
-  gnu-sed "/opt/homebrew/opt/gnu-sed"
+  gnused "/opt/homebrew/opt/gnu-sed"
   gawk "/opt/homebrew/opt/gawk"
   findutils "/opt/homebrew/opt/findutils"
   postgresql "/opt/homebrew/opt/postgresql@17"
@@ -47,9 +47,18 @@ _BREW_PREFIX=(
 # Prepend GNU coreutils/grep/sed/awk/findutils gnubin dirs.
 # _path_prepend gates on `[[ -d ]]`, so a stale prefix (after `brew uninstall`)
 # is silently skipped — never PATH corruption.
+#
+# NOTE on the 'gnused' key: the formula's actual brew name is `gnu-sed` with
+# a hyphen, but a hyphenated assoc-array key is fragile in zsh — shfmt
+# parses ${assoc[key]} subscripts as bash arithmetic context and rewrites
+# `gnu-sed` → `gnu - sed` (subtraction), which evaluates to an empty key.
+# Quoting the key (single or double) doesn't help: zsh then looks for the
+# literal string with quote chars. Renaming the key to `gnused` is the
+# simplest robust fix and stays stable through any future formatter pass.
+# `make refresh-paths` (Phase 5) will preserve this key naming.
 _path_prepend "${_BREW_PREFIX[coreutils]}/libexec/gnubin"
 _path_prepend "${_BREW_PREFIX[grep]}/libexec/gnubin"
-_path_prepend "${_BREW_PREFIX[gnu - sed]}/libexec/gnubin"
+_path_prepend "${_BREW_PREFIX[gnused]}/libexec/gnubin"
 _path_prepend "${_BREW_PREFIX[gawk]}/libexec/gnubin"
 _path_prepend "${_BREW_PREFIX[findutils]}/libexec/gnubin"
 
@@ -99,6 +108,13 @@ _paths_check_freshness() {
     printf 'note: ~/code/scripts shell paths never refreshed; run: make -C ~/code/scripts refresh-paths\n' >&2
     return 0
   fi
+  # zmodload zsh/datetime exposes the EPOCHSECONDS parameter (epoch in
+  # seconds). It's auto-loaded in interactive shells but NOT in `zsh -c`
+  # non-interactive subshells (cron, LaunchAgents, opencode tool calls,
+  # bats). Without this load, EPOCHSECONDS is empty, the arithmetic
+  # below silently yields a small/garbage value, and the staleness nag
+  # never fires. Idempotent: zmodload is a no-op if already loaded.
+  zmodload zsh/datetime 2>/dev/null || return 0
   # zmodload zsh/stat exposes the zstat builtin (no `stat` shellout).
   zmodload -F zsh/stat b:zstat 2>/dev/null || return 0
   local mtime

@@ -34,3 +34,6 @@ fi
 # Wpromote login-tier (optional; private repo).
 [[ -f "$HOME/code/wpromote/scripts/shell/init_profile.zsh" ]] &&
   source "$HOME/code/wpromote/scripts/shell/init_profile.zsh"
+
+# Explicit success exit — see init_env.zsh for rationale.
+return 0

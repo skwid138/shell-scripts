@@ -41,3 +41,9 @@ export REPO_ROOT
 
 # Local, machine-specific overrides (gitignored). Optional.
 [[ -f "$SCRIPTS_DIR/env/vars.local.zsh" ]] && source "$SCRIPTS_DIR/env/vars.local.zsh"
+
+# Explicit success exit. Without this, the final `[[ -f ... ]]` test above
+# leaks its exit status (1 when the optional file doesn't exist) as the
+# source command's status — breaking `source init_env.zsh && do-thing`
+# chains and causing bats `assert_success` to fail spuriously.
+return 0

@@ -58,3 +58,6 @@ fi
 # Wpromote rc-tier (optional; private repo).
 [[ -f "$HOME/code/wpromote/scripts/shell/init_rc.zsh" ]] &&
   source "$HOME/code/wpromote/scripts/shell/init_rc.zsh"
+
+# Explicit success exit — see init_env.zsh for rationale.
+return 0
