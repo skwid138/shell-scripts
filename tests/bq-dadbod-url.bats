@@ -108,3 +108,37 @@ EOF
   assert_failure
   assert_output --partial "Failed to resolve BQ project for env 'bogus'"
 }
+
+# --- repo-relative source resolution (regression for 4.6-B) ----------------
+# The script must resolve lib/common.sh relative to its own location, NOT
+# via $HOME/code/scripts. Otherwise it fails on CI (where the checkout path
+# isn't $HOME/code/scripts) AND for any user who clones the repo elsewhere.
+# Reverting the fix in personal/bq-dadbod-url.sh to the old hardcoded
+# $HOME path makes this test fail.
+
+@test "bq-dadbod-url: resolves lib/common.sh when invoked from a non-\$HOME cwd" {
+  # cd somewhere unrelated to the repo so the script's only way to find
+  # lib/common.sh is via BASH_SOURCE-relative resolution.
+  cd /tmp
+  run "$SCRIPT" tst all_clients
+  assert_success
+  assert_output "bigquery://prj-test-fake-tst/all_clients"
+  # If common.sh failed to load, die_usage would be undefined and the
+  # missing-arg path below would surface "die_usage: command not found"
+  # instead of exit 2 with the expected message.
+  run "$SCRIPT"
+  assert_failure 2
+  assert_output --partial "Missing <env>"
+  refute_output --partial "command not found"
+}
+
+@test "bq-dadbod-url: resolves lib/common.sh when HOME points elsewhere" {
+  # Simulates a CI runner where $HOME exists but doesn't contain
+  # code/scripts/. The fix must not rely on $HOME at all.
+  fake_home="$(mktemp -d)"
+  cd /tmp
+  HOME="$fake_home" run "$SCRIPT" tst all_clients
+  assert_success
+  assert_output "bigquery://prj-test-fake-tst/all_clients"
+  rm -rf "$fake_home"
+}

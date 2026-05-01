@@ -226,3 +226,29 @@ EOF
   [[ "$status" -eq 7 ]]
   assert_output --partial "simulated upstream failure"
 }
+
+# --- repo-relative source resolution (regression for 4.6-B) ----------------
+# Same defense as in bq-dadbod-url.bats: bq.sh historically sourced
+# lib/common.sh via $HOME/code/scripts which broke on CI runners and
+# anyone cloning the repo elsewhere. The fix resolves via BASH_SOURCE.
+
+@test "bq: resolves lib/common.sh when invoked from a non-\$HOME cwd" {
+  cd /tmp
+  # Hit a no-shellout codepath so we don't need bq itself.
+  run "$SCRIPT" --list-envs
+  assert_success
+  assert_output --partial "tst"
+  # Confirm common.sh actually loaded: missing-arg path uses die_usage.
+  run "$SCRIPT"
+  assert_failure 2
+  refute_output --partial "command not found"
+}
+
+@test "bq: resolves lib/common.sh when HOME points elsewhere" {
+  fake_home="$(mktemp -d)"
+  cd /tmp
+  HOME="$fake_home" run "$SCRIPT" --list-envs
+  assert_success
+  assert_output --partial "tst"
+  rm -rf "$fake_home"
+}

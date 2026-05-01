@@ -30,8 +30,14 @@
 # Exit codes (via lib/common.sh):
 #   1 die, 2 die_usage, 3 die_missing_dep, 4 die_unauthed, 5 die_upstream
 set -uo pipefail
-# shellcheck source=/Users/hunter/code/scripts/lib/common.sh
-source "$HOME/code/scripts/lib/common.sh"
+# Resolve lib/common.sh relative to this script (not via $HOME) so the script
+# works regardless of where the repo is cloned — including CI runners where
+# the checkout path is not $HOME/code/scripts. Mirrors the resolution pattern
+# in lib/keychain.sh.
+_BQ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$_BQ_DIR/../lib/common.sh"
+unset _BQ_DIR
 
 # Default location of the wpromote-layer project resolver. Test harnesses
 # (and any future relocation) can override via GCP_PROJECT_MAP.
