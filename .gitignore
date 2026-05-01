@@ -1,6 +1,8 @@
-# Local, machine-specific overrides (sourced by vars.sh and friends, never committed)
+# Local, machine-specific overrides (sourced by vars.sh / vars.local.zsh, never committed)
 vars.local.sh
+vars.local.zsh
 *.local.sh
+*.local.zsh
 
 # Snapshots / backups
 *.backup-*
