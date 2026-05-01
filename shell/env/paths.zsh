@@ -12,15 +12,40 @@
 
 # ──────────────────────────────────────────────────────────────────────
 # _path_prepend <dir>
-#   Prepend $1 to PATH iff (a) $1 is a directory and (b) not already on PATH.
-#   Replaces the old _prepend_brew_path helper, which shelled out to
-#   `brew --prefix` on every PATH-dependent command.
+#   Ensure $1 is at the FRONT of $PATH, iff $1 is a directory.
+#   - If $1 isn't a directory: no-op (lets us list optional prefixes
+#     without `[[ -d ]]` guards at the call site).
+#   - If $1 isn't on PATH: prepend it.
+#   - If $1 IS on PATH but not at the front: PROMOTE it (remove the
+#     existing occurrence and prepend). This matters on macOS login
+#     shells: /etc/zprofile runs `path_helper` BETWEEN ~/.zshenv and
+#     ~/.zprofile and rewrites PATH, demoting /opt/homebrew/bin to
+#     after /usr/bin:/bin. Without promotion, sourcing the env-tier
+#     a second time (from .zprofile) would no-op when it sees homebrew
+#     "already present", leaving `which bash` pointing at /bin/bash 3.2
+#     instead of /opt/homebrew/bin/bash 5.x. With promotion, the second
+#     source restores the intended ordering.
+#   - Replaces the old _prepend_brew_path helper, which shelled out to
+#     `brew --prefix` on every PATH-dependent command.
 # ──────────────────────────────────────────────────────────────────────
 _path_prepend() {
   local dir="$1"
   [[ -d "$dir" ]] || return 0
   case ":$PATH:" in
-    *":$dir:"*) return 0 ;;
+    "$dir:"*) return 0 ;; # already at front; nothing to do
+    *":$dir:"*)
+      # Present but not at front — promote. Use zsh array splitting on
+      # ':' so we don't mangle dirs containing spaces or special chars.
+      local -a parts
+      parts=("${(@s/:/)PATH}")
+      local p new
+      new="$dir"
+      for p in "${parts[@]}"; do
+        [[ "$p" == "$dir" ]] && continue
+        new="$new:$p"
+      done
+      export PATH="$new"
+      ;;
     *) export PATH="$dir:$PATH" ;;
   esac
 }

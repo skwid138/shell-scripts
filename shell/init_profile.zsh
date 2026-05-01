@@ -12,7 +12,16 @@
 #   - Does NOT source rc/docker.zsh (rc-tier; completions belong in
 #     interactive shells only).
 #
-# Assumes init_env.zsh has already run (zsh sources .zshenv before .zprofile).
+# macOS PATH-helper quirk:
+# zsh login-shell load order is /etc/zshenv -> ~/.zshenv (env-tier runs)
+# -> /etc/zprofile -> ~/.zprofile (this file). On macOS, /etc/zprofile
+# runs `path_helper` which REWRITES $PATH from /etc/paths and
+# /etc/paths.d/*, blowing away the carefully-ordered PATH that the
+# env-tier just built. Symptoms include /opt/homebrew/bin landing
+# AFTER /usr/bin:/bin (so `#!/usr/bin/env bash` resolves to bash 3.2
+# instead of bash 5.x). Fix: re-source the env-tier here, before any
+# login-tier prepends (nvm, etc.). The env-tier's _path_prepend is
+# idempotent (skips already-present and non-existent dirs).
 
 # Resolve our directory. Prefer the SCRIPTS_DIR exported from init_env.zsh,
 # fall back to %x resolution (defensive: covers direct sourcing of this file).
@@ -20,6 +29,12 @@ if [[ -z "${SCRIPTS_DIR:-}" ]]; then
   SCRIPTS_DIR="${${(%):-%x}:A:h}"
   [[ -z "$SCRIPTS_DIR" || "$SCRIPTS_DIR" == "." ]] && SCRIPTS_DIR="$HOME/code/scripts/shell"
 fi
+
+# Re-source the env-tier to undo path_helper's damage. See header comment.
+# Safe to re-source: env-tier's _path_prepend is idempotent for already-
+# front-of-PATH dirs and PROMOTES dirs that path_helper demoted, so a
+# second run restores the intended ordering without creating duplicates.
+[[ -f "$SCRIPTS_DIR/init_env.zsh" ]] && source "$SCRIPTS_DIR/init_env.zsh"
 
 # Login-tier tool inits. Each is existence-gated.
 [[ -d "$HOME/.nvm" && -f "$SCRIPTS_DIR/login/nvm.zsh" ]] && source "$SCRIPTS_DIR/login/nvm.zsh"
