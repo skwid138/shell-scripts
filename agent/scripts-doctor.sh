@@ -251,7 +251,11 @@ LEGACY_PERSONAL_ALLOWLIST=()
 
 is_legacy_personal() {
   local name="$1" entry
-  for entry in "${LEGACY_PERSONAL_ALLOWLIST[@]}"; do
+  # bash 3.2 (the system /bin/bash on macOS) errors on "${arr[@]}" expansion of
+  # an empty array under `set -u`. The `${arr[@]+...}` parameter-expansion form
+  # is the portable idiom: it expands to nothing when the array is empty/unset
+  # and to the array contents otherwise. Fixed in bash 4.4+ but we target 3.2.
+  for entry in ${LEGACY_PERSONAL_ALLOWLIST[@]+"${LEGACY_PERSONAL_ALLOWLIST[@]}"}; do
     [[ "$name" == "$entry" ]] && return 0
   done
   return 1

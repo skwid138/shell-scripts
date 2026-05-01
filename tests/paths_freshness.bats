@@ -16,6 +16,13 @@ setup() {
   load 'test_helper/bats-assert/load'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
   CLEAN_PATH="/usr/bin:/bin"
+  # The freshness nag is gated to interactive shells; these tests source
+  # init_env.zsh from a non-interactive `zsh -c '...'` (no tty available
+  # under bats) and need the nag to be reachable to assert on its output.
+  # _PATHS_NAG_FORCE=1 is the documented escape hatch in paths.zsh for
+  # exactly this case — testing the threshold arithmetic and stderr output
+  # of the nag itself.
+  export _PATHS_NAG_FORCE=1
 }
 
 # Helper: emit a YYYYMMDDhhmm.SS stamp N days in the past.
@@ -171,4 +178,105 @@ _make_sandbox_with_aged_sentinel() {
     assert_success "exit status non-zero for age=$age days"
     rm -rf "$SANDBOX"
   done
+}
+
+# --- non-interactive gate (regression guard) -------------------------------
+#
+# These tests guard against re-introducing the bug fixed in the Phase 4.5
+# follow-up commit: env-tier was printing the freshness nag to stderr from
+# every non-interactive `zsh -c '...'` subshell, polluting any downstream
+# automation that captures stderr (bats `run` merges stdout+stderr into
+# $output; opencode tool wrappers redirect stderr to logs; cron mailers
+# email anything on stderr). The env-tier contract is "silent and side-
+# effect-free in automation"; the nag is gated to interactive shells +
+# the _PATHS_NAG_FORCE override that paths_freshness.bats sets above.
+
+@test "freshness gate: non-interactive zsh -c sourcing init_env.zsh produces no stderr (no sentinel)" {
+  # Fresh-clone scenario (no sentinel) — without the gate, this prints
+  # 'note: ~/code/scripts shell paths never refreshed; ...' to stderr.
+  SANDBOX="$(mktemp -d)"
+  unset _PATHS_NAG_FORCE
+  run zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    HOME='$SANDBOX'
+    unset XDG_CACHE_HOME
+    source '$REPO/shell/init_env.zsh'
+  "
+  assert_success
+  refute_output --partial "never refreshed"
+  refute_output --partial "days ago"
+  # Belt-and-suspenders: the entire output should be empty. Anything env-
+  # tier prints from a non-interactive `zsh -c` is a contract violation.
+  [[ -z "$output" ]] || {
+    echo "expected no stderr output, got: $output" >&3
+    false
+  }
+  rm -rf "$SANDBOX"
+  export _PATHS_NAG_FORCE=1
+}
+
+@test "freshness gate: non-interactive zsh -c sourcing init_env.zsh produces no stderr (stale sentinel)" {
+  # Stale-sentinel scenario (1000 days old) — without the gate, this prints
+  # 'note: ~/code/scripts brew paths last refreshed N days ago; ...'.
+  SANDBOX="$(_make_sandbox_with_aged_sentinel 1000)"
+  unset _PATHS_NAG_FORCE
+  run zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    XDG_CACHE_HOME='$SANDBOX/.cache'
+    source '$REPO/shell/init_env.zsh'
+  "
+  assert_success
+  refute_output --partial "days ago"
+  refute_output --partial "never refreshed"
+  [[ -z "$output" ]] || {
+    echo "expected no stderr output, got: $output" >&3
+    false
+  }
+  rm -rf "$SANDBOX"
+  export _PATHS_NAG_FORCE=1
+}
+
+@test "freshness gate: zsh -lc (login, non-interactive) sourcing init_env.zsh produces no stderr" {
+  # Login-but-non-interactive shells (rare on macOS but used by some
+  # launchd plists, ssh batch sessions, and `zsh -lc` opencode invocations)
+  # must also be silent. -l (login) does NOT imply -i (interactive).
+  SANDBOX="$(mktemp -d)"
+  unset _PATHS_NAG_FORCE
+  run zsh -lc --no-rcs "
+    PATH='$CLEAN_PATH'
+    HOME='$SANDBOX'
+    unset XDG_CACHE_HOME
+    source '$REPO/shell/init_env.zsh'
+  " || true
+  # Some zsh versions reject -lc + --no-rcs combinations; fall back to plain -c
+  if [[ "$status" -ne 0 ]] && [[ "$output" == *"--no-rcs"* ]]; then
+    run zsh --no-rcs -c "
+      PATH='$CLEAN_PATH'
+      HOME='$SANDBOX'
+      unset XDG_CACHE_HOME
+      source '$REPO/shell/init_env.zsh'
+    "
+  fi
+  refute_output --partial "never refreshed"
+  refute_output --partial "days ago"
+  rm -rf "$SANDBOX"
+  export _PATHS_NAG_FORCE=1
+}
+
+@test "freshness gate: _PATHS_NAG_FORCE override re-enables nag in non-interactive context" {
+  # Confirms the escape hatch works (it's what paths_freshness.bats relies
+  # on). If this test ever fails, the rest of the freshness suite will
+  # also fail — but this test localizes the failure to the override
+  # mechanism specifically.
+  SANDBOX="$(mktemp -d)"
+  run zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    HOME='$SANDBOX'
+    unset XDG_CACHE_HOME
+    _PATHS_NAG_FORCE=1
+    source '$REPO/shell/init_env.zsh'
+  "
+  assert_success
+  assert_output --partial "never refreshed"
+  rm -rf "$SANDBOX"
 }

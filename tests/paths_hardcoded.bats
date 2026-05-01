@@ -151,7 +151,8 @@ setup() {
   # sentinels — silently breaking the 14-day backstop.
   #
   # We simulate a 100-day-old sentinel and assert the nag fires with a
-  # plausible age (>= 14 days).
+  # plausible age (>= 14 days). _PATHS_NAG_FORCE=1 bypasses the
+  # interactive-only gate (see paths.zsh and paths_freshness.bats setup).
   SANDBOX="$(mktemp -d)"
   mkdir -p "$SANDBOX/.cache/zsh"
   SENTINEL="$SANDBOX/.cache/zsh/paths-refreshed"
@@ -167,6 +168,7 @@ setup() {
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
     XDG_CACHE_HOME='$SANDBOX/.cache'
+    _PATHS_NAG_FORCE=1
     source '$REPO/shell/init_env.zsh' 2>&1 >/dev/null
   "
   assert_output --partial "days ago"
@@ -183,6 +185,7 @@ setup() {
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
     XDG_CACHE_HOME='$SANDBOX/.cache'
+    _PATHS_NAG_FORCE=1
     source '$REPO/shell/init_env.zsh' 2>&1 >/dev/null
   "
   assert_output --partial "never refreshed"

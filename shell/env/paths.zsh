@@ -102,6 +102,20 @@ _path_prepend "$HOME/bin"
 # routine `zsh -c '<one-liner>'` invocations.
 # ──────────────────────────────────────────────────────────────────────
 _paths_check_freshness() {
+  # Gate: the nag is a UI affordance for the human at the terminal —
+  # `make refresh-paths` is something a person runs. Firing it from
+  # non-interactive subshells (`zsh -c '...'`, bats, cron, opencode tool
+  # calls, CI) just pollutes stderr and breaks output-asserting tests
+  # downstream. Mirrors how nvm/conda live in the login-tier rather than
+  # env-tier: env-tier must be silent and side-effect-free in automation.
+  #
+  # The `_PATHS_NAG_FORCE` escape hatch exists so the dedicated freshness
+  # tests in tests/paths_freshness.bats can exercise the nag's threshold
+  # arithmetic and stderr output end-to-end (those tests *are* testing the
+  # interactive-UI path; everything else is not).
+  if [[ -z "${_PATHS_NAG_FORCE:-}" && ! -o interactive ]]; then
+    return 0
+  fi
   local sentinel="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/paths-refreshed"
   local age_days_threshold=14
   if [[ ! -f "$sentinel" ]]; then

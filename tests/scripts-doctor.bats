@@ -405,3 +405,46 @@ EOF
   assert_success
   refute_output --partial "personal,"
 }
+
+# --- bash 3.2 portability ----------------------------------------------------
+#
+# macOS ships /bin/bash 3.2.57. Agent scripts use `#!/usr/bin/env bash` and
+# may be picked up by either modern bash (5.x via Homebrew) or system bash
+# 3.2 depending on PATH. The doctor's own tooling section warns about this:
+# "agent scripts should be portable". These tests enforce that contract for
+# scripts-doctor itself, since it's the canary and was caught regressing in
+# Phase 4.5.
+#
+# Specific historical regressions guarded:
+#   - empty-array expansion ("${arr[@]}" of an empty array) under `set -u`
+#     errors with "unbound variable" in bash 3.2 but works in 4.4+. The
+#     ${arr[@]+"${arr[@]}"} form is the portable idiom.
+
+@test "scripts-doctor: runs cleanly under /bin/bash 3.2 (empty-array regression guard)" {
+  # Skip if /bin/bash isn't actually old bash (e.g. Linux CI may symlink to bash 5).
+  if ! /bin/bash --version | grep -qE 'version 3\.'; then
+    skip "/bin/bash is not bash 3.x on this host; regression target absent"
+  fi
+  write_valid_ci
+  write_valid_script "good.sh"
+
+  # Force the doctor to run under /bin/bash regardless of shebang resolution.
+  run /bin/bash "$SCRIPT" --repo "$REPO"
+  assert_success
+  refute_output --partial "unbound variable"
+  refute_output --partial "LEGACY_PERSONAL_ALLOWLIST"
+  assert_output --partial "result: OK"
+}
+
+@test "scripts-doctor: --json runs cleanly under /bin/bash 3.2" {
+  if ! /bin/bash --version | grep -qE 'version 3\.'; then
+    skip "/bin/bash is not bash 3.x on this host; regression target absent"
+  fi
+  write_valid_ci
+  write_valid_script "good.sh"
+
+  run /bin/bash "$SCRIPT" --repo "$REPO" --json
+  assert_success
+  refute_output --partial "unbound variable"
+  [[ "$(jq -r .ok <<<"$output")" == "true" ]]
+}
