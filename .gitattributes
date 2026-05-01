@@ -1,0 +1,5 @@
+# Ensure GitHub renders .zsh files with shell highlighting and counts them
+# in language stats (otherwise linguist treats them as a separate language
+# or marks them as text). Both .sh and .zsh are "Shell" for our purposes.
+*.zsh linguist-language=Shell
+*.zsh diff=zsh

@@ -3,7 +3,9 @@
 
 BATS    := ./tests/test_helper/bats-core/bin/bats
 TESTS   := tests/*.bats
-# Collect all *.sh scripts under the four script-bearing directories.
+# Collect shell scripts under the four script-bearing directories, split by
+# dialect so each gets the right tooling (rev. 6 of the zsh-init refactor).
+#
 # `find` (rather than $(wildcard)) is used uniformly for two reasons:
 #   1. Uniformity / readability — one idiom rather than mixed wildcard+find.
 #   2. Recursion — personal/ has subdirs (e.g. personal/docker_rollback/),
@@ -11,15 +13,25 @@ TESTS   := tests/*.bats
 #      someone nests it. The other dirs (shell/, agent/, lib/) are flat today
 #      but recursion costs nothing if that ever changes.
 # The 2>/dev/null protects against any of the dirs being absent.
-SCRIPTS := $(shell find shell agent lib personal -name '*.sh' -type f 2>/dev/null)
+#
+# .sh = POSIX/bash-portable (linted by shellcheck in bash mode).
+# .zsh = zsh-only (syntax-checked by `zsh -n`; shellcheck excluded by default,
+#   per-file opt-in via `# shellcheck shell=bash` directive at top of file).
+# Both extensions are formatted by shfmt, which auto-detects dialect from the
+# file extension (shfmt v3+ supports `-ln zsh` natively; .zsh files are
+# parsed under the zsh dialect, .sh under bash).
+SH_FILES  := $(shell find shell agent lib personal -name '*.sh'  -type f 2>/dev/null)
+ZSH_FILES := $(shell find shell agent lib personal -name '*.zsh' -type f 2>/dev/null)
+SCRIPTS   := $(SH_FILES) $(ZSH_FILES)
 
 # shfmt formatting flags (project convention):
 #   -i 2  : 2-space indent (matches .editorconfig)
 #   -ci   : indent switch case clauses
 # Notably NOT -sr (we keep redirects unspaced, e.g. >/dev/null)
+# Dialect (`-ln bash` / `-ln zsh`) is auto-detected from extension.
 SHFMT_FLAGS := -i 2 -ci
 
-.PHONY: help test install-bats lint lint-strict fmt fmt-check check clean install-hook uninstall-hook
+.PHONY: help test install-bats lint lint-sh lint-zsh lint-strict fmt fmt-check check clean install-hook uninstall-hook
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -33,11 +45,47 @@ install-bats: ## Initialize bats test framework submodules
 test: install-bats ## Run all bats tests
 	$(BATS) $(TESTS)
 
-lint: ## Run shellcheck (severity warning+; advisory)
-	shellcheck -x --severity=warning $(SCRIPTS)
+# --- Lint targets (dialect-aware; rev. 6) ---------------------------------
+# .sh files: shellcheck (bash mode). .zsh files: `zsh -n` parser check.
+# `lint` runs both at warning severity (advisory); `lint-strict` runs both
+# at error severity (CI gate). `lint-sh` and `lint-zsh` are the underlying
+# per-dialect targets, exposed for targeted iteration.
+
+lint-sh: ## Run shellcheck on .sh files (severity warning+; advisory)
+	@if [ -n "$(SH_FILES)" ]; then \
+		shellcheck -x --severity=warning $(SH_FILES); \
+	else \
+		echo "lint-sh: no .sh files found"; \
+	fi
+
+lint-zsh: ## Syntax-check .zsh files with `zsh -n`
+	@command -v zsh >/dev/null 2>&1 || { echo "zsh not installed; cannot lint .zsh files"; exit 3; }
+	@if [ -z "$(ZSH_FILES)" ]; then \
+		echo "lint-zsh: no .zsh files found"; \
+	else \
+		fail=0; \
+		for f in $(ZSH_FILES); do \
+			zsh -n "$$f" || { echo "syntax error: $$f" >&2; fail=1; }; \
+		done; \
+		exit $$fail; \
+	fi
+
+lint: lint-sh lint-zsh ## Lint all shell files (advisory severity)
 
 lint-strict: ## Stricter lint that gates CI: errors only
-	shellcheck -x --severity=error $(SCRIPTS)
+	@if [ -n "$(SH_FILES)" ]; then \
+		shellcheck -x --severity=error $(SH_FILES); \
+	fi
+	@command -v zsh >/dev/null 2>&1 || { echo "zsh not installed; cannot lint .zsh files"; exit 3; }
+	@if [ -n "$(ZSH_FILES)" ]; then \
+		fail=0; \
+		for f in $(ZSH_FILES); do \
+			zsh -n "$$f" || { echo "syntax error: $$f" >&2; fail=1; }; \
+		done; \
+		exit $$fail; \
+	fi
+
+# --- Format targets (shfmt auto-detects dialect from extension) ----------
 
 fmt: ## Apply shfmt formatting in place (2-space indent, switch-case indent)
 	@command -v shfmt >/dev/null 2>&1 || { echo "shfmt not installed. Run: brew install shfmt"; exit 3; }

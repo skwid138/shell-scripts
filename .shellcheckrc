@@ -1,5 +1,14 @@
 # shellcheck configuration for shell-scripts repo.
 # https://www.shellcheck.net/wiki/Directive
+#
+# Per-extension dialect strategy (rev. 6 of zsh-init refactor):
+#   .sh  files are linted by shellcheck in bash mode (the Makefile passes
+#        only $(SH_FILES) to shellcheck; .zsh files are excluded from the
+#        shellcheck invocation entirely).
+#   .zsh files are syntax-checked by `zsh -n` instead. Per-file opt-in to
+#        shellcheck's bash-overlap rules is available by adding
+#        `# shellcheck shell=bash` at the top of an individual .zsh file.
+# This file applies to whichever files shellcheck does scan.
 
 # External sources (lib/, etc.) are dynamic via "$DIR/file.sh" patterns.
 # SC1091: "Not following: file was not specified as input" — universally noisy.
