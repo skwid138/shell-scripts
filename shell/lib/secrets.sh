@@ -22,6 +22,56 @@
 # The file is .sh (not .zsh) deliberately so future MCP wrappers can:
 #   bash -c '. "$HOME/code/scripts/shell/lib/secrets.sh"; secret_load …; exec …'
 # without a zsh dependency.
+#
+# ----------------------------------------------------------------------------
+# Usage guidance — prefer secret_load over secret_get for repeated access
+# ----------------------------------------------------------------------------
+#
+# secret_load is the recommended entry point for almost every consumer. It
+# exports the secret as a named env var, then short-circuits on subsequent
+# calls by checking that env var directly — meaning the second-and-later
+# call costs ~zero (no cache lookup, no subshell, no Keychain shellout).
+#
+#   # Recommended pattern:
+#   secret_load WPRO_OPEN_AI_API_SECRET wpro-openai \
+#     || die_unauthed "wpro-openai not in keychain"
+#   curl -H "Authorization: Bearer $WPRO_OPEN_AI_API_SECRET" …
+#
+# secret_get is for callers that DON'T want the secret in the environment
+# (e.g. piping into a tool that reads stdin). The in-process cache makes
+# repeated calls cheap *within the same shell process*, but watch out:
+#
+#   # SUBTLE: each $(...) is a subshell. The cache write happens inside
+#   # the subshell and dies with it, so the second call re-queries Keychain.
+#   token1="$(secret_get wpro-openai)"   # Keychain hit
+#   token2="$(secret_get wpro-openai)"   # Keychain hit AGAIN (subshell quirk)
+#
+#   # Fix: hoist out of the subshell — direct invocation reuses the cache.
+#   secret_get wpro-openai >/tmp/token   # Keychain hit
+#   secret_get wpro-openai >/tmp/token2  # cached (no Keychain hit)
+#
+# If you find yourself calling $(secret_get …) more than once in the same
+# shell, reach for secret_load instead.
+#
+# ----------------------------------------------------------------------------
+# Two-layer memoization in secret_load — env var (fast path) + cache (fallback)
+# ----------------------------------------------------------------------------
+#
+# secret_load short-circuits in two stages:
+#
+#   1. Fast path: ${!var}/${(P)var} indirect read on the named env var.
+#      If the var is already set non-empty, return immediately. This is the
+#      hot path for repeated calls in the same shell.
+#
+#   2. Fallback: call secret_get, which checks the in-process cache before
+#      hitting Keychain. Relevant if the caller manually `unset`s the var
+#      (e.g. for re-load semantics) — the cache still holds the value, so
+#      the re-load is fast.
+#
+# These layers are NOT redundant. An `unset MY_TOKEN` will fall through to
+# the cache, and `secret_clear MY_TOKEN_ENTRY` will fall through to Keychain.
+# Both unset operations together force a fresh Keychain query — useful after
+# a rotation.
 
 # Re-source guard (matches the _LIB_COMMON_LOADED pattern from lib/common.sh).
 if [[ -n "${_LIB_SECRETS_LOADED:-}" ]]; then
