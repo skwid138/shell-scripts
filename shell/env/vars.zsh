@@ -1,51 +1,25 @@
-#!/bin/bash
-# Environment variables and secrets for ~/code/scripts/
+#!/usr/bin/env zsh
+# env/vars.zsh — env-tier environment variables.
 #
-# Secrets are loaded from the macOS Keychain via keychain_get. See the
-# secrets-bootstrap doc in the dotfiles repo for how to populate Keychain
-# entries on a new machine.
+# Sourced from init_env.zsh (which is sourced from .zshenv). Runs in EVERY
+# zsh invocation, including non-interactive subshells, so the contract is:
+# fast, silent, and NO keychain access.
 #
-# For machine-specific or non-shareable variables that you don't want
-# committed, create vars.local.sh in this directory. It's gitignored and
-# sourced at the end of this file if present.
+# For Keychain-backed secrets, callers use lib/secrets.sh::secret_load
+# explicitly at the point of need. The previous _load_secret helper that
+# eagerly populated env vars at shell startup has been removed (rev. 6 of
+# zsh_init_plan.md §4):
+#
+#   - GITHUB_PAT_WPROMOTE / HOMEBREW_GITHUB_API_TOKEN: load lazily in any
+#     wpromote brew helper that needs them.
+#   - HF_READ_TOKEN: load lazily in the one HF script that uses it.
+#   - SONARQUBE_TOKEN: was dead coupling. agent/sonar-pr-issues.sh uses
+#     `require_auth "sonar"` against the SonarCloud CLI's own auth state
+#     and never reads this env var. Removed entirely.
+#
+# For machine-specific or non-shareable variables, create env/vars.local.zsh
+# in this directory. It's gitignored and sourced at the end of init_env.zsh.
 
-# shellcheck source=../lib/keychain.sh
-source "$HOME/code/scripts/lib/keychain.sh"
-
-# Core environment variables
+# Core environment variables (kept from the original vars.sh contract).
 export EDITOR=vim
 export VISUAL=vim
-
-# Helper: load a Keychain secret into a named env var.
-# - Splits declare-and-assign so keychain_get's exit code isn't masked (SC2155).
-# - On failure: emits a one-line warning to stderr and exports an empty value
-#   so downstream code can detect the missing secret without aborting startup.
-_load_secret() {
-  local var="$1"
-  local entry="$2"
-  local value
-  if value="$(keychain_get "$entry" 2>/dev/null)" && [[ -n "$value" ]]; then
-    export "$var=$value"
-  else
-    export "$var="
-    printf 'Warning: keychain entry %q not found; %s is empty\n' "$entry" "$var" >&2
-  fi
-}
-
-# PAT for skwid138 wpromote resources (homebrew, wp-sdk)
-_load_secret GITHUB_PAT_WPROMOTE github-pat-wpromote
-
-# Variable for https://github.com/wpromote/wp-sdk
-export HOMEBREW_GITHUB_API_TOKEN="$GITHUB_PAT_WPROMOTE"
-
-# Hugging Face token for Skwid138 resources
-_load_secret HF_READ_TOKEN huggingface-read
-
-# SonarQube token for Skwid138 resources (sonarqube_cli_mbp_m4_2026.04)
-_load_secret SONARQUBE_TOKEN sonarqube-token
-
-unset -f _load_secret
-
-# Local, machine-specific overrides (gitignored). Optional.
-# shellcheck source=/dev/null
-[[ -f "$HOME/code/scripts/shell/vars.local.sh" ]] && source "$HOME/code/scripts/shell/vars.local.sh"

@@ -38,3 +38,24 @@ clipflip() {
   local output="$2"
   ffmpeg -i "$input" -c:v libx264 -c:a aac "$output"
 }
+
+## brew wrapper — auto-refresh hardcoded prefixes in shell/env/paths.zsh
+## after path-affecting subcommands. Function form (not alias) so all
+## subcommands behave identically to the real binary; only the listed
+## mutating commands trigger the regeneration.
+##
+## Non-interactive caveat (rev. 5 of zsh_init_plan.md §5): this lives in
+## rc-tier and is therefore not defined in non-interactive shells. The
+## 14-day staleness nag in env/paths.zsh is the safety net for those
+## cases (and for background HOMEBREW_AUTO_UPDATE, Brewfile bundles,
+## idle machines, brand-new clones).
+brew() {
+  command brew "$@" || return $?
+  case "$1" in
+    upgrade | install | uninstall | reinstall | bundle | update)
+      # Subshell so cwd is preserved.
+      (cd "$HOME/code/scripts" && make refresh-paths) ||
+        printf 'warn: brew wrapper: make refresh-paths failed; PATH may be stale\n' >&2
+      ;;
+  esac
+}
