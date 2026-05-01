@@ -141,10 +141,22 @@ _paths_check_freshness() {
   if [[ -z "${_PATHS_NAG_FORCE:-}" && ! -o interactive ]]; then
     return 0
   fi
+  # Once-per-shell guard. paths.zsh is sourced from init_env.zsh, which is
+  # itself sourced from BOTH ~/.zshenv (env-tier, every shell) and
+  # ~/.zprofile (re-sourced via init_profile.zsh to undo macOS path_helper
+  # damage — see init_profile.zsh header). Without this guard, login
+  # shells print the nag twice. We use a shell-scoped (not exported)
+  # variable so each new shell still gets its own evaluation, but a
+  # single shell's repeated env-tier sources are deduped. Tests that
+  # need to re-fire within one shell can `unset _PATHS_NAG_FIRED`.
+  if [[ -n "${_PATHS_NAG_FIRED:-}" ]]; then
+    return 0
+  fi
   local sentinel="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/paths-refreshed"
   local age_days_threshold=14
   if [[ ! -f "$sentinel" ]]; then
     printf 'note: ~/code/scripts shell paths never refreshed; run: make -C ~/code/scripts refresh-paths\n' >&2
+    _PATHS_NAG_FIRED=1
     return 0
   fi
   # zmodload zsh/datetime exposes the EPOCHSECONDS parameter (epoch in
@@ -162,5 +174,6 @@ _paths_check_freshness() {
   local age_days=$(((now - mtime) / 86400))
   ((age_days < age_days_threshold)) && return 0
   printf 'note: ~/code/scripts brew paths last refreshed %d days ago; consider: make -C ~/code/scripts refresh-paths\n' "$age_days" >&2
+  _PATHS_NAG_FIRED=1
 }
 _paths_check_freshness

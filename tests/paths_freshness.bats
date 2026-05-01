@@ -280,3 +280,136 @@ _make_sandbox_with_aged_sentinel() {
   assert_output --partial "never refreshed"
   rm -rf "$SANDBOX"
 }
+
+# --- once-per-shell guard (regression guard) -------------------------------
+#
+# These tests guard the bug fixed alongside the macOS path_helper PATH-
+# ordering fix: init_profile.zsh re-sources init_env.zsh to undo
+# path_helper's damage, which means paths.zsh runs TWICE in a single
+# login shell. Without _PATHS_NAG_FIRED, users saw the freshness nag
+# printed twice on every new terminal:
+#
+#     Last login: ...
+#     note: ~/code/scripts shell paths never refreshed; ...
+#     note: ~/code/scripts shell paths never refreshed; ...
+#
+# The once-per-shell guard fires the nag at most once per shell process,
+# while still letting each new shell evaluate freshness independently.
+# `unset _PATHS_NAG_FIRED` is the documented re-fire mechanism.
+
+@test "once-per-shell: nag prints exactly once when init_env.zsh is sourced twice (no sentinel)" {
+  # The exact scenario users hit on login: env-tier sources paths.zsh
+  # from .zshenv, then init_profile.zsh re-sources init_env.zsh from
+  # .zprofile to undo path_helper damage. Without the guard, two prints.
+  SANDBOX="$(mktemp -d)"
+  run zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    HOME='$SANDBOX'
+    unset XDG_CACHE_HOME
+    source '$REPO/shell/init_env.zsh'
+    source '$REPO/shell/init_env.zsh'
+  " 2>&1
+  assert_success
+  count="$(printf '%s' "$output" | grep -c 'never refreshed' || true)"
+  [[ "$count" -eq 1 ]] || {
+    echo "expected exactly 1 'never refreshed' message, got $count: $output" >&3
+    false
+  }
+  rm -rf "$SANDBOX"
+}
+
+@test "once-per-shell: nag prints exactly once when init_env.zsh is sourced twice (stale sentinel)" {
+  # Same regression guard for the stale-sentinel branch (the other code
+  # path that prints to stderr).
+  SANDBOX="$(_make_sandbox_with_aged_sentinel 1000)"
+  run zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    XDG_CACHE_HOME='$SANDBOX/.cache'
+    source '$REPO/shell/init_env.zsh'
+    source '$REPO/shell/init_env.zsh'
+  " 2>&1
+  assert_success
+  count="$(printf '%s' "$output" | grep -c 'days ago' || true)"
+  [[ "$count" -eq 1 ]] || {
+    echo "expected exactly 1 'days ago' message, got $count: $output" >&3
+    false
+  }
+  rm -rf "$SANDBOX"
+}
+
+@test "once-per-shell: end-to-end zsh -lc (with init_profile.zsh re-source) prints nag at most once" {
+  # The integration test for the exact user-visible bug: a real login
+  # shell traversing .zshenv -> /etc/zprofile -> .zprofile (which sources
+  # init_profile.zsh, which re-sources init_env.zsh). Uses the user's
+  # actual ~/.zshenv / ~/.zprofile chain (not a sandboxed HOME) because
+  # we need init_profile.zsh's re-source path to fire.
+  #
+  # We accept 0 or 1 occurrences of the nag (depending on the user's
+  # current sentinel state — the test is robust either way) but reject 2+.
+  if [[ ! -f "$HOME/.zshenv" || ! -f "$HOME/.zprofile" ]]; then
+    skip "user .zshenv/.zprofile not present; integration test not meaningful"
+  fi
+  run env PATH="/usr/bin:/bin" zsh -lc 'true' 2>&1
+  # Don't assert success — user's login shell may have other unrelated
+  # warnings; we only care about the freshness nag count.
+  nag_count="$(printf '%s' "$output" | grep -cE '(never refreshed|days ago)' || true)"
+  [[ "$nag_count" -le 1 ]] || {
+    echo "expected at most 1 freshness nag in zsh -lc output, got $nag_count: $output" >&3
+    false
+  }
+}
+
+@test "once-per-shell: unsetting _PATHS_NAG_FIRED allows the nag to re-fire (escape hatch)" {
+  # Documents the test/debug escape hatch: callers (or future tests)
+  # that genuinely need the nag to re-fire within one shell can do so by
+  # unsetting _PATHS_NAG_FIRED. If this test fails, the guard's
+  # reset semantics broke.
+  SANDBOX="$(mktemp -d)"
+  run zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    HOME='$SANDBOX'
+    unset XDG_CACHE_HOME
+    _PATHS_NAG_FORCE=1
+    source '$REPO/shell/init_env.zsh'
+    unset _PATHS_NAG_FIRED
+    source '$REPO/shell/init_env.zsh'
+  " 2>&1
+  assert_success
+  count="$(printf '%s' "$output" | grep -c 'never refreshed' || true)"
+  [[ "$count" -eq 2 ]] || {
+    echo "expected exactly 2 'never refreshed' messages after explicit reset, got $count: $output" >&3
+    false
+  }
+  rm -rf "$SANDBOX"
+}
+
+@test "once-per-shell: separate shells each get one nag (guard does not leak across shells)" {
+  # The guard is shell-scoped (not exported). Two independent shells
+  # must each fire their own nag — confirms we didn't accidentally
+  # `export` _PATHS_NAG_FIRED, which would suppress every shell after
+  # the first within a session.
+  SANDBOX="$(mktemp -d)"
+  out1="$(zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    HOME='$SANDBOX'
+    unset XDG_CACHE_HOME
+    _PATHS_NAG_FORCE=1
+    source '$REPO/shell/init_env.zsh'
+  " 2>&1)"
+  out2="$(zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    HOME='$SANDBOX'
+    unset XDG_CACHE_HOME
+    _PATHS_NAG_FORCE=1
+    source '$REPO/shell/init_env.zsh'
+  " 2>&1)"
+  [[ "$out1" == *"never refreshed"* ]] || {
+    echo "shell 1 missed nag: $out1" >&3
+    false
+  }
+  [[ "$out2" == *"never refreshed"* ]] || {
+    echo "shell 2 missed nag: $out2" >&3
+    false
+  }
+  rm -rf "$SANDBOX"
+}
