@@ -39,6 +39,66 @@ setup() {
 # Helper: position of $1 in $PATH (1-indexed, 0 if absent).
 # Implemented in zsh inside the test's subshell rather than here in bash.
 
+# Helper: build a ZDOTDIR sandbox whose .zshenv + .zprofile source our
+# init barrels. Required because the GH-hosted macOS runner's $HOME has
+# no user shell config — `zsh -lc` would otherwise just pick up
+# /etc/zshenv -> /etc/zprofile (which runs path_helper) and never
+# invoke our env-tier prepend code. With ZDOTDIR pointed at this
+# sandbox, zsh sources our barrels in the same order a real user's
+# shell would (.zshenv -> /etc/zprofile -> .zprofile), which is exactly
+# what the post-Phase 4.5 fix is supposed to survive.
+#
+# Usage:
+#   ZDOTDIR="$(_make_zdotdir_sandbox)"
+#   run env PATH="/usr/bin:/bin" ZDOTDIR="$ZDOTDIR" zsh -lc '...'
+#   rm -rf "$ZDOTDIR"
+_make_zdotdir_sandbox() {
+  local sandbox
+  sandbox="$(mktemp -d)"
+  # .zshenv runs first (always sourced for any zsh invocation).
+  printf 'source %q\n' "$REPO/shell/init_env.zsh" >"$sandbox/.zshenv"
+  # .zprofile runs after /etc/zprofile (= path_helper) for login shells.
+  # This is where the post-path_helper recovery happens.
+  printf 'source %q\n' "$REPO/shell/init_profile.zsh" >"$sandbox/.zprofile"
+  printf '%s\n' "$sandbox"
+}
+
+# Helper: run a zsh command in the sandboxed login-shell environment
+# and capture ONLY stdout. Stderr is discarded because optional tools
+# (nvm, fortune/cowsay/lolcat) emit "command not found" / "Required
+# commands not installed" warnings at startup on CI runners that lack
+# them, and those warnings would otherwise pollute `$output` and
+# break colon-split awk parsing of the PATH line.
+#
+# Sets `$output` and `$status` (mimicking bats `run`) so existing
+# assertion patterns (`assert_success`, `$output`, `assert_output`)
+# keep working. Caller is responsible for `rm -rf "$ZDOTDIR_SANDBOX"`
+# after asserting if they don't want to leak temp dirs.
+#
+# Usage:
+#   ZDOTDIR_SANDBOX="$(_make_zdotdir_sandbox)"
+#   _run_login_shell '/usr/bin:/bin' 'print -- "$PATH"'
+#   rm -rf "$ZDOTDIR_SANDBOX"
+#   assert_success
+_run_login_shell() {
+  local initial_path="$1" cmd="$2" out_tmp
+  out_tmp="$(mktemp)"
+  env PATH="$initial_path" ZDOTDIR="$ZDOTDIR_SANDBOX" HOME="$ZDOTDIR_SANDBOX" zsh -lc "$cmd" >"$out_tmp" 2>/dev/null
+  status=$?
+  output="$(cat "$out_tmp")"
+  rm -f "$out_tmp"
+}
+
+# Same as _run_login_shell but for non-login shells (zsh -c instead of zsh -lc).
+_run_nonlogin_shell() {
+  local initial_path="$1" cmd="$2" out_tmp
+  out_tmp="$(mktemp)"
+  env PATH="$initial_path" ZDOTDIR="$ZDOTDIR_SANDBOX" HOME="$ZDOTDIR_SANDBOX" zsh -c "$cmd" >"$out_tmp" 2>/dev/null
+  status=$?
+  output="$(cat "$out_tmp")"
+  rm -f "$out_tmp"
+}
+
 # --- _path_prepend: promote-to-front semantics -------------------------------
 
 @test "_path_prepend: prepends a dir not already on PATH" {
@@ -137,9 +197,13 @@ setup() {
   if [[ ! -d /opt/homebrew/bin ]]; then
     skip "/opt/homebrew/bin not present on this host"
   fi
-  run env PATH="/usr/bin:/bin" zsh -lc 'print -- "$PATH"'
-  assert_success
-  # Both must appear.
+  ZDOTDIR_SANDBOX="$(_make_zdotdir_sandbox)"
+  _run_login_shell "/usr/bin:/bin" 'print -- "$PATH"'
+  rm -rf "$ZDOTDIR_SANDBOX"
+  [[ "$status" -eq 0 ]] || {
+    echo "zsh -lc exited $status" >&3
+    false
+  }
   assert_output --partial "/opt/homebrew/bin"
   assert_output --partial "/usr/bin"
   # Position of /opt/homebrew/bin must be less than position of /usr/bin
@@ -168,8 +232,13 @@ setup() {
   if [[ ! -d /opt/homebrew/bin ]]; then
     skip "/opt/homebrew/bin not present on this host"
   fi
-  run env PATH="/usr/bin:/bin" zsh -lc 'print -- "$PATH"'
-  assert_success
+  ZDOTDIR_SANDBOX="$(_make_zdotdir_sandbox)"
+  _run_login_shell "/usr/bin:/bin" 'print -- "$PATH"'
+  rm -rf "$ZDOTDIR_SANDBOX"
+  [[ "$status" -eq 0 ]] || {
+    echo "zsh -lc exited $status" >&3
+    false
+  }
   brew_pos="$(awk -v p="$output" -v t="/opt/homebrew/bin" 'BEGIN {
     n=split(p,a,":"); for(i=1;i<=n;i++) if(a[i]==t){print i; exit}; print 0
   }')"
@@ -198,17 +267,30 @@ setup() {
   if [[ ! -x /opt/homebrew/bin/bash ]]; then
     skip "/opt/homebrew/bin/bash not present on this host"
   fi
-  run env PATH="/usr/bin:/bin" zsh -lc 'command -v bash'
-  assert_success
-  assert_output "/opt/homebrew/bin/bash"
+  ZDOTDIR_SANDBOX="$(_make_zdotdir_sandbox)"
+  _run_login_shell "/usr/bin:/bin" 'command -v bash'
+  rm -rf "$ZDOTDIR_SANDBOX"
+  [[ "$status" -eq 0 ]] || {
+    echo "zsh -lc exited $status, output: $output" >&3
+    false
+  }
+  [[ "$output" = "/opt/homebrew/bin/bash" ]] || {
+    echo "expected /opt/homebrew/bin/bash, got: $output" >&3
+    false
+  }
 }
 
 @test "login shell: PATH has no duplicate of /opt/homebrew/bin" {
   if [[ ! -d /opt/homebrew/bin ]]; then
     skip "/opt/homebrew/bin not present on this host"
   fi
-  run env PATH="/usr/bin:/bin" zsh -lc 'print -- "$PATH"'
-  assert_success
+  ZDOTDIR_SANDBOX="$(_make_zdotdir_sandbox)"
+  _run_login_shell "/usr/bin:/bin" 'print -- "$PATH"'
+  rm -rf "$ZDOTDIR_SANDBOX"
+  [[ "$status" -eq 0 ]] || {
+    echo "zsh -lc exited $status" >&3
+    false
+  }
   # NB: this assertion runs in bash (bats), so use printf, not zsh's print.
   count="$(printf '%s' ":$output:" | grep -o ":/opt/homebrew/bin:" | wc -l | tr -d ' ')"
   [[ "$count" -eq 1 ]] || {
@@ -224,11 +306,20 @@ setup() {
   # (no -l). path_helper does NOT run for non-login shells (it's in
   # /etc/zprofile), so the env-tier's first prepend is sufficient.
   # This test confirms there's no regression in the simple case.
+  #
+  # Note: non-login zsh sources only .zshenv from $ZDOTDIR (or $HOME)
+  # — NOT .zprofile. Our sandbox .zshenv sources init_env.zsh, which
+  # is exactly what we want to test here.
   if [[ ! -d /opt/homebrew/bin ]]; then
     skip "/opt/homebrew/bin not present on this host"
   fi
-  run env PATH="/usr/bin:/bin" zsh -c 'print -- "$PATH"'
-  assert_success
+  ZDOTDIR_SANDBOX="$(_make_zdotdir_sandbox)"
+  _run_nonlogin_shell "/usr/bin:/bin" 'print -- "$PATH"'
+  rm -rf "$ZDOTDIR_SANDBOX"
+  [[ "$status" -eq 0 ]] || {
+    echo "zsh -c exited $status" >&3
+    false
+  }
   brew_pos="$(awk -v p="$output" -v t="/opt/homebrew/bin" 'BEGIN {
     n=split(p,a,":"); for(i=1;i<=n;i++) if(a[i]==t){print i; exit}; print 0
   }')"
