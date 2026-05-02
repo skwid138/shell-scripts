@@ -168,6 +168,13 @@ setup() {
 @test "profile-minimal: env+profile combined silence on stderr" {
   # End-to-end: env-tier + login-tier together produce zero stderr noise.
   # Sandbox a fresh sentinel so the freshness nag doesn't fire.
+  #
+  # Known-noise denylist: load_nvmrc fires on profile-tier source and
+  # warns "command not found: nvm" when nvm isn't installed (CI runners
+  # legitimately don't have it). Scrub that expected line before
+  # asserting silence; meta-test below confirms the scrub doesn't
+  # swallow other warnings. See init_compat.bats for the analogous
+  # pattern.
   SANDBOX="$(mktemp -d)"
   mkdir -p "$SANDBOX/.cache/zsh"
   : >"$SANDBOX/.cache/zsh/paths-refreshed"
@@ -177,6 +184,29 @@ setup() {
     source '$REPO/shell/init_profile.zsh' 2>&1 >/dev/null
   "
   assert_success
-  assert_output ""
+  scrubbed="$(printf '%s\n' "$output" |
+    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' ||
+    true)"
+  assert [ -z "$scrubbed" ]
+  rm -rf "$SANDBOX"
+}
+
+@test "profile-minimal: silence-assertion denylist still catches genuine warnings" {
+  # Meta-test mirroring init_compat.bats: confirm the scrub denylist
+  # doesn't swallow real warnings.
+  SANDBOX="$(mktemp -d)"
+  mkdir -p "$SANDBOX/.cache/zsh"
+  : >"$SANDBOX/.cache/zsh/paths-refreshed"
+  run zsh --no-rcs -c "
+    XDG_CACHE_HOME='$SANDBOX/.cache'
+    source '$REPO/shell/init_env.zsh' 2>&1 >/dev/null
+    source '$REPO/shell/init_profile.zsh' 2>&1 >/dev/null
+    print -u2 -- 'GENUINE WARNING that must not be scrubbed'
+  "
+  scrubbed="$(printf '%s\n' "$output" |
+    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' ||
+    true)"
+  assert [ -n "$scrubbed" ]
+  echo "$scrubbed" | grep -q 'GENUINE WARNING that must not be scrubbed'
   rm -rf "$SANDBOX"
 }
