@@ -42,9 +42,14 @@ setup() {
   # Known-noise denylist: certain optional tools (nvm, fortune/cowsay/
   # lolcat) emit "command not found" or "Required commands ... not
   # installed" stderr when absent, and CI runners legitimately don't
-  # have them. We scrub those expected lines before asserting silence,
-  # so the test catches *new* warnings without fighting environment
-  # skew. The denylist is meta-tested below.
+  # have them. Likewise, running zsh under `zsh -c` with no controlling
+  # tty (as happens under bats) makes compinit print "not interactive
+  # and can't open terminal" + "compinit: initialization aborted",
+  # which then propagates as "complete:13: command not found: compdef".
+  # These are environment artifacts of the test harness, not real
+  # warnings emitted to interactive users. We scrub those expected
+  # lines before asserting silence, so the test catches *new* warnings
+  # without fighting environment skew. The denylist is meta-tested below.
   SANDBOX="$(mktemp -d)"
   mkdir -p "$SANDBOX/.cache/zsh"
   : >"$SANDBOX/.cache/zsh/paths-refreshed"
@@ -55,7 +60,10 @@ setup() {
   assert_success
   scrubbed="$(printf '%s\n' "$output" |
     grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' |
-    grep -Ev 'Required commands \(fortune, cowsay, lolcat\) are not installed' ||
+    grep -Ev 'Required commands \(fortune, cowsay, lolcat\) are not installed' |
+    grep -Ev "^not interactive and can't open terminal$" |
+    grep -Ev '^compinit: initialization aborted$' |
+    grep -Ev '^complete:[0-9]+: command not found: compdef$' ||
     true)"
   assert [ -z "$scrubbed" ]
   rm -rf "$SANDBOX"
@@ -76,7 +84,10 @@ setup() {
   "
   scrubbed="$(printf '%s\n' "$output" |
     grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' |
-    grep -Ev 'Required commands \(fortune, cowsay, lolcat\) are not installed' ||
+    grep -Ev 'Required commands \(fortune, cowsay, lolcat\) are not installed' |
+    grep -Ev "^not interactive and can't open terminal$" |
+    grep -Ev '^compinit: initialization aborted$' |
+    grep -Ev '^complete:[0-9]+: command not found: compdef$' ||
     true)"
   assert [ -n "$scrubbed" ]
   echo "$scrubbed" | grep -q 'GENUINE WARNING that must not be scrubbed'

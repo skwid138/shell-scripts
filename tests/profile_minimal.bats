@@ -171,10 +171,16 @@ setup() {
   #
   # Known-noise denylist: load_nvmrc fires on profile-tier source and
   # warns "command not found: nvm" when nvm isn't installed (CI runners
-  # legitimately don't have it). Scrub that expected line before
-  # asserting silence; meta-test below confirms the scrub doesn't
-  # swallow other warnings. See init_compat.bats for the analogous
-  # pattern.
+  # legitimately don't have it). Likewise, on Ubuntu CI's zsh, running
+  # `zsh -c` with no controlling tty surfaces compinit-related stderr
+  # ("not interactive and can't open terminal" + "compinit:
+  # initialization aborted" + "complete:NN: command not found: compdef"
+  # — the latter from Ubuntu's autoloaded `complete` function reacting
+  # to compinit's failure). These are environment artifacts of the
+  # test harness, not real warnings emitted to interactive users. Scrub
+  # those expected lines before asserting silence; meta-test below
+  # confirms the scrub doesn't swallow other warnings. See
+  # init_compat.bats for the analogous pattern.
   SANDBOX="$(mktemp -d)"
   mkdir -p "$SANDBOX/.cache/zsh"
   : >"$SANDBOX/.cache/zsh/paths-refreshed"
@@ -185,7 +191,10 @@ setup() {
   "
   assert_success
   scrubbed="$(printf '%s\n' "$output" |
-    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' ||
+    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' |
+    grep -Ev "^not interactive and can't open terminal$" |
+    grep -Ev '^compinit: initialization aborted$' |
+    grep -Ev '^complete:[0-9]+: command not found: compdef$' ||
     true)"
   assert [ -z "$scrubbed" ]
   rm -rf "$SANDBOX"
@@ -204,7 +213,10 @@ setup() {
     print -u2 -- 'GENUINE WARNING that must not be scrubbed'
   "
   scrubbed="$(printf '%s\n' "$output" |
-    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' ||
+    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' |
+    grep -Ev "^not interactive and can't open terminal$" |
+    grep -Ev '^compinit: initialization aborted$' |
+    grep -Ev '^complete:[0-9]+: command not found: compdef$' ||
     true)"
   assert [ -n "$scrubbed" ]
   echo "$scrubbed" | grep -q 'GENUINE WARNING that must not be scrubbed'
