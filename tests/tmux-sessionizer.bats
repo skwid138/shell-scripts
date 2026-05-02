@@ -219,6 +219,16 @@ EOF
   # Don't write tmux stub. PATH points at STUBDIR plus minimal system dirs
   # (so the script's `#!/usr/bin/env bash` shebang and `dirname`/`basename`
   # still resolve), but tmux itself is absent from STUBDIR.
+  #
+  # On Ubuntu CI runners, tmux is pre-installed at /usr/bin/tmux, so the
+  # require_cmd guard finds it via the /usr/bin fallback in PATH and the
+  # script proceeds — failing later with "open terminal failed: not a
+  # terminal" when tmux tries to attach. The test's invariant ("missing
+  # tmux exits 3") only holds on hosts where tmux isn't on the bare
+  # system PATH; skip elsewhere rather than fight environment skew.
+  if [[ -x /usr/bin/tmux || -x /bin/tmux ]]; then
+    skip "tmux is available on the system PATH; can't simulate 'missing' without breaking shebang resolution"
+  fi
   PATH="$STUBDIR:/usr/bin:/bin" run "$SCRIPT" "$BATS_TEST_TMPDIR"
   assert_failure 3
   assert_output --partial "tmux"
