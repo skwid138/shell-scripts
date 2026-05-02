@@ -102,25 +102,32 @@ _run_nonlogin_shell() {
 # --- _path_prepend: promote-to-front semantics -------------------------------
 
 @test "_path_prepend: prepends a dir not already on PATH" {
+  # Use a real tempdir so _path_prepend's "skip non-existent" guard
+  # doesn't no-op the call on Ubuntu CI (where /opt/homebrew/bin
+  # doesn't exist). The semantics under test are dir-name-agnostic.
+  tdir="$(mktemp -d)"
   run zsh --no-rcs -c '
     source "'"$REPO"'/shell/env/paths.zsh" >/dev/null 2>&1
     PATH="/usr/bin:/bin"
-    _path_prepend "/opt/homebrew/bin"
+    _path_prepend "'"$tdir"'"
     print -- "$PATH"
   '
+  rm -rf "$tdir"
   assert_success
-  assert_output "/opt/homebrew/bin:/usr/bin:/bin"
+  assert_output "$tdir:/usr/bin:/bin"
 }
 
 @test "_path_prepend: no-op when dir is already at the FRONT of PATH" {
+  tdir="$(mktemp -d)"
   run zsh --no-rcs -c '
     source "'"$REPO"'/shell/env/paths.zsh" >/dev/null 2>&1
-    PATH="/opt/homebrew/bin:/usr/bin:/bin"
-    _path_prepend "/opt/homebrew/bin"
+    PATH="'"$tdir"':/usr/bin:/bin"
+    _path_prepend "'"$tdir"'"
     print -- "$PATH"
   '
+  rm -rf "$tdir"
   assert_success
-  assert_output "/opt/homebrew/bin:/usr/bin:/bin"
+  assert_output "$tdir:/usr/bin:/bin"
 }
 
 @test "_path_prepend: PROMOTES a dir that is on PATH but not at the front" {
@@ -129,29 +136,33 @@ _run_nonlogin_shell() {
   # PATH and demotes homebrew to AFTER /usr/bin. When .zprofile re-sources
   # the env-tier, _path_prepend must MOVE /opt/homebrew/bin back to the
   # front, not no-op because "it's already on PATH somewhere".
+  tdir="$(mktemp -d)"
   run zsh --no-rcs -c '
     source "'"$REPO"'/shell/env/paths.zsh" >/dev/null 2>&1
-    PATH="/usr/bin:/bin:/opt/homebrew/bin"
-    _path_prepend "/opt/homebrew/bin"
+    PATH="/usr/bin:/bin:'"$tdir"'"
+    _path_prepend "'"$tdir"'"
     print -- "$PATH"
   '
+  rm -rf "$tdir"
   assert_success
-  assert_output "/opt/homebrew/bin:/usr/bin:/bin"
+  assert_output "$tdir:/usr/bin:/bin"
 }
 
 @test "_path_prepend: promotion preserves order of remaining entries" {
+  # Need real dirs for /a, /b, /c, /d AND the target — easier with a single
+  # tempdir for the target and skip-if-not-present for /a etc. Use mktemp
+  # so the test runs everywhere.
+  tdir="$(mktemp -d)"
+  a="$(mktemp -d)" b="$(mktemp -d)" c="$(mktemp -d)" d="$(mktemp -d)"
   run zsh --no-rcs -c '
     source "'"$REPO"'/shell/env/paths.zsh" >/dev/null 2>&1
-    PATH="/a:/b:/opt/homebrew/bin:/c:/d"
-    [[ -d "/opt/homebrew/bin" ]] || { print "skip"; exit 0; }
-    _path_prepend "/opt/homebrew/bin"
+    PATH="'"$a"':'"$b"':'"$tdir"':'"$c"':'"$d"'"
+    _path_prepend "'"$tdir"'"
     print -- "$PATH"
   '
+  rm -rf "$tdir" "$a" "$b" "$c" "$d"
   assert_success
-  if [[ "$output" == "skip" ]]; then
-    skip "/opt/homebrew/bin not present on this host"
-  fi
-  assert_output "/opt/homebrew/bin:/a:/b:/c:/d"
+  assert_output "$tdir:$a:$b:$c:$d"
 }
 
 @test "_path_prepend: skips non-existent dirs (no PATH mutation)" {
@@ -166,20 +177,22 @@ _run_nonlogin_shell() {
 }
 
 @test "_path_prepend: idempotent under repeated calls (no duplicates)" {
+  tdir="$(mktemp -d)"
   run zsh --no-rcs -c '
     source "'"$REPO"'/shell/env/paths.zsh" >/dev/null 2>&1
     PATH="/usr/bin:/bin"
-    _path_prepend "/opt/homebrew/bin"
-    _path_prepend "/opt/homebrew/bin"
-    _path_prepend "/opt/homebrew/bin"
+    _path_prepend "'"$tdir"'"
+    _path_prepend "'"$tdir"'"
+    _path_prepend "'"$tdir"'"
     # Count occurrences via :PATH: framing.
-    count=$(print -- ":$PATH:" | grep -o ":/opt/homebrew/bin:" | wc -l | tr -d " ")
+    count=$(print -- ":$PATH:" | grep -o ":'"$tdir"':" | wc -l | tr -d " ")
     print -- "count=$count"
     print -- "$PATH"
   '
+  rm -rf "$tdir"
   assert_success
   assert_line "count=1"
-  assert_line "/opt/homebrew/bin:/usr/bin:/bin"
+  assert_line "$tdir:/usr/bin:/bin"
 }
 
 # --- end-to-end: login-shell PATH ordering ----------------------------------

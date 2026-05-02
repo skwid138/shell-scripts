@@ -113,15 +113,20 @@ setup() {
 # --- _path_prepend dedup behavior -------------------------------------------
 
 @test "paths: _path_prepend de-duplicates re-prepends" {
+  # Use a real tempdir so _path_prepend's "skip non-existent" guard
+  # doesn't no-op every call on Ubuntu CI (where /opt/homebrew/bin
+  # doesn't exist). The dedup semantics under test are dir-name-agnostic.
+  tdir="$(mktemp -d)"
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
     source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
     typeset -f _path_prepend >/dev/null || { print -- 'NO-FN'; exit 1; }
-    target='/opt/homebrew/bin'
+    target='$tdir'
     for i in 1 2 3 4 5; do _path_prepend \"\$target\"; done
     n=\$(print -l \${(s.:.)PATH} | grep -cE \"^\$target\$\" || true)
     print -- \"count=\$n\"
   "
+  rm -rf "$tdir"
   assert_success
   assert_output --partial "count=1"
 }

@@ -132,7 +132,14 @@ setup() {
   # and the new ~/.zshenv/~/.zprofile/~/.zshrc trio (which independently
   # source the barrels). Total: each barrel sourced 2-4 times during a
   # single shell startup. PATH must remain dup-free.
+  #
+  # Reset PATH to a known clean baseline so we measure ONLY duplicates
+  # introduced by our own sourcing logic. Without this, the inherited
+  # PATH from the bats runner (e.g. Ubuntu CI's PATH listing /snap/bin
+  # twice) is reported as a "duplicate" — which is real but not caused
+  # by our code.
   run zsh --no-rcs -c "
+    PATH='/usr/bin:/bin'
     source '$REPO/shell/init.zsh' >/dev/null 2>&1
     source '$REPO/shell/init.zsh' >/dev/null 2>&1
     source '$REPO/shell/init.zsh' >/dev/null 2>&1

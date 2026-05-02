@@ -122,7 +122,13 @@ EOF
 # --- idempotency -------------------------------------------------------------
 
 @test "init_env: triple-source produces zero PATH duplicates" {
+  # Reset PATH to a known clean baseline so we measure ONLY duplicates
+  # introduced by our own sourcing logic. Without this, the inherited
+  # PATH from the bats runner (e.g. Ubuntu CI's PATH listing /snap/bin
+  # twice) is reported as a "duplicate" — which is real but not caused
+  # by our code, and outside our dedup contract.
   run zsh --no-rcs -c "
+    PATH='/usr/bin:/bin'
     source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
     source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
     source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
