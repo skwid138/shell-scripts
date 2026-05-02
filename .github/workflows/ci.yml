@@ -23,12 +23,27 @@ jobs:
       - name: Install shellcheck and shfmt (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          # Retry apt-get to survive transient mirror outages (e.g. azure
+          # ubuntu mirror DNS hiccups). 3 attempts with exponential backoff;
+          # --fix-missing tolerates partial archive availability.
           # zsh is required by `make lint-strict` to validate .zsh files via
           # `zsh -n`; Ubuntu runners don't have it preinstalled. Without it,
           # lint-strict exits 3 ("zsh not installed") and masks downstream
           # test failures. macOS runners already ship zsh.
-          sudo apt-get install -y shellcheck zsh
+          for attempt in 1 2 3; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --fix-missing shellcheck zsh; then
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              delay=$((5 * (3 ** (attempt - 1))))
+              echo "apt-get attempt $attempt failed; retrying in ${delay}s..."
+              sleep "$delay"
+            else
+              echo "apt-get failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
           # shfmt: install latest binary release directly (apt version often stale)
           SHFMT_VERSION="3.13.1"
           curl -fsSL -o /tmp/shfmt \
