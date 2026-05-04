@@ -38,6 +38,9 @@ gh-watch-say() {
 
 [[ ! -f "$HOME/code/scripts/personal/mov2gif.sh" ]] || alias mov2gif='"$HOME/code/scripts/personal/mov2gif.sh"'
 
+## Budget-aware GIF wrapper around mov2gif (see personal/gif_jif.sh --help).
+[[ ! -f "$HOME/code/scripts/personal/gif_jif.sh" ]] || alias gif_jif='"$HOME/code/scripts/personal/gif_jif.sh"'
+
 ## Start Chrome Devtools MCP
 [[ ! -f "$HOME/code/scripts/agent/chrome_mcp.sh" ]] || alias chrome_mcp='"$HOME/code/scripts/agent/chrome_mcp.sh"'
 
