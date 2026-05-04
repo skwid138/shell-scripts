@@ -85,12 +85,37 @@ fi
 n=$(($(cat "$COUNTERFILE" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$COUNTERFILE"
 
-# Pick size: nth entry of MOCK_FFMPEG_OUTPUT_SIZES (colon-delimited),
-# clamped to last value if list is shorter.
-IFS=':' read -r -a sizes <<<"$MOCK_FFMPEG_OUTPUT_SIZES"
-idx=$((n - 1))
-if [[ "$idx" -ge "${#sizes[@]}" ]]; then idx=$((${#sizes[@]} - 1)); fi
-size="${sizes[$idx]}"
+# Detect fps from the filter string (looks like "fps=24,scale=...").
+fps=""
+for arg in "$@"; do
+  case "$arg" in
+    *fps=*)
+      # Extract the digits after the first fps=.
+      tmp="${arg#*fps=}"
+      fps="${tmp%%,*}"
+      break
+      ;;
+  esac
+done
+if [[ -n "$fps" ]]; then
+  echo "fps=$fps" >>"$STUBDIR/fps_log"
+fi
+
+# Per-fps size override (MOCK_FFMPEG_SIZE_AT_FPS_<N>) takes precedence
+# over the indexed MOCK_FFMPEG_OUTPUT_SIZES list.
+size=""
+if [[ -n "$fps" ]]; then
+  varname="MOCK_FFMPEG_SIZE_AT_FPS_${fps}"
+  size="${!varname:-}"
+fi
+if [[ -z "$size" ]]; then
+  # Pick size: nth entry of MOCK_FFMPEG_OUTPUT_SIZES (colon-delimited),
+  # clamped to last value if list is shorter.
+  IFS=':' read -r -a sizes <<<"$MOCK_FFMPEG_OUTPUT_SIZES"
+  idx=$((n - 1))
+  if [[ "$idx" -ge "${#sizes[@]}" ]]; then idx=$((${#sizes[@]} - 1)); fi
+  size="${sizes[$idx]}"
+fi
 
 # Truncate to requested size (portable across macOS/Linux).
 if command -v truncate >/dev/null 2>&1; then
@@ -333,4 +358,134 @@ EOF
   PATH="$STUBDIR:/usr/bin:/bin" run "$SCRIPT" --pr "$input"
   assert_failure 3
   assert_output --partial "ffprobe"
+}
+
+# --- v2: --dry-run, --verbose, fps cascade -------------------------------
+
+@test "gif_jif: --dry-run --pr exits 0, no files, prints pr fps=N scale=N" {
+  write_stubs
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --dry-run --pr "$input"
+  assert_success
+  # No gif file created.
+  [[ ! -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+  # No paletteuse calls (no encoding happened).
+  paletteuse_calls="$(grep -c paletteuse "$STATEFILE" || true)"
+  [[ "$paletteuse_calls" -eq 0 ]]
+  # Output line format: "pr fps=<N> scale=<N>".
+  echo "$output" | grep -qE '^pr fps=[0-9]+ scale=[0-9]+$'
+}
+
+@test "gif_jif: --dry-run --pr --slack --max prints three lines, no files" {
+  write_stubs
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  stdout_file="$BATS_TEST_TMPDIR/stdout.txt"
+  bash "$SCRIPT" --dry-run --pr --slack --max "$input" >"$stdout_file" 2>/dev/null
+  rc=$?
+  [[ "$rc" -eq 0 ]]
+  count="$(wc -l <"$stdout_file" | tr -d ' ')"
+  [[ "$count" -eq 3 ]]
+  grep -qE '^pr fps=[0-9]+ scale=[0-9]+$' "$stdout_file"
+  grep -qE '^slack fps=[0-9]+ scale=[0-9]+$' "$stdout_file"
+  grep -qE '^max fps=[0-9]+ scale=[0-9]+$' "$stdout_file"
+  [[ ! -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+  [[ ! -f "$BATS_TEST_TMPDIR/clip.slack.gif" ]]
+  [[ ! -f "$BATS_TEST_TMPDIR/clip.max.gif" ]]
+}
+
+@test "gif_jif: --dry-run --max-size 5MB prints custom fps=N scale=N" {
+  write_stubs
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --dry-run --max-size 5MB "$input"
+  assert_success
+  echo "$output" | grep -qE '^custom fps=[0-9]+ scale=[0-9]+$'
+}
+
+@test "gif_jif: --dry-run without preset exits 2" {
+  write_stubs
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --dry-run "$input"
+  assert_failure 2
+  assert_output --partial "no preset"
+}
+
+@test "gif_jif: --dry-run honors --fps and --scale overrides" {
+  write_stubs
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --dry-run --fps 15 --scale 480 --pr "$input"
+  assert_success
+  echo "$output" | grep -qE '^pr fps=15 scale=480$'
+}
+
+@test "gif_jif: --verbose accepted (smoke via dry-run)" {
+  write_stubs
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --dry-run --verbose --max "$input"
+  assert_success
+  echo "$output" | grep -qE '^max fps=[0-9]+ scale=[0-9]+$'
+}
+
+@test "gif_jif: fps cascade — over budget at fps=30, succeeds at fps=18" {
+  write_stubs
+  # Force a >10s clip so starting fps is capped at 24 — and we still
+  # want fps>=24 to be over budget. Use 11s.
+  export MOCK_FFPROBE_DUR="11.0"
+  # Per-fps sizing: at fps=24 always over (50MB), at fps=18 in budget (8MB).
+  export MOCK_FFMPEG_SIZE_AT_FPS_24="50000000"
+  export MOCK_FFMPEG_SIZE_AT_FPS_18="8000000"
+  export MOCK_FFMPEG_OUTPUT_SIZES="50000000" # fallback
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --pr "$input"
+  assert_success
+  [[ -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+  # Verify cascade reached fps=18.
+  grep -q "fps=18" "$STUBDIR/fps_log"
+}
+
+@test "gif_jif: fps cascade exhausted — non-TTY produces best-effort file" {
+  write_stubs
+  # Always over budget, regardless of fps.
+  export MOCK_FFMPEG_OUTPUT_SIZES="60000000"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  stderr_file="$BATS_TEST_TMPDIR/stderr.txt"
+  bash "$SCRIPT" --pr "$input" </dev/null >/dev/null 2>"$stderr_file"
+  # File exists despite never fitting budget.
+  [[ -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+  grep -q "non-TTY" "$stderr_file"
+  grep -q "budget unreachable" "$stderr_file"
+  # Cascade visited multiple fps levels.
+  grep -q "fps=18" "$STUBDIR/fps_log"
+  grep -q "fps=8" "$STUBDIR/fps_log"
+}
+
+@test "gif_jif: user-supplied --fps disables cascade" {
+  write_stubs
+  # If the cascade ran, fps=18 would yield in-budget output. Setting
+  # --fps 30 must NOT cascade — only fps=30 is tried.
+  export MOCK_FFMPEG_SIZE_AT_FPS_30="50000000"
+  export MOCK_FFMPEG_SIZE_AT_FPS_18="8000000"
+  export MOCK_FFMPEG_OUTPUT_SIZES="50000000"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  stderr_file="$BATS_TEST_TMPDIR/stderr.txt"
+  bash "$SCRIPT" --fps 30 --pr "$input" </dev/null >/dev/null 2>"$stderr_file"
+  # File still produced (best-effort via budget-unreachable handler).
+  [[ -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+  # fps=18 must NOT appear in the log — cascade was disabled.
+  if grep -q "fps=18" "$STUBDIR/fps_log"; then
+    echo "fps=18 unexpectedly present — cascade was not disabled by --fps" >&2
+    return 1
+  fi
+  # fps=30 must appear.
+  grep -q "fps=30" "$STUBDIR/fps_log"
+  # Budget-unreachable handling kicked in.
+  grep -q "budget unreachable" "$stderr_file"
 }
