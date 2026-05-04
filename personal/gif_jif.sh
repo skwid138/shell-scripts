@@ -289,14 +289,20 @@ filesize() {
 # output) is allowed through to the user's terminal. Stdout stays
 # suppressed either way (only the "GIF created" line, which we don't
 # want polluting our own stdout contract).
+#
+# stdin is explicitly redirected from /dev/null. Without this, ffmpeg
+# (invoked transitively via mov2gif.sh) consumes its inherited stdin,
+# which would drain the herestring feeding our fps cascade loop —
+# silently breaking the cascade after the first encode. mov2gif.sh
+# also passes -nostdin to ffmpeg as a second line of defense.
 encode_once() {
   local fps="$1" scale="$2" out="$3"
   if [[ "$VERBOSE_FF" -eq 1 ]]; then
-    if ! "$MOV2GIF" -f "$fps" -s "$scale" -o "$out" "$INPUT" >/dev/null; then
+    if ! "$MOV2GIF" -f "$fps" -s "$scale" -o "$out" "$INPUT" </dev/null >/dev/null; then
       return 1
     fi
   else
-    if ! "$MOV2GIF" -f "$fps" -s "$scale" -o "$out" "$INPUT" >/dev/null 2>&1; then
+    if ! "$MOV2GIF" -f "$fps" -s "$scale" -o "$out" "$INPUT" </dev/null >/dev/null 2>&1; then
       return 1
     fi
   fi
@@ -372,6 +378,7 @@ _search_at_fps() {
   lower_thresh="$(awk -v b="$budget" 'BEGIN { printf "%d\n", b*0.7 }')"
 
   local last_size=0
+  local last_scale="$scale" # tracks the scale that was actually encoded
   local i
   for i in 1 2 3 4 5; do
     if ! encode_once "$fps" "$scale" "$tmpfile"; then
@@ -379,6 +386,7 @@ _search_at_fps() {
       die "ffmpeg encoding failed (preset=$CURRENT_PRESET, fps=$fps, iter=$i)"
     fi
     last_size="$(filesize "$tmpfile")"
+    last_scale="$scale"
     info "[$CURRENT_PRESET] fps=$fps iter $i: scale=$scale size=$last_size budget=$budget"
 
     if [[ "$last_size" -le "$budget" ]]; then
@@ -412,8 +420,11 @@ _search_at_fps() {
     fi
   done
 
+  # Report against the last scale that was actually encoded, not the
+  # next scale we would have tried (the loop may exit with `scale` set
+  # to a value that was never fed to ffmpeg).
   SEARCH_SIZE="$last_size"
-  SEARCH_SCALE="$scale"
+  SEARCH_SCALE="$last_scale"
   if [[ "$last_size" -le "$budget" ]]; then
     SEARCH_OK=1
   else

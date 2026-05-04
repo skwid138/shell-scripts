@@ -57,6 +57,17 @@ EOF
 
   cat >"$STUBDIR/ffmpeg" <<'EOF'
 #!/usr/bin/env bash
+# Drain stdin like real ffmpeg does. This is critical regression
+# coverage: real ffmpeg consumes its inherited stdin unless invoked
+# with -nostdin. If gif_jif fails to redirect stdin or mov2gif drops
+# -nostdin, the fps cascade (fed via a herestring) gets silently
+# eaten on the first encode and never advances past fps[0]. The stub
+# matches that behavior so any regression here is caught by the
+# existing cascade tests below.
+if [[ ! -t 0 ]]; then
+  cat >/dev/null 2>&1 || true
+fi
+
 # Log every call.
 echo "ffmpeg $*" >>"$STATEFILE"
 
@@ -488,4 +499,193 @@ EOF
   grep -q "fps=30" "$STUBDIR/fps_log"
   # Budget-unreachable handling kicked in.
   grep -q "budget unreachable" "$stderr_file"
+}
+
+# --- v3: stdin-drain regression, output paths, edge cases, portability ---
+
+@test "gif_jif: stdin-drain regression — extra lines on stdin do not break cascade" {
+  # Direct regression test for the production bug where ffmpeg, invoked
+  # without -nostdin or </dev/null, consumed the herestring feeding the
+  # fps cascade loop and silently skipped past fps levels 18/12/8.
+  #
+  # We pipe a long stdin payload into gif_jif. The bats ffmpeg stub
+  # drains stdin to mimic real ffmpeg, so a regression (missing
+  # </dev/null in encode_once or missing -nostdin in mov2gif) would
+  # let ffmpeg consume the cascade herestring and skip past the first
+  # fps level.
+  #
+  # With the fix in place, all four cascade levels (30, 18, 12, 8) must
+  # show up in the fps_log.
+  write_stubs
+  # Always over budget so the cascade fully exhausts.
+  export MOCK_FFMPEG_OUTPUT_SIZES="60000000"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  stderr_file="$BATS_TEST_TMPDIR/stderr.txt"
+  # Pipe garbage into stdin. A correct implementation ignores it; a
+  # broken one will let ffmpeg eat the herestring along with this.
+  yes | head -n 1000 | bash "$SCRIPT" --pr "$input" >/dev/null 2>"$stderr_file"
+  [[ -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+  # Default MOCK_FFPROBE_DUR=8.0 so starting fps stays at native 30.
+  # Cascade should visit 30, 18, 12, 8 — four unique levels.
+  unique_levels="$(sort -u "$STUBDIR/fps_log" | wc -l | tr -d ' ')"
+  if [[ "$unique_levels" -lt 4 ]]; then
+    echo "expected 4 unique fps levels in cascade, got $unique_levels:" >&2
+    cat "$STUBDIR/fps_log" >&2
+    return 1
+  fi
+  # Specifically confirm each cascade level was tried.
+  grep -q "^fps=30$" "$STUBDIR/fps_log"
+  grep -q "^fps=18$" "$STUBDIR/fps_log"
+  grep -q "^fps=12$" "$STUBDIR/fps_log"
+  grep -q "^fps=8$" "$STUBDIR/fps_log"
+}
+
+@test "gif_jif: -o path is honored for single preset" {
+  write_stubs
+  export MOCK_FFMPEG_OUTPUT_SIZES="8000000"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  out="$BATS_TEST_TMPDIR/explicit/custom-name.gif"
+  mkdir -p "$BATS_TEST_TMPDIR/explicit"
+  run "$SCRIPT" --pr -o "$out" "$input"
+  assert_success
+  [[ -f "$out" ]]
+  # Default-named file must NOT exist when -o is given.
+  [[ ! -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+  # stdout names the explicit path.
+  assert_output --partial "$out"
+}
+
+@test "gif_jif: --max-size 0 rejected as usage error" {
+  write_stubs
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --max-size 0 "$input"
+  assert_failure 2
+  assert_output --partial "must be > 0"
+}
+
+@test "gif_jif: --max-size 1.5MB (decimal) parses and runs" {
+  write_stubs
+  # 1.5MB = 1572864 bytes. Use a size in the [70%, 100%] sweet spot.
+  export MOCK_FFMPEG_OUTPUT_SIZES="1300000"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --max-size 1.5MB "$input"
+  assert_success
+  [[ -f "$BATS_TEST_TMPDIR/clip.custom.gif" ]]
+}
+
+@test "gif_jif: native fps capped at 24 when duration > 10s" {
+  write_stubs
+  export MOCK_FFPROBE_FPS="60/1"
+  export MOCK_FFPROBE_DUR="11.0"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --dry-run --pr "$input"
+  assert_success
+  echo "$output" | grep -qE '^pr fps=24 scale=[0-9]+$'
+}
+
+@test "gif_jif: native fps NOT capped when duration <= 10s" {
+  write_stubs
+  export MOCK_FFPROBE_FPS="60/1"
+  export MOCK_FFPROBE_DUR="9.0"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --dry-run --max "$input"
+  assert_success
+  # Short clips keep native fps.
+  echo "$output" | grep -qE '^max fps=60 scale=[0-9]+$'
+}
+
+@test "gif_jif: --scale 240 (floor boundary) does not infinite-loop" {
+  write_stubs
+  # Always over budget. With --scale 240 the search starts at the floor,
+  # so the binary search must exit immediately rather than loop.
+  export MOCK_FFMPEG_OUTPUT_SIZES="60000000"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  # Run with a timeout safety net via background + kill, but really just
+  # rely on bats' own timeout. If this test hangs, the script is broken.
+  bash "$SCRIPT" --scale 240 --pr "$input" </dev/null >/dev/null 2>/dev/null
+  [[ -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+}
+
+@test "gif_jif: tmpfile cleaned up when ffmpeg fails mid-encode" {
+  # Stub ffmpeg to fail on paletteuse so encode_once returns nonzero.
+  cat >"$STUBDIR/ffprobe" <<'EOF'
+#!/usr/bin/env bash
+cat <<EOT
+width=$MOCK_FFPROBE_W
+height=$MOCK_FFPROBE_H
+r_frame_rate=$MOCK_FFPROBE_FPS
+duration=$MOCK_FFPROBE_DUR
+EOT
+exit 0
+EOF
+  chmod +x "$STUBDIR/ffprobe"
+  cat >"$STUBDIR/ffmpeg" <<'EOF'
+#!/usr/bin/env bash
+if [[ ! -t 0 ]]; then cat >/dev/null 2>&1 || true; fi
+# Pass 1 (palettegen): succeed and create the palette so pass 2 starts.
+for arg in "$@"; do
+  case "$arg" in
+    *paletteuse*) exit 1 ;; # always fail pass-2
+    /tmp/palette-*.png) : >"$arg" ;;
+  esac
+done
+exit 0
+EOF
+  chmod +x "$STUBDIR/ffmpeg"
+
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --pr "$input"
+  assert_failure 1
+  # No leaked tmpfile in /tmp matching our PID prefix.
+  leaked="$(ls /tmp/gif_jif-*-pr.gif 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "$leaked" -eq 0 ]]
+  # No final output file either.
+  [[ ! -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
+}
+
+@test "gif_jif: r_frame_rate=0/0 falls back to fps=30" {
+  write_stubs
+  # Some sources (still images, weird containers) report 0/0 fps.
+  # The script must not divide-by-zero or carry a 0 fps forward.
+  export MOCK_FFPROBE_FPS="0/0"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --dry-run --max "$input"
+  assert_success
+  echo "$output" | grep -qE '^max fps=30 scale=[0-9]+$'
+}
+
+@test "gif_jif: portable filesize — works when only GNU stat -c%s available" {
+  write_stubs
+  # Shadow `stat` with a stub that only honors -c%s (GNU semantics) and
+  # fails on -f%z (BSD semantics). Confirms the fallback branch in
+  # filesize() works on Linux even though dev is on macOS.
+  cat >"$STUBDIR/stat" <<'EOF'
+#!/usr/bin/env bash
+# Reject BSD-style -f%z, accept GNU -c%s.
+case "$1" in
+  -f%z) exit 1 ;;
+  -c%s)
+    # Use wc -c for a portable byte count.
+    wc -c <"$2" | tr -d ' '
+    exit 0
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod +x "$STUBDIR/stat"
+  export MOCK_FFMPEG_OUTPUT_SIZES="8000000"
+  input="$BATS_TEST_TMPDIR/clip.mov"
+  : >"$input"
+  run "$SCRIPT" --pr "$input"
+  assert_success
+  [[ -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]
 }

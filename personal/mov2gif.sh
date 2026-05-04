@@ -109,12 +109,16 @@ fi
 PALETTE="/tmp/palette-$$.png"
 
 # Pass 1: generate palette.
-ffmpeg -y -i "$INPUT_FILE" \
+# -nostdin is critical: without it, ffmpeg consumes its inherited stdin,
+# which silently breaks callers that pipe data into us (e.g. gif_jif.sh
+# feeds its fps cascade via a herestring; ffmpeg would drain those lines
+# on the first encode and the cascade would never advance past fps[0]).
+ffmpeg -nostdin -y -i "$INPUT_FILE" \
   -vf "fps=${FPS},scale=${SCALE}:-1:force_original_aspect_ratio=decrease,palettegen" \
   "$PALETTE" || die "ffmpeg palette generation failed"
 
 # Pass 2: apply palette to create GIF.
-ffmpeg -y -i "$INPUT_FILE" -i "$PALETTE" \
+ffmpeg -nostdin -y -i "$INPUT_FILE" -i "$PALETTE" \
   -lavfi "fps=${FPS},scale=${SCALE}:-1:force_original_aspect_ratio=decrease[x]; [x][1:v] paletteuse" \
   "$OUTPUT" || die "ffmpeg gif render failed"
 
