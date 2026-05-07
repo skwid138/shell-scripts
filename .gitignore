@@ -22,10 +22,5 @@ vars.local.zsh
 #  is a safety net in case they're ever cloned without --recurse-submodules.)
 
 # Working docs not for publication (private restructure plans, etc.)
-REPO-ORGANIZATION-PLAN.md
-SHELL-LAYER-PLAN.md
-EXECUTION-PLAN.md
-NEOVIM-TMUX-PLAN.md
-NEOVIM-TMUX-ROADMAP.md
+.project-plans
 KEYMAPS-CHEATSHEET.md
-zsh_init_plan.md
