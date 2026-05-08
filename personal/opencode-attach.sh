@@ -95,4 +95,8 @@ OPENCODE_SERVER_PASSWORD="$(keychain_get 'opencode-server-password')" || exit $?
 export OPENCODE_SERVER_PASSWORD
 export OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
 
-exec opencode attach "$URL" "${PASSTHROUGH[@]}"
+# bash 3.2 (macOS /bin/bash) treats "${arr[@]}" as unbound under `set -u`
+# when the array is empty. Use the conditional-expansion idiom that the rest
+# of the repo uses (see agent/scripts-doctor.sh) so an empty PASSTHROUGH is
+# safe across bash 3.2 → 5.x.
+exec opencode attach "$URL" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}

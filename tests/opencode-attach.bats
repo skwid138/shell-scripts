@@ -184,3 +184,24 @@ write_all_stubs() {
   assert_success
   refute_output --partial "THIS_PASSWORD_MUST_NEVER_LEAK"
 }
+
+# --- bash 3.2 portability regression ---------------------------------------
+#
+# macOS still ships /bin/bash at version 3.2, and so does GitHub's
+# `macos-latest` runner under `#!/usr/bin/env bash`. Under `set -u`, bash 3.2
+# raises "unbound variable" for "${arr[@]}" when arr is an empty array — a
+# trap newer bash (≥4.4) silently tolerates. This test pins the happy path
+# to /bin/bash so any regression of that idiom in the script is caught
+# locally, not on CI.
+
+@test "opencode-attach: happy path is bash 3.2 safe (empty PASSTHROUGH array)" {
+  [[ -x /bin/bash ]] || skip "no /bin/bash on host"
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  # Invoke the script via /bin/bash explicitly to bypass the env(1) PATH
+  # lookup that would otherwise pick up /opt/homebrew/bin/bash.
+  run /bin/bash "$SCRIPT"
+  assert_success
+  run cat "$STATEFILE"
+  assert_output --partial "opencode attach http://127.0.0.1:4096"
+}
