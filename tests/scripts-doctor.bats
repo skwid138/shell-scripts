@@ -14,10 +14,22 @@ setup() {
   # Each test gets its own scratch repo tree.
   REPO="$(mktemp -d)"
   mkdir -p "$REPO/agent" "$REPO/tests" "$REPO/.github/workflows"
+
+  # Default: isolate the opencode wrapper symlink check away from the host's
+  # real ~/.config/opencode/bin/opencode. Point at a sandbox path with no
+  # symlink and a non-existent target — the check's "skip when target
+  # missing" branch fires, and the wrapper invariant doesn't contaminate
+  # tests that aren't about it. Wrapper-specific tests below override these
+  # vars to exercise the check.
+  WRAPPER_DEFAULT_SANDBOX="$(mktemp -d)"
+  export OPENCODE_WRAPPER_LINK="$WRAPPER_DEFAULT_SANDBOX/bin/opencode"
+  export OPENCODE_WRAPPER_TARGET="$WRAPPER_DEFAULT_SANDBOX/no-such-wrapper.sh"
 }
 
 teardown() {
   rm -rf "$REPO"
+  [[ -d "${WRAPPER_DEFAULT_SANDBOX:-}" ]] && rm -rf "$WRAPPER_DEFAULT_SANDBOX"
+  unset OPENCODE_WRAPPER_LINK OPENCODE_WRAPPER_TARGET
 }
 
 # Helper: write a minimal valid agent script (passes all checks).
@@ -447,4 +459,98 @@ EOF
   assert_success
   refute_output --partial "unbound variable"
   [[ "$(jq -r .ok <<<"$output")" == "true" ]]
+}
+
+# --- opencode wrapper symlink check ------------------------------------------
+#
+# scripts-doctor verifies ~/.config/opencode/bin/opencode is a symlink to
+# personal/opencode-wrapper.sh. Tests use OPENCODE_WRAPPER_LINK and
+# OPENCODE_WRAPPER_TARGET as test seams (the same seams install-wrapper.sh
+# honors) so we don't touch the real symlink.
+
+setup_wrapper_seam() {
+  WRAPPER_SANDBOX="$(mktemp -d)"
+  export OPENCODE_WRAPPER_LINK="$WRAPPER_SANDBOX/bin/opencode"
+  # Point at the REAL repo wrapper so the [[ -f $expected_target ]] guard
+  # (which gates the whole check) passes. Tests vary only the link side.
+  export OPENCODE_WRAPPER_TARGET="$BATS_TEST_DIRNAME/../personal/opencode-wrapper.sh"
+}
+
+teardown_wrapper_seam() {
+  unset OPENCODE_WRAPPER_LINK OPENCODE_WRAPPER_TARGET
+  [[ -d "${WRAPPER_SANDBOX:-}" ]] && rm -rf "$WRAPPER_SANDBOX"
+}
+
+@test "scripts-doctor: passes when wrapper symlink resolves correctly" {
+  setup_wrapper_seam
+  write_valid_ci
+  write_valid_script "good.sh"
+  mkdir -p "$(dirname "$OPENCODE_WRAPPER_LINK")"
+  ln -s "$OPENCODE_WRAPPER_TARGET" "$OPENCODE_WRAPPER_LINK"
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_success
+  assert_output --partial "opencode wrapper symlink"
+  assert_output --partial "$OPENCODE_WRAPPER_LINK"
+  teardown_wrapper_seam
+}
+
+@test "scripts-doctor: fails when wrapper symlink is missing" {
+  setup_wrapper_seam
+  write_valid_ci
+  write_valid_script "good.sh"
+  # Don't create the symlink.
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_failure
+  assert_output --partial "opencode wrapper symlink"
+  assert_output --partial "missing"
+  assert_output --partial "install-wrapper.sh"
+  teardown_wrapper_seam
+}
+
+@test "scripts-doctor: fails when wrapper symlink drifts to wrong target" {
+  setup_wrapper_seam
+  write_valid_ci
+  write_valid_script "good.sh"
+  mkdir -p "$(dirname "$OPENCODE_WRAPPER_LINK")"
+  ln -s "/some/wrong/place" "$OPENCODE_WRAPPER_LINK"
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_failure
+  assert_output --partial "opencode wrapper symlink"
+  assert_output --partial "drift"
+  teardown_wrapper_seam
+}
+
+@test "scripts-doctor: fails when wrapper path exists as a regular file" {
+  setup_wrapper_seam
+  write_valid_ci
+  write_valid_script "good.sh"
+  mkdir -p "$(dirname "$OPENCODE_WRAPPER_LINK")"
+  echo "shim" >"$OPENCODE_WRAPPER_LINK"
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_failure
+  assert_output --partial "opencode wrapper symlink"
+  assert_output --partial "not a symlink"
+  teardown_wrapper_seam
+}
+
+@test "scripts-doctor: skips wrapper check when source-of-truth target is missing" {
+  # If the repo doesn't contain personal/opencode-wrapper.sh (e.g. when
+  # running scripts-doctor against a different repo), the wrapper check
+  # should silently skip rather than failing.
+  WRAPPER_SANDBOX="$(mktemp -d)"
+  export OPENCODE_WRAPPER_LINK="$WRAPPER_SANDBOX/bin/opencode"
+  export OPENCODE_WRAPPER_TARGET="$WRAPPER_SANDBOX/nonexistent-wrapper.sh"
+  write_valid_ci
+  write_valid_script "good.sh"
+
+  run "$SCRIPT" --repo "$REPO"
+  assert_success
+  refute_output --partial "opencode wrapper symlink"
+
+  unset OPENCODE_WRAPPER_LINK OPENCODE_WRAPPER_TARGET
+  rm -rf "$WRAPPER_SANDBOX"
 }

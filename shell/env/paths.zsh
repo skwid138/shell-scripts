@@ -112,6 +112,19 @@ _path_prepend "$HOME/.lmstudio/bin"
 # matches the original paths.sh contract).
 _path_prepend "$HOME/bin"
 
+# OpenCode launcher wrapper — must intercept `opencode` before the real binary
+# at /opt/homebrew/bin/opencode. The symlink at this path resolves to
+# ~/code/scripts/personal/opencode-wrapper.sh, which conditionally injects
+# wpromote-specific instruction files into OPENCODE_CONFIG_CONTENT when $PWD
+# is under ~/code/wpromote/. _path_prepend gates on `[[ -d ]]`, so a
+# fresh-clone box without the symlink installed is silently skipped — no
+# breakage, just no conditional context. Run
+# ~/.config/opencode/bin/install-wrapper.sh to bootstrap. scripts-doctor
+# audits the symlink integrity. The wrapper's recursion guard (PATH walk
+# skipping its own canonical path) keeps it safe even when both this dir
+# and the real binary's dir are on PATH.
+_path_prepend "$HOME/.config/opencode/bin"
+
 # ──────────────────────────────────────────────────────────────────────
 # 14-day staleness nag (rev. 5/6 §5 backstop).
 #

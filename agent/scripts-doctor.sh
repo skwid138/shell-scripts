@@ -177,6 +177,48 @@ check_tooling() {
   esac
 }
 
+# --- check: opencode wrapper symlink ---
+#
+# ~/.config/opencode/bin/opencode must be a symlink resolving to
+# personal/opencode-wrapper.sh in this repo. The wrapper conditionally
+# injects ~/.config/opencode/instruction/wpromote-context.md into
+# OPENCODE_CONFIG_CONTENT when $PWD is under ~/code/wpromote/, so the
+# real opencode binary loads wpromote-specific instructions only inside
+# wpromote repos. If the symlink is missing or drifted, that conditional
+# context never loads. Run ~/.config/opencode/bin/install-wrapper.sh to
+# repair.
+
+check_opencode_wrapper_symlink() {
+  local link="${OPENCODE_WRAPPER_LINK:-$HOME/.config/opencode/bin/opencode}"
+  local expected_target="${OPENCODE_WRAPPER_TARGET:-$HOME/code/scripts/personal/opencode-wrapper.sh}"
+  local name="opencode wrapper symlink"
+
+  # Only audit if the source-of-truth wrapper exists in this repo. If the
+  # repo doesn't contain the wrapper (e.g. running scripts-doctor against a
+  # different repo via --repo), skip silently.
+  [[ -f "$expected_target" ]] || return 0
+
+  if [[ ! -e "$link" && ! -L "$link" ]]; then
+    record "_global" "$name" "fail" "missing — run $HOME/.config/opencode/bin/install-wrapper.sh"
+    return
+  fi
+  if [[ ! -L "$link" ]]; then
+    record "_global" "$name" "fail" "exists but is not a symlink ($link)"
+    return
+  fi
+  local actual
+  actual="$(readlink "$link")"
+  if [[ "$actual" != "$expected_target" ]]; then
+    record "_global" "$name" "fail" "drift: points at $actual (expected $expected_target)"
+    return
+  fi
+  if [[ ! -e "$link" ]]; then
+    record "_global" "$name" "fail" "dangling: target $expected_target missing"
+    return
+  fi
+  record "_global" "$name" "pass" "$link → $expected_target"
+}
+
 # --- per-script checks ---
 
 check_script_help() {
@@ -327,6 +369,7 @@ if [[ "$JSON" -eq 0 ]]; then
 fi
 
 check_tooling
+check_opencode_wrapper_symlink
 for repo in "${REPOS[@]}"; do
   check_repo "$repo"
 done
