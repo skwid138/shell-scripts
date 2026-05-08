@@ -9,9 +9,15 @@ alias lsd="ls -d -1 */ | lolcat"
 # Aliases below use single quotes so $HOME expands at *use time*, not at
 # alias-definition time (silences ShellCheck SC2139). Behaviorally
 # identical for stable vars like $HOME, but stylistically correct.
+#
+# NOTE: do NOT wrap the path in extra double quotes inside the single-quoted
+# value (e.g. '"$HOME/foo.sh"'). zsh expands the alias and feeds the literal
+# `"…"` through to zsh-syntax-highlighting's command lookup, which fails the
+# stat() and paints the alias red as `unknown-token`. The shell still runs
+# it (quotes are stripped during execution), but it looks broken.
 
 ## Git rev list gist
-[[ ! -f "$HOME/code/scripts/personal/git_rev_list.sh" ]] || alias git_rev_list='"$HOME/code/scripts/personal/git_rev_list.sh"'
+[[ ! -f "$HOME/code/scripts/personal/git_rev_list.sh" ]] || alias git_rev_list='$HOME/code/scripts/personal/git_rev_list.sh'
 
 ## Watch the latest GitHub Actions run via `gh run watch` and `say` when done.
 ## Replaces the old github_workflow_tail.sh (deleted; gh covers it natively).
@@ -36,13 +42,13 @@ gh-watch-say() {
   return "$rc"
 }
 
-[[ ! -f "$HOME/code/scripts/personal/mov2gif.sh" ]] || alias mov2gif='"$HOME/code/scripts/personal/mov2gif.sh"'
+[[ ! -f "$HOME/code/scripts/personal/mov2gif.sh" ]] || alias mov2gif='$HOME/code/scripts/personal/mov2gif.sh'
 
 ## Budget-aware GIF wrapper around mov2gif (see personal/gif_jif.sh --help).
-[[ ! -f "$HOME/code/scripts/personal/gif_jif.sh" ]] || alias gif_jif='"$HOME/code/scripts/personal/gif_jif.sh"'
+[[ ! -f "$HOME/code/scripts/personal/gif_jif.sh" ]] || alias gif_jif='$HOME/code/scripts/personal/gif_jif.sh'
 
 ## Start Chrome Devtools MCP
-[[ ! -f "$HOME/code/scripts/agent/chrome_mcp.sh" ]] || alias chrome_mcp='"$HOME/code/scripts/agent/chrome_mcp.sh"'
+[[ ! -f "$HOME/code/scripts/agent/chrome_mcp.sh" ]] || alias chrome_mcp='$HOME/code/scripts/agent/chrome_mcp.sh'
 
 ## ───────────────────────────────────────────────────────────────────
 ## Neovim
@@ -62,18 +68,18 @@ alias nvim-update='nvim --headless "+Lazy! sync" +qa && \
 ## ───────────────────────────────────────────────────────────────────
 ## tmux helpers (sessionizer is bound in tmux.conf, but also from shell)
 ## ───────────────────────────────────────────────────────────────────
-[[ ! -f "$HOME/code/scripts/personal/tmux-sessionizer.sh" ]] || alias tms='"$HOME/code/scripts/personal/tmux-sessionizer.sh"'
+[[ ! -f "$HOME/code/scripts/personal/tmux-sessionizer.sh" ]] || alias tms='$HOME/code/scripts/personal/tmux-sessionizer.sh'
 
 ## ───────────────────────────────────────────────────────────────────
 ## BQ wrappers (bqx, not bq — bq is the actual gcloud binary; we don't shadow it)
 ## ───────────────────────────────────────────────────────────────────
-[[ ! -f "$HOME/code/scripts/personal/bq.sh" ]] || alias bqx='"$HOME/code/scripts/personal/bq.sh"'
+[[ ! -f "$HOME/code/scripts/personal/bq.sh" ]] || alias bqx='$HOME/code/scripts/personal/bq.sh'
 
 ## ───────────────────────────────────────────────────────────────────
 ## GCP project map (only if wpromote/scripts is cloned)
 ## ───────────────────────────────────────────────────────────────────
 [[ ! -f "$HOME/code/wpromote/scripts/agent/gcp-project-map.sh" ]] ||
-  alias gcp-map='"$HOME/code/wpromote/scripts/agent/gcp-project-map.sh"'
+  alias gcp-map='$HOME/code/wpromote/scripts/agent/gcp-project-map.sh'
 
 ## ───────────────────────────────────────────────────────────────────
 ## opencode remote access (Tailscale-fronted web UI)
@@ -83,6 +89,6 @@ alias nvim-update='nvim --headless "+Lazy! sync" +qa && \
 ## See: ~/.config/opencode/README-remote-access.md (or .project-plans/2026.05.08_opencode-web-ui.md)
 ## ───────────────────────────────────────────────────────────────────
 [[ ! -f "$HOME/code/scripts/personal/opencode-web.sh" ]] ||
-  alias openweb='"$HOME/code/scripts/personal/opencode-web.sh"'
+  alias openweb='$HOME/code/scripts/personal/opencode-web.sh'
 [[ ! -f "$HOME/code/scripts/personal/opencode-attach.sh" ]] ||
-  alias openattach='"$HOME/code/scripts/personal/opencode-attach.sh"'
+  alias openattach='$HOME/code/scripts/personal/opencode-attach.sh'
