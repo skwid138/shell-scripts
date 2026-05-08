@@ -119,12 +119,20 @@ write_all_stubs() {
 
 @test "opencode-web: missing caffeinate exits 3" {
   write_opencode_stub
-  # Remove /usr/bin (where the real caffeinate lives) from PATH while
-  # keeping homebrew + /bin so dirname/env/source still work. The opencode
-  # stub is in $STUBDIR and satisfies require_cmd opencode, leaving
-  # caffeinate as the next dep checked.
-  filtered_path="$(echo "$PATH" | tr ':' '\n' | grep -v '^/usr/bin$' | paste -sd: -)"
-  PATH="$filtered_path" run "$SCRIPT"
+  # Build an isolated PATH containing ONLY $STUBDIR plus symlinks to the
+  # handful of real binaries the script actually needs to start and reach
+  # the caffeinate dependency check:
+  #   - bash:    `#!/usr/bin/env bash` — env(1) searches PATH for bash
+  #   - dirname: used by SCRIPT_DIR resolution at the top of the script
+  # caffeinate is intentionally NOT linked, so require_cmd caffeinate fires
+  # and exits 3. Environment-independent: works whether the host's
+  # caffeinate lives in /usr/bin (macOS) or anywhere else.
+  for bin in bash dirname; do
+    real="$(command -v "$bin")"
+    [[ -n "$real" ]] || skip "host is missing required tool: $bin"
+    ln -sf "$real" "$STUBDIR/$bin"
+  done
+  PATH="$STUBDIR" run "$SCRIPT"
   assert_failure 3
   assert_output --partial "caffeinate"
 }
