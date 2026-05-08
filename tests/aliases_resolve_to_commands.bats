@@ -48,50 +48,59 @@ setup() {
   [[ -f "$ALIASES" ]]
 }
 
-@test "aliases.zsh: every alias resolves to a real command (no literal \$HOME / ~ in value)" {
+@test "aliases.zsh: no alias has an unexpanded \$VAR or ~/ at its head (highlighter-safe)" {
   # Source aliases.zsh in a clean zsh, then for every alias whose value
   # contains a '/', extract the head token (everything up to the first
-  # whitespace) and verify it's a command zsh can find. This is the same
-  # check zsh-syntax-highlighting effectively performs.
+  # whitespace or pipe) and verify that head is *not* an unexpanded
+  # variable reference (`\$HOME/…`, `\${HOME}/…`) or unexpanded tilde
+  # (`~/…`).
   #
-  # whence -p only finds external commands on PATH; we also accept any
-  # absolute path that exists on disk, to allow alias values like
-  # `/usr/local/bin/foo` even if /usr/local/bin isn't on PATH in the
-  # test environment.
+  # Why this shape and not a real command-resolution check:
+  #   The failure mode we care about is the alias body containing a
+  #   literal \$HOME (because it was defined with single quotes — \$HOME
+  #   never expands at definition time → highlighter stat fails → red).
+  #   That's a textual property of the alias value after zsh sources
+  #   the file, and it's deterministic across CI environments.
   #
-  # This is the canonical regression guard for the `'$HOME/foo.sh'`
-  # (single-quoted, never-expanded) form. The broken form has a head
-  # token of `$HOME/foo.sh`, which is neither an absolute path on disk
-  # nor a command zsh can find — so this test fails.
+  #   A "does \`whence\` find it" check sounded more behavioral but
+  #   ended up environment-dependent: e.g. \`alias nvim-update='nvim …'\`
+  #   has head=nvim, which is fine on a dev box but fails in a CI
+  #   runner that has no nvim installed. We don't want CI flakiness
+  #   tied to which optional tools the runner happens to ship.
+  #
+  # Catches all of these (the highlighter-red forms):
+  #   alias openweb='\$HOME/code/scripts/personal/opencode-web.sh'
+  #   alias openweb='\${HOME}/code/scripts/personal/opencode-web.sh'
+  #   alias openweb='~/code/scripts/personal/opencode-web.sh'
+  #
+  # Allows (correctly green):
+  #   alias openweb=\"\$HOME/code/scripts/personal/opencode-web.sh\"
+  #     (definition-time expansion → value is a literal absolute path)
+  #   alias lsf=\"ls -apx | grep -v /\"
+  #     (head is a real command name, no \$ or ~ in head)
+  #   alias nvim-update='nvim --headless …'
+  #     (head is a real command name; \"\$HOME/code/dotfiles\" appears
+  #     later as a cd argument and is irrelevant to the head token)
   run zsh --no-rcs -c '
     set -u
     source "'"$ALIASES"'" 2>/dev/null
     bad=()
-    # Iterate every defined alias.
     for name in "${(@k)aliases}"; do
       value="${aliases[$name]}"
-      # Only check aliases whose value contains a /; plain aliases like
-      # v=nvim or vim=nvim resolve trivially.
       [[ "$value" == */* ]] || continue
-      # Head token: everything up to the first whitespace or pipe.
       head="${value%%[[:space:]|]*}"
-      # Strip surrounding single/double quotes if any leaked through.
       head="${head#[\"\x27]}"
       head="${head%[\"\x27]}"
-      # OK if it is an existing absolute path...
-      if [[ "$head" == /* && -e "$head" ]]; then
+      # Flag unexpanded variable references at the head: $FOO/... or ${FOO}/...
+      if [[ "$head" == \$* ]]; then
+        bad+=("$name=$value (head starts with unexpanded \$ — define alias with double quotes so the variable expands at definition time)")
         continue
       fi
-      # ...or a command zsh can find on PATH (handles aliases like
-      # lsf="ls -apx | grep -v /" where head=ls).
-      if whence -p -- "$head" >/dev/null 2>&1; then
+      # Flag unexpanded tilde at the head: ~/...
+      if [[ "$head" == "~"* ]]; then
+        bad+=("$name=$value (head starts with unexpanded ~ — use \"\$HOME/...\" double-quoted instead)")
         continue
       fi
-      # Builtins / functions / reserved words are fine too.
-      if whence -- "$head" >/dev/null 2>&1; then
-        continue
-      fi
-      bad+=("$name=$value (unresolvable head: $head)")
     done
     if (( ${#bad[@]} > 0 )); then
       print -l -- "${bad[@]}"
