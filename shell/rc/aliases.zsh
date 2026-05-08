@@ -74,3 +74,14 @@ alias nvim-update='nvim --headless "+Lazy! sync" +qa && \
 ## ───────────────────────────────────────────────────────────────────
 [[ ! -f "$HOME/code/wpromote/scripts/agent/gcp-project-map.sh" ]] ||
   alias gcp-map='"$HOME/code/wpromote/scripts/agent/gcp-project-map.sh"'
+
+## ───────────────────────────────────────────────────────────────────
+## opencode remote access (Tailscale-fronted web UI)
+## openweb     — start `opencode web` wrapped in caffeinate, password from Keychain.
+## openattach  — attach a local TUI to the running web backend so all clients
+##               (web + terminal) share one session pool. Requires `openweb` running.
+## See: ~/.config/opencode/README-remote-access.md (or .project-plans/2026.05.08_opencode-web-ui.md)
+## ───────────────────────────────────────────────────────────────────
+[[ ! -f "$HOME/code/scripts/personal/opencode-web.sh" ]] ||
+  alias openweb='"$HOME/code/scripts/personal/opencode-web.sh"'
+alias openattach='opencode attach http://127.0.0.1:4096'
