@@ -84,4 +84,5 @@ alias nvim-update='nvim --headless "+Lazy! sync" +qa && \
 ## ───────────────────────────────────────────────────────────────────
 [[ ! -f "$HOME/code/scripts/personal/opencode-web.sh" ]] ||
   alias openweb='"$HOME/code/scripts/personal/opencode-web.sh"'
-alias openattach='opencode attach http://127.0.0.1:4096'
+[[ ! -f "$HOME/code/scripts/personal/opencode-attach.sh" ]] ||
+  alias openattach='"$HOME/code/scripts/personal/opencode-attach.sh"'

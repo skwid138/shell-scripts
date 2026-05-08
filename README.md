@@ -157,8 +157,10 @@ A few scripts here are interactive launchers wired up via aliases in
 
 - `openweb` → `personal/opencode-web.sh` — start opencode's web UI for remote
   access via Tailscale (loads password lazily from Keychain, wraps in
-  `caffeinate -is`). Companion alias `openattach` connects local TUI clients
-  to the running web backend so all clients share one session pool.
+  `caffeinate -is`).
+- `openattach` → `personal/opencode-attach.sh` — attach a local TUI to the
+  running `openweb` backend so web + terminal clients share one session pool.
+  Loads the same Keychain password so basic-auth succeeds without env setup.
   See `~/.config/opencode/README-remote-access.md` for the full setup.
 
 ## Development
