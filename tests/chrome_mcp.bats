@@ -80,14 +80,15 @@ teardown() {
 }
 
 @test "chrome_mcp: missing Chrome binary exits 3 (missing dep)" {
-  # Make a one-off copy of the script with CHROME_BIN pointing at a
-  # nonexistent path; copy it next to lib/ so its sibling-resolution still
-  # finds common.sh.
-  tmp_script="$BATS_TEST_DIRNAME/../agent/.tmp_chrome_mcp_nochrome.sh"
+  # Build $BATS_TEST_TMPDIR/agent/ next to a symlinked lib/ so the
+  # script's `dirname/.../lib/common.sh` resolution works in isolation.
+  mkdir -p "$BATS_TEST_TMPDIR/agent"
+  ln -sfn "$BATS_TEST_DIRNAME/../lib" "$BATS_TEST_TMPDIR/lib"
+  tmp_script="$BATS_TEST_TMPDIR/agent/chrome_mcp.sh"
   sed 's|^CHROME_BIN=.*|CHROME_BIN="/nonexistent/Chrome"|' "$SCRIPT" >"$tmp_script"
   chmod +x "$tmp_script"
   run "$tmp_script"
-  rm -f "$tmp_script"
+  # No explicit rm needed; bats removes $BATS_TEST_TMPDIR after the test.
   assert_failure 3
   assert_output --partial "Missing dependency:"
 }
@@ -109,12 +110,15 @@ teardown() {
 # --- arg passthrough sanity (using stubbed Chrome) ----------------------------
 
 @test "chrome_mcp: foreground mode passes URL and port to Chrome" {
-  # Place tmp script next to lib/ so common.sh resolves.
-  tmp_script="$BATS_TEST_DIRNAME/../agent/.tmp_chrome_mcp_stubbed.sh"
+  # Build $BATS_TEST_TMPDIR/agent/ next to a symlinked lib/ so the
+  # script's `dirname/.../lib/common.sh` resolution works in isolation.
+  mkdir -p "$BATS_TEST_TMPDIR/agent"
+  ln -sfn "$BATS_TEST_DIRNAME/../lib" "$BATS_TEST_TMPDIR/lib"
+  tmp_script="$BATS_TEST_TMPDIR/agent/chrome_mcp.sh"
   sed "s|^CHROME_BIN=.*|CHROME_BIN=\"$FAKE_CHROME\"|" "$SCRIPT" >"$tmp_script"
   chmod +x "$tmp_script"
   run "$tmp_script" --foreground --port 9333 --url "https://example.com"
-  rm -f "$tmp_script"
+  # No explicit rm needed; bats removes $BATS_TEST_TMPDIR after the test.
   assert_success
   assert_output --partial "fake-chrome-args:"
   assert_output --partial "--remote-debugging-port=9333"

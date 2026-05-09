@@ -182,7 +182,7 @@ EOF
   write_stubs
   input="$BATS_TEST_TMPDIR/clip.mov"
   : >"$input"
-  run "$SCRIPT" --pr --slack -o /tmp/x.gif "$input"
+  run "$SCRIPT" --pr --slack -o "$BATS_TEST_TMPDIR/x.gif" "$input"
   assert_failure 2
   assert_output --partial "exactly one preset"
 }
