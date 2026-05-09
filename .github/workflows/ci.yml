@@ -71,6 +71,41 @@ jobs:
       - name: Run tests
         run: make test
 
+  test-parallel-advisory:
+    # Advisory bake job for cross-file bats parallelism. continue-on-error
+    # means a failure here does NOT block the PR; we collect signal until
+    # the bake gate (10 green runs across both OSes OR 1 calendar week)
+    # justifies promoting `make test` to parallel.
+    name: bats parallel (advisory) (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Ensure GNU parallel (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v parallel >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y parallel
+          fi
+          parallel --version | head -1
+
+      - name: Ensure GNU parallel (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          command -v parallel >/dev/null 2>&1 || brew install parallel
+          parallel --version | head -1
+
+      - name: Run tests in parallel
+        run: make test-parallel
+
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
