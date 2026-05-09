@@ -3,10 +3,11 @@
 
 BATS    := ./tests/test_helper/bats-core/bin/bats
 TESTS   := tests/*.bats
-# Parallel job count for `make test-parallel`. Autodetect cores; override
-# via `JOBS=N make test-parallel` for debugging. macOS uses sysctl;
+# Parallel job count for `make test`. Autodetect cores; override
+# via `JOBS=N make test` for debugging. macOS uses sysctl;
 # Linux uses nproc; fallback 4. Cross-file parallelism only (bats --jobs).
 # Requires GNU parallel on PATH (Brewfile / preinstalled on GH runners).
+# Use `make test-serial` to bypass parallel entirely.
 JOBS    ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 # Collect shell scripts under the four script-bearing directories, split by
 # dialect so each gets the right tooling (rev. 6 of the zsh-init refactor).
@@ -36,7 +37,7 @@ SCRIPTS   := $(SH_FILES) $(ZSH_FILES)
 # Dialect (`-ln bash` / `-ln zsh`) is auto-detected from extension.
 SHFMT_FLAGS := -i 2 -ci
 
-.PHONY: help test test-parallel install-bats lint lint-sh lint-zsh lint-strict fmt fmt-check check clean install-hook uninstall-hook refresh-paths
+.PHONY: help test test-parallel test-serial install-bats lint lint-sh lint-zsh lint-strict fmt fmt-check check check-serial clean install-hook uninstall-hook refresh-paths
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -47,13 +48,16 @@ install-bats: ## Initialize bats test framework submodules
 		git submodule update --init --recursive tests/test_helper; \
 	fi
 
-test: install-bats ## Run all bats tests
-	$(BATS) $(TESTS)
-
-test-parallel: install-bats ## Run all bats tests across $(JOBS) workers (cross-file)
-	@command -v parallel >/dev/null 2>&1 || { echo "GNU parallel not installed; run: brew install parallel" >&2; exit 3; }
+test: install-bats ## Run all bats tests (parallel by default; $(JOBS) workers, cross-file)
+	@command -v parallel >/dev/null 2>&1 || { echo "GNU parallel not installed; run: brew install parallel (or: make test-serial)" >&2; exit 3; }
 	@echo "bats --jobs $(JOBS)"
 	$(BATS) --jobs $(JOBS) $(TESTS)
+
+test-serial: install-bats ## Run all bats tests sequentially (escape hatch for parallel-only failures)
+	$(BATS) $(TESTS)
+
+test-parallel: test ## Alias for `test` (parallel is the default)
+	@:
 
 # --- Lint targets (dialect-aware; rev. 6) ---------------------------------
 # .sh files: shellcheck (bash mode). .zsh files: `zsh -n` parser check.
@@ -113,6 +117,8 @@ fmt-check: ## Verify shfmt formatting (CI gate; exits non-zero on diff)
 	fi
 
 check: lint-strict fmt-check test ## Full CI gate: strict lint + format check + tests
+
+check-serial: lint-strict fmt-check test-serial ## Sequential variant of `check` for triaging parallel-only failures
 
 install-hook: ## Enable .githooks/pre-commit (sets git core.hooksPath)
 	@# Use git's native core.hooksPath (Git 2.9+) instead of symlinking
