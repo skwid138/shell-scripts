@@ -264,3 +264,69 @@ EOF
   run cat "$STATEFILE"
   assert_output --partial "wpromote-context.md"
 }
+
+# --- symlink invocation: regression test for common.sh resolution -----------
+#
+# When the wrapper is invoked through the install symlink (the documented
+# happy path), bash sets BASH_SOURCE[0] to the symlink path, not the
+# resolved target. A previous version sourced common.sh via a relative
+# path and broke under symlink invocation, printing
+# "No such file or directory" to stderr while exit code stayed 0.
+
+@test "wrapper: invoked through symlink, no stderr noise (common.sh resolves)" {
+  write_opencode_stub
+  # Build a symlink that mirrors the real install layout.
+  mkdir -p "$HOME/.config/opencode/bin"
+  ln -s "$SCRIPT" "$HOME/.config/opencode/bin/opencode"
+  cd "$HOME"
+  # Capture stderr separately so we can assert it is silent.
+  STDERR_FILE="$BATS_TEST_TMPDIR/stderr"
+  "$HOME/.config/opencode/bin/opencode" --no-conditional run 2>"$STDERR_FILE"
+  status=$?
+  [ "$status" -eq 0 ]
+  run cat "$STDERR_FILE"
+  refute_output --partial "No such file or directory"
+  refute_output --partial "common.sh"
+}
+
+@test "wrapper: invoked through symlink with verbose, OPENCODE_COMMON_LIB missing — falls back to stubs" {
+  write_opencode_stub
+  mkdir -p "$HOME/.config/opencode/bin"
+  ln -s "$SCRIPT" "$HOME/.config/opencode/bin/opencode"
+  mkdir -p "$HOME/code/wpromote/x"
+  cd "$HOME/code/wpromote/x"
+  # Point common.sh at a path that does not exist; stubs must take over.
+  STDERR_FILE="$BATS_TEST_TMPDIR/stderr"
+  OPENCODE_COMMON_LIB="$BATS_TEST_TMPDIR/no-such-common.sh" \
+    OPENCODE_WRAPPER_VERBOSE=1 \
+    "$HOME/.config/opencode/bin/opencode" 2>"$STDERR_FILE"
+  status=$?
+  [ "$status" -eq 0 ]
+  run cat "$STDERR_FILE"
+  refute_output --partial "No such file or directory"
+  # Stub info() should still emit the verbose injection notice.
+  assert_output --partial "wpromote conditional context loaded"
+}
+
+@test "wrapper: invoked through symlink, OPENCODE_COMMON_LIB override is honored" {
+  write_opencode_stub
+  mkdir -p "$HOME/.config/opencode/bin"
+  ln -s "$SCRIPT" "$HOME/.config/opencode/bin/opencode"
+  # Custom common.sh that defines info as a marker.
+  CUSTOM_COMMON="$BATS_TEST_TMPDIR/custom-common.sh"
+  cat >"$CUSTOM_COMMON" <<'EOF'
+info() { printf '[CUSTOM-INFO] %s\n' "$*" >&2; }
+warn() { printf '[CUSTOM-WARN] %s\n' "$*" >&2; }
+die_missing_dep() {
+  printf '[CUSTOM-DEP] %s\n' "$*" >&2
+  exit 3
+}
+EOF
+  mkdir -p "$HOME/code/wpromote/x"
+  cd "$HOME/code/wpromote/x"
+  OPENCODE_COMMON_LIB="$CUSTOM_COMMON" \
+    OPENCODE_WRAPPER_VERBOSE=1 \
+    run "$HOME/.config/opencode/bin/opencode"
+  assert_success
+  assert_output --partial "[CUSTOM-INFO]"
+}
