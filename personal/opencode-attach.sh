@@ -7,6 +7,17 @@
 # of NEVER eagerly populating secrets at shell init. Without this, `opencode
 # attach` sends no Basic-Auth credentials and the server replies "unauthorized".
 #
+# Working directory: bare `opencode attach <url>` falls back to the SERVER's
+# CWD (the dir `openweb` was launched from), not the terminal's CWD — so
+# every attach lands in the same project regardless of where the alias was
+# invoked. We forward `--dir "$PWD"` by default so the attached session
+# uses the terminal's CWD instead. The path is interpreted server-side
+# (sent via the `x-opencode-directory` header), which is fine on a single
+# host but means cross-machine attach must use a path the server can see.
+# Caller can override by passing `-- --dir /other/path`; we detect that and
+# skip the default injection so the explicit value wins.
+# Refs: https://github.com/anomalyco/opencode/issues/14460
+#
 # Companion: `openweb` (personal/opencode-web.sh) starts the server.
 #
 # Keychain entry consumed:
@@ -40,9 +51,14 @@ Arguments:
 Options:
   -h, --help    Show this help.
 
+By default, the attached session uses the current shell's CWD (forwarded
+as `--dir "$PWD"`). Override by passing `--dir <path>` after `--`; the
+explicit value wins.
+
 Any args after `--` are passed through to `opencode attach`. Example:
   openattach -- --continue
   openattach http://127.0.0.1:4096 -- --session abc123
+  openattach -- --dir /other/project          # override the default CWD
 
 Environment overrides:
   OPENCODE_WEB_PORT         Port the backend is on    (default: 4096)
@@ -95,8 +111,26 @@ OPENCODE_SERVER_PASSWORD="$(keychain_get 'opencode-server-password')" || exit $?
 export OPENCODE_SERVER_PASSWORD
 export OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
 
+# Inject the client's CWD as the attached session's working directory unless
+# the caller already supplied --dir via passthrough. The opencode server uses
+# the `x-opencode-directory` header (forwarded by `--dir`) per request, so
+# without this the session falls back to the SERVER's process.cwd() — which
+# is whatever dir `openweb` was launched from, not the terminal's CWD.
+# Refs: https://github.com/anomalyco/opencode/issues/14460
+HAS_DIR=0
+for arg in ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}; do
+  if [[ "$arg" == "--dir" || "$arg" == --dir=* ]]; then
+    HAS_DIR=1
+    break
+  fi
+done
+
 # bash 3.2 (macOS /bin/bash) treats "${arr[@]}" as unbound under `set -u`
 # when the array is empty. Use the conditional-expansion idiom that the rest
 # of the repo uses (see agent/scripts-doctor.sh) so an empty PASSTHROUGH is
 # safe across bash 3.2 → 5.x.
-exec opencode attach "$URL" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+if [[ $HAS_DIR -eq 0 ]]; then
+  exec opencode attach "$URL" --dir "$PWD" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+else
+  exec opencode attach "$URL" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+fi

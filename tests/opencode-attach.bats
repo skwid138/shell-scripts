@@ -126,7 +126,8 @@ write_all_stubs() {
   run "$SCRIPT" -- --continue
   assert_success
   run cat "$STATEFILE"
-  assert_output --partial "opencode attach http://127.0.0.1:4096 --continue"
+  assert_output --partial "opencode attach http://127.0.0.1:4096 --dir"
+  assert_output --partial "--continue"
 }
 
 @test "opencode-attach: URL + passthrough args coexist" {
@@ -135,7 +136,74 @@ write_all_stubs() {
   run "$SCRIPT" "http://h:9" -- --session abc
   assert_success
   run cat "$STATEFILE"
-  assert_output --partial "opencode attach http://h:9 --session abc"
+  assert_output --partial "opencode attach http://h:9 --dir"
+  assert_output --partial "--session abc"
+}
+
+# --- --dir injection regression tests ---------------------------------------
+#
+# `opencode attach` without --dir falls back to the SERVER's process.cwd()
+# (the dir openweb was launched from), so every attached session lands in
+# the same project regardless of where the alias was invoked. These tests
+# pin the wrapper's behavior of injecting `--dir "$PWD"` by default and
+# yielding to an explicit caller-supplied --dir.
+# Refs: https://github.com/anomalyco/opencode/issues/14460
+
+@test "opencode-attach: injects --dir \$PWD by default" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  cd "$STUBDIR"
+  run "$SCRIPT"
+  assert_success
+  run cat "$STATEFILE"
+  assert_output --partial "opencode attach http://127.0.0.1:4096 --dir $STUBDIR"
+}
+
+@test "opencode-attach: --dir reflects current working directory at invocation" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  local subdir="$STUBDIR/nested/project"
+  mkdir -p "$subdir"
+  cd "$subdir"
+  run "$SCRIPT"
+  assert_success
+  run cat "$STATEFILE"
+  assert_output --partial "--dir $subdir"
+}
+
+@test "opencode-attach: caller-supplied --dir overrides default injection" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  cd "$STUBDIR"
+  run "$SCRIPT" -- --dir /override/path
+  assert_success
+  run cat "$STATEFILE"
+  # The forwarded args should contain the caller's --dir exactly once,
+  # and must not contain the default $PWD injection.
+  assert_output --partial "--dir /override/path"
+  refute_output --partial "--dir $STUBDIR"
+}
+
+@test "opencode-attach: caller-supplied --dir=value form also overrides default" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  cd "$STUBDIR"
+  run "$SCRIPT" -- --dir=/override/path
+  assert_success
+  run cat "$STATEFILE"
+  assert_output --partial "--dir=/override/path"
+  refute_output --partial "--dir $STUBDIR"
+}
+
+@test "opencode-attach: --dir injected alongside other passthrough args" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  cd "$STUBDIR"
+  run "$SCRIPT" -- --continue
+  assert_success
+  run cat "$STATEFILE"
+  assert_output --partial "--dir $STUBDIR"
+  assert_output --partial "--continue"
 }
 
 @test "opencode-attach: exports OPENCODE_SERVER_PASSWORD for the child process" {
