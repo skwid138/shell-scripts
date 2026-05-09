@@ -8,7 +8,7 @@ on:
 
 jobs:
   lint-test-serial:
-    name: shellcheck + bats (${{ matrix.os }})
+    name: lint-test-serial (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -72,7 +72,7 @@ jobs:
         run: make test-serial
 
   lint-test-parallel:
-    name: bats parallel (${{ matrix.os }})
+    name: lint-test-parallel (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
