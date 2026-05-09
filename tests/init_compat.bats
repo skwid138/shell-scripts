@@ -22,6 +22,17 @@ setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
+  # Per-test ZPLUG_HOME isolation: rc-tier sources rc/zsh_plugins.zsh, which
+  # runs `zplug load` and writes to $ZPLUG_HOME/log/load_success.log. Under
+  # parallel bats workers (`bats --jobs N`), multiple subshells contending
+  # on the shared default (~/.zplug/log/load_success.log) emit log-write
+  # errors to stderr, breaking the silence assertion at line 68 below
+  # intermittently. Giving each test its own ZPLUG_HOME under the per-test
+  # tmpdir removes the contention. zplug honors $ZPLUG_HOME if pre-set
+  # (see /opt/homebrew/opt/zplug/base/core/core.zsh: `ZPLUG_HOME=${ZPLUG_HOME:-~/.zplug}`),
+  # so plugin behavior outside tests is unchanged.
+  export ZPLUG_HOME="$BATS_TEST_TMPDIR/.zplug"
+  mkdir -p "$ZPLUG_HOME/log"
 }
 
 @test "compat: sourcing init.zsh exits 0" {

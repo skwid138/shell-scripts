@@ -18,6 +18,13 @@ setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
+  # Per-test ZPLUG_HOME isolation. See init_compat.bats setup() for the full
+  # rationale: `zplug load` writes to $ZPLUG_HOME/log/load_success.log, and
+  # parallel bats workers contending on the shared default (~/.zplug) leak
+  # log-write errors to stderr. Per-test dirs eliminate the race. zplug
+  # honors a pre-set $ZPLUG_HOME, so behavior outside tests is unchanged.
+  export ZPLUG_HOME="$BATS_TEST_TMPDIR/.zplug"
+  mkdir -p "$ZPLUG_HOME/log"
 }
 
 # --- compinit guard ---------------------------------------------------------
