@@ -212,6 +212,46 @@ EOF
   refute_output --partial "wpromote conditional context loaded"
 }
 
+@test "wrapper: verbose mode from non-wpromote dir is silent on stderr (no errors, no notice)" {
+  # The symptom that motivated Phase 1 was: verbose mode from a non-wpromote
+  # dir would print bash's "No such file or directory" because common.sh
+  # failed to source. After Phase 1 it's silent; this test pins that.
+  write_opencode_stub
+  mkdir -p "$HOME/.config/opencode/bin"
+  ln -s "$SCRIPT" "$HOME/.config/opencode/bin/opencode"
+  cd "$HOME" # explicitly NOT under $HOME/code/wpromote
+  STDERR_FILE="$BATS_TEST_TMPDIR/stderr"
+  OPENCODE_WRAPPER_VERBOSE=1 \
+    "$HOME/.config/opencode/bin/opencode" run 2>"$STDERR_FILE"
+  status=$?
+  [ "$status" -eq 0 ]
+  run cat "$STDERR_FILE"
+  refute_output --partial "No such file or directory"
+  refute_output --partial "unbound variable"
+  # No injection notice should fire outside wpromote, even with verbose on.
+  refute_output --partial "wpromote conditional context loaded"
+}
+
+@test "wrapper: verbose mode from wpromote dir, invoked through symlink, fires the injection notice cleanly" {
+  # Companion test: under wpromote, verbose, through symlink — injection
+  # notice should appear on stderr and nothing else noisy.
+  write_opencode_stub
+  mkdir -p "$HOME/.config/opencode/bin"
+  ln -s "$SCRIPT" "$HOME/.config/opencode/bin/opencode"
+  mkdir -p "$HOME/code/wpromote/polaris-web"
+  cd "$HOME/code/wpromote/polaris-web"
+  STDERR_FILE="$BATS_TEST_TMPDIR/stderr"
+  OPENCODE_WRAPPER_VERBOSE=1 \
+    "$HOME/.config/opencode/bin/opencode" run 2>"$STDERR_FILE"
+  status=$?
+  [ "$status" -eq 0 ]
+  run cat "$STDERR_FILE"
+  refute_output --partial "No such file or directory"
+  refute_output --partial "unbound variable"
+  assert_output --partial "wpromote conditional context loaded"
+  assert_output --partial "$HOME/code/wpromote/polaris-web"
+}
+
 # --- recursion safety -------------------------------------------------------
 
 @test "wrapper: skips itself when a copy of itself appears earlier on PATH" {
