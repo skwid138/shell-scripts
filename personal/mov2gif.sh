@@ -106,7 +106,7 @@ if [[ -z "$OUTPUT" ]]; then
 fi
 
 # Temporary palette file.
-PALETTE="/tmp/palette-$$.png"
+PALETTE="${TMPDIR:-/tmp}/palette-$$.png"
 
 # Pass 1: generate palette.
 # -nostdin is critical: without it, ffmpeg consumes its inherited stdin,

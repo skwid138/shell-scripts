@@ -12,6 +12,9 @@ setup() {
   STATEFILE="$STUBDIR/calls.log"
   export PATH="$STUBDIR:$PATH"
   export STATEFILE
+  # Scope mov2gif.sh's PALETTE tmpfile to a per-test directory so parallel
+  # workers don't share /tmp/palette-$$.png paths.
+  export TMPDIR="$STUBDIR"
 }
 
 teardown() {
@@ -25,7 +28,7 @@ echo "ffmpeg $*" >>"$STATEFILE"
 # When asked to write the palette PNG, materialize it so pass 2 sees it.
 for arg in "$@"; do
   case "$arg" in
-    /tmp/palette-*.png) : >"$arg" ;;
+    */palette-*.png) : >"$arg" ;;
   esac
 done
 exit 0

@@ -26,6 +26,12 @@ setup() {
   : >"$STATEFILE"
   : >"$COUNTERFILE"
 
+  # Scope the script-under-test's tmp writes (gif_jif.sh tmpfile, mov2gif.sh
+  # PALETTE) to a per-test directory so parallel workers can't observe each
+  # other's in-flight tmp files. The stubs match palette paths via a glob
+  # (`*/palette-*.png`) so they continue to work under any TMPDIR.
+  export TMPDIR="$STUBDIR"
+
   # Defaults: 1280x720 @ 30fps, 8s duration.
   export MOCK_FFPROBE_W="${MOCK_FFPROBE_W:-1280}"
   export MOCK_FFPROBE_H="${MOCK_FFPROBE_H:-720}"
@@ -87,7 +93,7 @@ eval "out=\${$#}"
 # Pass-1 (palettegen): just create the palette PNG (no size tracking).
 if [[ "$is_paletteuse" -eq 0 ]]; then
   case "$out" in
-    /tmp/palette-*.png) : >"$out" ;;
+    */palette-*.png) : >"$out" ;;
   esac
   exit 0
 fi
@@ -633,7 +639,7 @@ if [[ ! -t 0 ]]; then cat >/dev/null 2>&1 || true; fi
 for arg in "$@"; do
   case "$arg" in
     *paletteuse*) exit 1 ;; # always fail pass-2
-    /tmp/palette-*.png) : >"$arg" ;;
+    */palette-*.png) : >"$arg" ;;
   esac
 done
 exit 0
@@ -644,8 +650,9 @@ EOF
   : >"$input"
   run "$SCRIPT" --pr "$input"
   assert_failure 1
-  # No leaked tmpfile in /tmp matching our PID prefix.
-  leaked="$(ls /tmp/gif_jif-*-pr.gif 2>/dev/null | wc -l | tr -d ' ')"
+  # No leaked tmpfile in our scoped TMPDIR. (TMPDIR is per-test STUBDIR;
+  # the script honors ${TMPDIR:-/tmp} for its tmpfile path.)
+  leaked="$(ls "$TMPDIR"/gif_jif-*-pr.gif 2>/dev/null | wc -l | tr -d ' ')"
   [[ "$leaked" -eq 0 ]]
   # No final output file either.
   [[ ! -f "$BATS_TEST_TMPDIR/clip.pr.gif" ]]

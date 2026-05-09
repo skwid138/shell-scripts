@@ -449,7 +449,7 @@ encode_for_preset() {
   start_scale="$(starting_scale "$preset")"
 
   local tmpfile
-  tmpfile="/tmp/gif_jif-$$-${preset}.gif"
+  tmpfile="${TMPDIR:-/tmp}/gif_jif-$$-${preset}.gif"
 
   info "[$preset] starting: fps=$start_fps scale=$start_scale budget=$budget"
 
