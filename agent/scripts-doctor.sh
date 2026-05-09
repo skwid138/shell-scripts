@@ -219,6 +219,35 @@ check_opencode_wrapper_symlink() {
   record "_global" "$name" "pass" "$link → $expected_target"
 }
 
+# --- check: opencode wrapper sources common.sh cleanly ---
+#
+# Regression guard for a 2026-05-09 bug where opencode-wrapper.sh sourced
+# common.sh via a path relative to BASH_SOURCE[0]. When invoked through
+# the install symlink, BASH_SOURCE[0] is the symlink path (not the resolved
+# target), so the relative source resolved to ~/.config/opencode/lib/common.sh
+# which does not exist. Bash printed "No such file or directory" to stderr
+# while exit code stayed 0. See:
+#   ~/.config/opencode/.project-plans/2026-05-09_opencode-wrapper-common-sh-fix.md
+
+check_opencode_wrapper_invocation() {
+  local link="${OPENCODE_WRAPPER_LINK:-$HOME/.config/opencode/bin/opencode}"
+  local name="opencode wrapper sources common.sh cleanly"
+
+  # Skip silently if the symlink isn't installed (no install run yet) or if
+  # common.sh isn't where we expect (intentional non-default install).
+  [[ -L "$link" ]] || return 0
+  [[ -r "$HOME/code/scripts/lib/common.sh" ]] || return 0
+
+  local stderr_capture
+  stderr_capture="$("$link" --help 2>&1 >/dev/null)" || true
+
+  if printf '%s' "$stderr_capture" | grep -q 'No such file or directory'; then
+    record "_global" "$name" "fail" "stderr contains 'No such file or directory': $(printf '%s' "$stderr_capture" | head -n1)"
+    return
+  fi
+  record "_global" "$name" "pass" "wrapper invocation through symlink is silent on stderr"
+}
+
 # --- per-script checks ---
 
 check_script_help() {
@@ -370,6 +399,7 @@ fi
 
 check_tooling
 check_opencode_wrapper_symlink
+check_opencode_wrapper_invocation
 for repo in "${REPOS[@]}"; do
   check_repo "$repo"
 done
