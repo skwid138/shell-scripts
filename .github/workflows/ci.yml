@@ -137,9 +137,21 @@ jobs:
           # shallow clone.
           fetch-depth: 0
 
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@v2
+      - name: Install gitleaks CLI
+        # Self-hosted CLI install (instead of gitleaks/gitleaks-action@v2)
+        # because that action is pinned to Node 20, which GitHub is
+        # deprecating. The CLI is a single Go binary; pin via env var.
         env:
-          # GITHUB_TOKEN lets gitleaks-action post a check-run summary on PRs.
-          # No org-level GITLEAKS_LICENSE is needed for public repos.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run gitleaks
+        # `detect` scans the full git history (matches gitleaks-action default
+        # on push). --redact prevents secrets from appearing in CI logs.
+        # --exit-code 1 (default) fails the job on any finding.
+        run: gitleaks detect --source . --redact --no-banner --verbose
