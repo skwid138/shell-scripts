@@ -89,22 +89,38 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Ensure GNU parallel and zsh (Linux)
+      - name: Ensure GNU parallel, zsh, shellcheck, shfmt (Linux)
         if: runner.os == 'Linux'
         run: |
           # parallel is required by `bats --jobs` for cross-file parallelism;
           # zsh is required by tests that source .zsh files (init_*, compat,
-          # aliases, etc). Ubuntu runners ship neither by default.
+          # aliases, etc); shellcheck + shfmt are required by scripts-doctor
+          # tests which check for them on PATH. Ubuntu runners ship none of
+          # these by default.
           sudo apt-get update
-          sudo apt-get install -y parallel zsh
+          sudo apt-get install -y parallel zsh shellcheck
+          # shfmt: install latest binary release directly (apt version often stale)
+          SHFMT_VERSION="3.13.1"
+          curl -fsSL -o /tmp/shfmt \
+            "https://github.com/mvdan/sh/releases/download/v$SHFMT_VERSION/shfmt_v${SHFMT_VERSION}_linux_amd64"
+          chmod +x /tmp/shfmt
+          sudo mv /tmp/shfmt /usr/local/bin/shfmt
           parallel --version | head -1
           zsh --version
+          shellcheck --version | head -1
+          shfmt --version
 
-      - name: Ensure GNU parallel (macOS)
+      - name: Ensure GNU parallel, shellcheck, shfmt (macOS)
         if: runner.os == 'macOS'
         run: |
+          # macOS already ships zsh. parallel + shellcheck + shfmt come from brew.
+          # scripts-doctor tests require shellcheck and shfmt on PATH.
           command -v parallel >/dev/null 2>&1 || brew install parallel
+          command -v shellcheck >/dev/null 2>&1 || brew install shellcheck
+          command -v shfmt >/dev/null 2>&1 || brew install shfmt
           parallel --version | head -1
+          shellcheck --version | head -1
+          shfmt --version
 
       - name: Run tests in parallel
         run: make test-parallel
