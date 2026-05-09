@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  lint-test:
+  lint-test-serial:
     name: shellcheck + bats (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -69,16 +69,11 @@ jobs:
         run: make fmt-check
 
       - name: Run tests
-        run: make test
+        run: make test-serial
 
-  test-parallel-advisory:
-    # Advisory bake job for cross-file bats parallelism. continue-on-error
-    # means a failure here does NOT block the PR; we collect signal until
-    # the bake gate (10 green runs across both OSes OR 1 calendar week)
-    # justifies promoting `make test` to parallel.
-    name: bats parallel (advisory) (${{ matrix.os }})
+  lint-test-parallel:
+    name: bats parallel (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -121,6 +116,12 @@ jobs:
           parallel --version | head -1
           shellcheck --version | head -1
           shfmt --version
+
+      - name: Lint (errors only)
+        run: make lint-strict
+
+      - name: Format check
+        run: make fmt-check
 
       - name: Run tests in parallel
         run: make test-parallel
