@@ -89,13 +89,16 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Ensure GNU parallel (Linux)
+      - name: Ensure GNU parallel and zsh (Linux)
         if: runner.os == 'Linux'
         run: |
-          if ! command -v parallel >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y parallel
-          fi
+          # parallel is required by `bats --jobs` for cross-file parallelism;
+          # zsh is required by tests that source .zsh files (init_*, compat,
+          # aliases, etc). Ubuntu runners ship neither by default.
+          sudo apt-get update
+          sudo apt-get install -y parallel zsh
           parallel --version | head -1
+          zsh --version
 
       - name: Ensure GNU parallel (macOS)
         if: runner.os == 'macOS'

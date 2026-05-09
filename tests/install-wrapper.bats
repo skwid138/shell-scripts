@@ -18,7 +18,11 @@ setup() {
 }
 
 teardown() {
-  [[ -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
+  # SANDBOX may be unset if setup() called `skip` before mktemp; guard so
+  # teardown stays exit-0 in that case (bats fails the test if teardown
+  # returns nonzero, which would mask a legitimate skip).
+  [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
+  return 0
 }
 
 write_target() {
