@@ -52,9 +52,27 @@
 
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../lib/common.sh
-source "$SCRIPT_DIR/../lib/common.sh"
+# Resolve common.sh via absolute path so the wrapper works whether invoked
+# directly or through the install symlink at ~/.config/opencode/bin/opencode.
+# (BASH_SOURCE[0] is the symlink path, not the resolved target, so a relative
+# `$SCRIPT_DIR/../lib/common.sh` would resolve to ~/.config/opencode/lib/
+# which does not exist — see ~/.config/opencode/.project-plans/2026-05-09_opencode-wrapper-common-sh-fix.md)
+COMMON_LIB="${OPENCODE_COMMON_LIB:-$HOME/code/scripts/lib/common.sh}"
+if [[ -r "$COMMON_LIB" ]]; then
+  # shellcheck source=../lib/common.sh
+  source "$COMMON_LIB"
+else
+  # Stub fallback — only the three symbols the wrapper actually consumes
+  # (info, warn, die_missing_dep). Keeps the wrapper functional even if
+  # the scripts repo is missing or moved. Mirrors the pattern in
+  # ~/.config/opencode/bin/install-wrapper.sh.
+  info() { [[ "${OPENCODE_WRAPPER_VERBOSE:-0}" == "1" ]] && printf '[wrapper] %s\n' "$*" >&2; }
+  warn() { printf '[wrapper:warn] %s\n' "$*" >&2; }
+  die_missing_dep() {
+    printf '[wrapper:fatal] missing dependency: %s\n' "$*" >&2
+    exit 3
+  }
+fi
 
 usage() {
   cat <<'EOF'
