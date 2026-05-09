@@ -60,7 +60,8 @@ All scripts in this directory:
 ## Testing
 
 ```bash
-make test          # all bats suites
+make test          # all bats suites (parallel by default)
+make test-serial   # sequential (for debugging parallel-only failures)
 make check         # lint + fmt + test (CI gate)
 ```
 

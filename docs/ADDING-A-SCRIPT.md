@@ -142,9 +142,13 @@ look at `tests/gh-pr-checks-summary.bats` for the established pattern.
 ```bash
 make fmt          # apply shfmt
 make lint-strict  # error-level shellcheck (CI gates on this)
-make test         # run all bats
+make test         # run all bats (parallel by default)
+make test-serial  # run all bats sequentially (escape hatch)
 make check        # all of the above
 ```
+
+Tests run in parallel by default; if you see a flaky failure, re-run
+with `make test-serial` to confirm it's not parallel-related.
 
 `make check` MUST be clean before you commit. CI runs the same gate.
 

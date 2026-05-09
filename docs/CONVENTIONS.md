@@ -211,6 +211,17 @@ coverage in `tests/`. Convention:
 Per-script preflight tests (missing-dep, unauthed) are not duplicated:
 `tests/common.bats` covers `require_cmd` and `require_auth` once.
 
+### Parallel safety
+
+Tests run in parallel by default via `bats --jobs` (cross-file). To stay
+parallel-safe:
+
+- Don't share mutable state across tests; use `$BATS_TEST_TMPDIR` rather
+  than hardcoded `/tmp/foo` paths.
+- Don't depend on test execution order (within or across files).
+- If a test fails only in parallel mode, run `make test-serial` to
+  confirm the failure is parallel-specific and triage from there.
+
 ## File layout
 
 See [README.md](../README.md) for the directory map. The summary:

@@ -166,17 +166,27 @@ A few scripts here are interactive launchers wired up via aliases in
 ## Development
 
 ```bash
-make lint           # shellcheck (advisory; warning-level findings shown)
+make lint           # shellcheck (advisory)
 make lint-strict    # shellcheck (CI gate; errors only)
-make test           # bats — auto-installs submodules on first run
 make fmt            # apply shfmt formatting
-make check          # full CI gate: lint-strict + fmt-check + test
+make test           # bats (parallel by default; requires GNU parallel)
+make test-serial    # bats sequentially (escape hatch)
+make test-parallel  # alias for `make test`
+make check          # full CI gate: lint-strict + fmt-check + test (parallel)
+make check-serial   # sequential variant of `make check`
 make help           # list all targets
 ```
 
-CI runs `lint-strict`, `fmt-check`, and `test` on every push and PR
-(macOS + Ubuntu matrix), plus a separate gitleaks job for secret
-scanning.
+CI runs `lint-strict`, `fmt-check`, and **both** `test-serial` and
+`test-parallel` as side-by-side blocking jobs (macOS + Ubuntu matrix),
+plus a separate gitleaks job for secret scanning. Two test jobs let us
+distinguish serial-only regressions from parallel-only regressions.
+
+Parallel test execution requires GNU `parallel` on PATH (preinstalled on
+GitHub-hosted runners; `brew install parallel` for local dev). The
+`JOBS` env var controls worker count and defaults to the CPU count
+(`sysctl -n hw.ncpu` on macOS, `nproc` on Linux, fallback 4); override
+with `JOBS=N make test` for debugging.
 
 ### Pre-commit hook (optional)
 
