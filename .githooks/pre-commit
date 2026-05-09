@@ -5,8 +5,9 @@
 #
 #   make install-hook
 #
-# The installed hook is a symlink to this file, so future updates to
-# this script are picked up automatically — no need to re-run install.
+# The installer points `git config core.hooksPath` at `.githooks/`
+# (Git 2.9+), so future edits to this script are picked up automatically
+# — no need to re-run install.
 #
 # Bypass for emergency commits with: git commit --no-verify
 #
