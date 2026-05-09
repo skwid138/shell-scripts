@@ -189,3 +189,62 @@ EOF
   run "$bash_3" "$HOOK"
   assert_success
 }
+
+# --- opencode-wrapper invariants check -------------------------------------
+#
+# These tests exercise the wrapper-specific gate added in Phase 2 §2b.
+# They depend on the real wrapper file at ../personal/opencode-wrapper.sh
+# and the real $HOME/code/scripts/lib/common.sh (which the wrapper sources
+# via absolute path). On any reasonable dev machine running this suite,
+# both exist.
+
+@test "pre-commit: passes when staged wrapper sources common.sh correctly" {
+  command -v shellcheck >/dev/null 2>&1 || skip "shellcheck not installed"
+  command -v shfmt >/dev/null 2>&1 || skip "shfmt not installed"
+
+  cd "$REPO"
+  mkdir -p personal
+  cp "$BATS_TEST_DIRNAME/../personal/opencode-wrapper.sh" personal/opencode-wrapper.sh
+  git add personal/opencode-wrapper.sh
+  run "$HOOK"
+  assert_success
+  assert_output --partial "opencode-wrapper.sh parses cleanly"
+  assert_output --partial "opencode-wrapper.sh sources common.sh cleanly via symlink"
+}
+
+@test "pre-commit: fails when staged wrapper has broken common.sh resolution" {
+  cd "$REPO"
+  mkdir -p personal
+  # A wrapper that SOURCES from a relative path that won't resolve under
+  # symlink invocation — the pre-Phase-1 bug shape. Crafted to be free
+  # of shellcheck findings (so we exercise the new gate, not shellcheck)
+  # by disabling SC1091 inline.
+  cat >personal/opencode-wrapper.sh <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091  # intentional broken-shape regression fixture
+source "$SCRIPT_DIR/../lib/common.sh"
+exit 0
+EOF
+  chmod +x personal/opencode-wrapper.sh
+  git add personal/opencode-wrapper.sh
+  run "$HOOK"
+  assert_failure
+  assert_output --partial "source resolution broken under symlink invocation"
+}
+
+@test "pre-commit: wrapper invariants check is skipped for unrelated commits" {
+  cd "$REPO"
+  cat >other.sh <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+echo "hi"
+EOF
+  chmod +x other.sh
+  git add other.sh
+  run "$HOOK"
+  # Pass or fail depends on shellcheck/shfmt presence; what we assert
+  # is that the wrapper-specific messages do NOT appear.
+  refute_output --partial "opencode-wrapper.sh"
+}

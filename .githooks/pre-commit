@@ -126,6 +126,62 @@ else
   echo "  ! gitleaks not installed; skipping (install: brew install gitleaks)" >&2
 fi
 
+# --- 4. opencode-wrapper invariants ----------------------------------------
+# When personal/opencode-wrapper.sh is in the staged set, validate that the
+# invariants Phase 1 fixed still hold. The wrapper must:
+#   (a) parse cleanly under bash (`bash -n`), and
+#   (b) source common.sh successfully when invoked through a symlink
+#       (this catches the BASH_SOURCE[0]-via-symlink class of bug that
+#        produced silent "No such file or directory" stderr noise).
+#
+# We only run these when the wrapper itself is staged — fast path stays
+# fast for unrelated commits.
+wrapper_staged=0
+for f in "${staged_sh[@]}"; do
+  case "$f" in personal/opencode-wrapper.sh)
+    wrapper_staged=1
+    break
+    ;;
+  esac
+done
+
+if [[ "$wrapper_staged" -eq 1 ]]; then
+  wrapper_path="$repo_root/personal/opencode-wrapper.sh"
+
+  # (a) Syntax check.
+  pc_syn="$(mktemp -t pc-wrapper-syn.XXXXXX)"
+  if bash -n "$wrapper_path" 2>"$pc_syn"; then
+    pass "opencode-wrapper.sh parses cleanly"
+  else
+    sed 's/^/    /' <"$pc_syn" >&2
+    fail "opencode-wrapper.sh has syntax errors above. Fix before committing."
+  fi
+  rm -f "$pc_syn"
+
+  # (b) Symlink-invocation smoke. Build a throwaway symlink and a stub
+  # opencode in a temp dir; invoke the wrapper through the symlink with
+  # --no-conditional (avoids needing to fake wpromote layout) and assert
+  # stderr is clean of the marker bash prints when source fails.
+  pc_tmp="$(mktemp -d)"
+  mkdir -p "$pc_tmp/bin" "$pc_tmp/stubpath"
+  ln -s "$wrapper_path" "$pc_tmp/bin/opencode"
+  cat >"$pc_tmp/stubpath/opencode" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+  chmod +x "$pc_tmp/stubpath/opencode"
+  pc_stderr="$pc_tmp/stderr"
+  PATH="$pc_tmp/stubpath:/usr/bin:/bin" \
+    "$pc_tmp/bin/opencode" --no-conditional >/dev/null 2>"$pc_stderr"
+  if grep -q 'No such file or directory' "$pc_stderr" 2>/dev/null; then
+    sed 's/^/    /' <"$pc_stderr" >&2
+    fail "opencode-wrapper.sh source resolution broken under symlink invocation (see stderr above). Likely cause: common.sh path went relative again — keep absolute \$HOME path per Phase 1 fix."
+  else
+    pass "opencode-wrapper.sh sources common.sh cleanly via symlink"
+  fi
+  rm -rf "$pc_tmp"
+fi
+
 if [[ $overall_fail -ne 0 ]]; then
   echo "" >&2
   echo "pre-commit: one or more checks failed. Commit aborted." >&2
