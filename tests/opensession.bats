@@ -265,7 +265,10 @@ arm_spawn_timeout() {
   }
   # openattach was exec'd. No --force passthrough on default path.
   grep -qE "^openattach\b" "$STATEFILE"
-  run ! grep -q "^openattach.*--force" "$STATEFILE"
+  if grep -q "^openattach.*--force" "$STATEFILE"; then
+    echo "unexpected --force in openattach call" >&2
+    return 1
+  fi
   # The info banner mentions starting the daemon.
   assert_output --partial "starting one"
 }
@@ -276,7 +279,10 @@ arm_spawn_timeout() {
   run "$SCRIPT"
   assert_success
   # No openweb spawn.
-  run ! grep -q "^openweb" "$STATEFILE"
+  if grep -q "^openweb" "$STATEFILE"; then
+    echo "unexpected openweb spawn on fresh-daemon path" >&2
+    return 1
+  fi
   # openattach was exec'd.
   grep -qE "^openattach\b" "$STATEFILE"
   # No "starting one" banner — silent attach.
@@ -314,7 +320,10 @@ arm_spawn_timeout() {
   assert_output --partial "not opencode"
   assert_output --partial "caffeinate"
   # Crucially, no spawn attempt.
-  run ! grep -q "^openweb" "$STATEFILE"
+  if grep -q "^openweb" "$STATEFILE"; then
+    echo "unexpected openweb spawn on foreign-listener path" >&2
+    return 1
+  fi
 }
 
 @test "opensession: spawn race — port grabbed by foreign process during spawn → exit 5" {
@@ -366,7 +375,10 @@ arm_spawn_timeout() {
   assert_failure 5
   assert_output --partial "openweb --restart failed"
   # openattach was NOT exec'd — we bailed before that.
-  run ! grep -q "^openattach" "$STATEFILE"
+  if grep -q "^openattach" "$STATEFILE"; then
+    echo "unexpected openattach exec after openweb failure" >&2
+    return 1
+  fi
 }
 
 # --- --force flag passthrough -----------------------------------------------
