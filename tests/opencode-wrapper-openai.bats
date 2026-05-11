@@ -8,8 +8,6 @@ setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
 
-  WRAPPER="$HOME/.config/opencode/bin/opencode"
-
   STUBDIR="$(mktemp -d)"
   export PATH="$STUBDIR:$PATH"
 
@@ -26,15 +24,7 @@ EOF
   chmod +x "$STUBDIR/opencode"
 
   # Override HOME so the wrapper resolves secrets.sh from our stub
-  export REAL_HOME="$HOME"
   export HOME="$STUBDIR"
-
-  # Create minimal wrapper config dir structure
-  mkdir -p "$STUBDIR/.config/opencode/bin"
-  mkdir -p "$STUBDIR/.config/opencode/instruction"
-
-  # Copy the real wrapper
-  cp "$REAL_HOME/.config/opencode/bin/opencode" "$STUBDIR/.config/opencode/bin/opencode"
 
   # Provide common.sh stubs (the wrapper needs info/warn/die_missing_dep)
   export OPENCODE_COMMON_LIB="$STUBDIR/common.sh"
