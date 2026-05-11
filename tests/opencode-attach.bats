@@ -519,7 +519,13 @@ arm_no_daemon() {
   # Feed 'n\n' via stdin; script(1) runs the wrapper inside a real pty.
   # `|| true` because script(1)'s exit code passthrough is variable across
   # platforms — we assert via the captured typescript content.
-  echo n | script -q "$BATS_TEST_TMPDIR/pty.out" "$script_path" || true
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    # GNU script (util-linux): requires -c for command
+    echo n | script -q "$BATS_TEST_TMPDIR/pty.out" -c "$script_path" || true
+  else
+    # BSD script (macOS): command is positional
+    echo n | script -q "$BATS_TEST_TMPDIR/pty.out" "$script_path" || true
+  fi
   SCRIPT="$script_path"
   grep -q "Continue attaching" "$BATS_TEST_TMPDIR/pty.out"
 }
