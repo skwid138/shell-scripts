@@ -20,8 +20,8 @@
 #
 # Daemon lifecycle: the `opencode web` daemon self-daemonizes (PPID=1, owned
 # by launchd) — closing the terminal that ran `openweb` does NOT kill the
-# daemon. To stop it: `kill <pid>`, `openweb --restart`, or once Ship 2
-# lands, `opensession --restart`. The previous wrapper headers' "Ctrl+C
+# daemon. To stop it: `kill <pid>`, `openweb --restart`, or
+# `opensession --restart`. The previous wrapper headers' "Ctrl+C
 # kills both" claim was incorrect.
 #
 # Stale-daemon detection: if the daemon's start-time config snapshot (sha256

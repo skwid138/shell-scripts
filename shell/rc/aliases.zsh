@@ -99,11 +99,17 @@ alias nvim-update='nvim --headless "+Lazy! sync" +qa && \
 
 ## ───────────────────────────────────────────────────────────────────
 ## opencode remote access (Tailscale-fronted web UI)
+## opensession — daily driver. Ensures a daemon is running, then attaches.
+##               Starts one via openweb if needed; otherwise just openattach.
+##               --restart for a clean refresh; --force to bypass staleness.
 ## openweb     — start `opencode web` wrapped in caffeinate, password from Keychain.
 ## openattach  — attach a local TUI to the running web backend so all clients
 ##               (web + terminal) share one session pool. Requires `openweb` running.
-## See: ~/.config/opencode/README-remote-access.md (or .project-plans/2026.05.08_opencode-web-ui.md)
+## See: ~/.config/opencode/README.md → "OpenCode daemon and the wrapper quartet"
 ## ───────────────────────────────────────────────────────────────────
+# shellcheck disable=SC2139
+[[ ! -f "$HOME/code/scripts/personal/opensession.sh" ]] ||
+  alias opensession="$HOME/code/scripts/personal/opensession.sh"
 # shellcheck disable=SC2139
 [[ ! -f "$HOME/code/scripts/personal/opencode-web.sh" ]] ||
   alias openweb="$HOME/code/scripts/personal/opencode-web.sh"

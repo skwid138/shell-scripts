@@ -22,7 +22,7 @@
 #   to decide whether the running daemon's config is stale.
 #
 # Companion: `openattach` attaches a local TUI to the same backend. `opensession`
-# (Ship 2) is the daily-driver orchestrator that ensures-daemon-then-attaches.
+# is the daily-driver orchestrator that ensures-daemon-then-attaches.
 #
 # Keychain entry consumed:
 #   service: opencode-server-password
