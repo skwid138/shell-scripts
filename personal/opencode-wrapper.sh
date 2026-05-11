@@ -196,6 +196,34 @@ case "${1:-}" in
     ;;
 esac
 
+# --- OpenAI API key (unconditional) ------------------------------------------
+# Load Wpromote OpenAI key for opencode's OpenAI provider. Available in any
+# repo context. Key is project-scoped (sk-proj-...).
+_openai_secrets="$HOME/code/scripts/shell/lib/secrets.sh"
+if [[ -r "$_openai_secrets" ]]; then
+  source "$_openai_secrets"
+  # Ensure die_unauthed is available (common.sh may not have loaded in stub path)
+  if ! type die_unauthed &>/dev/null; then
+    die_unauthed() {
+      printf '[wrapper:fatal] unauthenticated: %s\n' "$*" >&2
+      exit 4
+    }
+  fi
+  if ! secret_load OPENAI_API_KEY wpro-openai 2>/dev/null; then
+    warn "wpro-openai not in keychain; OpenAI agents will be unavailable."
+    if : >/dev/tty 2>/dev/null; then
+      printf 'Continue without OpenAI? [y/N] ' >/dev/tty
+      IFS= read -r _reply </dev/tty || _reply=""
+      [[ "$_reply" =~ ^[yY] ]] || die_unauthed "Aborted. Add key with: security add-generic-password -a openai -s wpro-openai -w '<key>'"
+    else
+      die_unauthed "wpro-openai not in keychain and no tty for prompt. Add with: security add-generic-password -a openai -s wpro-openai -w '<key>'"
+    fi
+  fi
+else
+  warn "secrets.sh not found at $_openai_secrets; OpenAI agents unavailable"
+fi
+unset _openai_secrets _reply
+
 # --- conditional injection ---------------------------------------------------
 
 WPROMOTE_ROOT="$HOME/code/wpromote"
