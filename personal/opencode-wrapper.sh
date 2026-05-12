@@ -188,17 +188,10 @@ find_real_opencode() {
 REAL_OPENCODE="$(find_real_opencode)" || die_missing_dep \
   "real 'opencode' binary not found on PATH (the wrapper at $self_real is the only match). Install with: brew install anomalyco/tap/opencode"
 
-# --- subcommand carve-out: web / attach pass through unmodified --------------
-
-case "${1:-}" in
-  web | attach)
-    exec "$REAL_OPENCODE" "$@"
-    ;;
-esac
-
 # --- OpenAI API key (unconditional) ------------------------------------------
 # Load Wpromote OpenAI key for opencode's OpenAI provider. Available in any
-# repo context. Key is project-scoped (sk-proj-...).
+# repo context — including web/attach subcommands. Key is project-scoped
+# (sk-proj-...).
 _openai_secrets="$HOME/code/scripts/shell/lib/secrets.sh"
 if [[ -r "$_openai_secrets" ]]; then
   source "$_openai_secrets"
@@ -223,6 +216,14 @@ else
   warn "secrets.sh not found at $_openai_secrets; OpenAI agents unavailable"
 fi
 unset _openai_secrets _reply
+
+# --- subcommand carve-out: web / attach pass through unmodified --------------
+
+case "${1:-}" in
+  web | attach)
+    exec "$REAL_OPENCODE" "$@"
+    ;;
+esac
 
 # --- conditional injection ---------------------------------------------------
 
