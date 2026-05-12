@@ -8,8 +8,9 @@
 #
 # Decision tree:
 #   no daemon on :$PORT     → background-spawn openweb, wait for listener,
-#                             exec openattach. (Race-safe: listener-identity
-#                             verified before we treat the port as "up".)
+#                             wait briefly for its sidecar, exec openattach.
+#                             (Race-safe: listener-identity verified before we
+#                             treat the port as "up".)
 #   fresh daemon on :$PORT  → exec openattach silently.
 #   stale daemon on :$PORT  → exec openattach and let openattach's prompt
 #                             handle it. (Don't duplicate prompt logic here.)
@@ -70,9 +71,9 @@ Options:
   -h, --help      Show this help.
 
 Default behavior: query the port; if no daemon, background-spawn `openweb`
-and wait for the listener to bind (≤5s, listener-identity verified). Then
-exec `openattach`. On stale daemon, openattach handles the prompt itself —
-this wrapper stays declarative.
+and wait for the listener to bind (≤5s, listener-identity verified), then
+wait briefly for its sidecar (≤2s) and exec `openattach`. On stale daemon,
+openattach handles the prompt itself — this wrapper stays declarative.
 
 Environment overrides:
   OPENCODE_WEB_PORT         Port to query/spawn on        (default: 4096)
@@ -187,10 +188,27 @@ else
   # the helper emits die_upstream with the offending pid+comm; on timeout it
   # returns non-zero and we surface a "daemon failed to bind" message with
   # the log path so the user can look.
-  if ! opencode_wait_for_opencode_listener "$PORT" 5 >/dev/null; then
+  LISTENER_PID_FILE="$LOG_DIR/opensession-listener-pid.$$"
+  if ! opencode_wait_for_opencode_listener "$PORT" 5 >"$LISTENER_PID_FILE"; then
+    rm -f "$LISTENER_PID_FILE"
     die_upstream "daemon failed to bind :$PORT within 5s; see $LOG"
   fi
+  LISTENER_PID="$(<"$LISTENER_PID_FILE")"
+  rm -f "$LISTENER_PID_FILE"
   info "daemon started on :$PORT; attaching…"
+
+  # openweb writes the config-hash sidecar after the listener binds. Wait
+  # briefly so openattach's staleness check doesn't observe the in-between
+  # state as a false missing-sidecar stale daemon warning.
+  SIDECAR="$(_opencode_sidecar_path "$PORT" "$LISTENER_PID")"
+  SIDECAR_WAIT_ATTEMPTS=20
+  while [[ ! -f "$SIDECAR" && "$SIDECAR_WAIT_ATTEMPTS" -gt 0 ]]; do
+    sleep 0.1
+    SIDECAR_WAIT_ATTEMPTS=$((SIDECAR_WAIT_ATTEMPTS - 1))
+  done
+  if [[ ! -f "$SIDECAR" ]]; then
+    warn "config-hash sidecar for daemon on :$PORT (pid $LISTENER_PID) did not appear within 2s; attaching anyway"
+  fi
 fi
 
 # --- attach ------------------------------------------------------------------

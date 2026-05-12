@@ -61,6 +61,46 @@ EOF
   chmod +x "$STUBDIR/opencode-attach.sh"
 }
 
+# openweb stub for the listener/sidecar race: the lsof stub reports the
+# listener as bound before this stub writes the sidecar, matching real openweb's
+# ordering. Tests pair it with write_sidecar_asserting_openattach_stub.
+write_delayed_sidecar_openweb_stub() {
+  cat >"$STUBDIR/opencode-web.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "openweb $*" >>"$STATEFILE"
+port="${OPENCODE_WEB_PORT:-4096}"
+pid="${DELAYED_SIDECAR_PID:-99999}"
+sidecar="$OPENCODE_DAEMON_STATE_DIR/daemon-config-hash-${port}-${pid}"
+sleep "${DELAYED_SIDECAR_SLEEP:-1}"
+mkdir -p "$(dirname "$sidecar")"
+printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" >"$sidecar"
+echo "sidecar-written $sidecar" >>"$STATEFILE"
+exit "${OPENWEB_EXIT:-0}"
+EOF
+  chmod +x "$STUBDIR/opencode-web.sh"
+}
+
+# openattach stub that makes the race observable through public behavior:
+# attaching before the sidecar exists exits non-zero; attaching after it exists
+# succeeds and logs the normal openattach invocation.
+write_sidecar_asserting_openattach_stub() {
+  cat >"$STUBDIR/opencode-attach.sh" <<'EOF'
+#!/usr/bin/env bash
+port="${OPENCODE_WEB_PORT:-4096}"
+pid="${DELAYED_SIDECAR_PID:-99999}"
+sidecar="$OPENCODE_DAEMON_STATE_DIR/daemon-config-hash-${port}-${pid}"
+if [[ ! -f "$sidecar" ]]; then
+  echo "openattach-sidecar missing" >>"$STATEFILE"
+  echo "sidecar missing before openattach: $sidecar" >&2
+  exit 42
+fi
+echo "openattach-sidecar present" >>"$STATEFILE"
+echo "openattach $*" >>"$STATEFILE"
+exit "${OPENATTACH_EXIT:-0}"
+EOF
+  chmod +x "$STUBDIR/opencode-attach.sh"
+}
+
 # lsof stub: 3-phase model lifted from tests/opencode-web.bats. opensession
 # uses lsof transitively via opencode_daemon_pid_for_port,
 # opencode_port_listener_pid, and opencode_wait_for_opencode_listener.
@@ -271,6 +311,23 @@ arm_spawn_timeout() {
   fi
   # The info banner mentions starting the daemon.
   assert_output --partial "starting one"
+}
+
+@test "opensession: no daemon → waits for sidecar before execing openattach" {
+  write_all_stubs
+  write_delayed_sidecar_openweb_stub
+  write_sidecar_asserting_openattach_stub
+  arm_spawn_succeeds
+
+  DELAYED_SIDECAR_SLEEP=1 run "$SCRIPT"
+
+  assert_success
+  grep -q "^sidecar-written " "$STATEFILE"
+  grep -q "^openattach-sidecar present$" "$STATEFILE"
+  if grep -q "^openattach-sidecar missing$" "$STATEFILE"; then
+    echo "openattach ran before the sidecar existed" >&2
+    return 1
+  fi
 }
 
 @test "opensession: fresh daemon → execs openattach silently (no spawn)" {
