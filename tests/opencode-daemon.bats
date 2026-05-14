@@ -360,7 +360,7 @@ set_lsof_port() {
   write_ps_stub
   set_lsof_port 4096 6666
   set_ps_comm 6666 "/usr/bin/nginx"
-  run bash -c "source '$LIB' && opencode_wait_for_opencode_listener 4096 1"
+  run bash -c "source '$LIB' && opencode_wait_for_opencode_listener 4096 5"
   # die_upstream exits 5
   assert_failure 5
   assert_output --partial "port :4096 taken by pid 6666"
