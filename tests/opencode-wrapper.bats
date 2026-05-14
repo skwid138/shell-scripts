@@ -28,15 +28,6 @@ setup() {
   # unless a test explicitly removes it.
   echo "stub wpromote context" >"$HOME/.config/opencode/instruction/wpromote-context.md"
 
-  # Stub secrets.sh so the OpenAI key loading block works in tests
-  mkdir -p "$HOME/code/scripts/shell/lib"
-  cat >"$HOME/code/scripts/shell/lib/secrets.sh" <<'SECRETS_EOF'
-secret_load() {
-  local varname="$1"
-  export "$varname"="sk-test-wrapper-key"
-  return 0
-}
-SECRETS_EOF
 }
 
 teardown() {
@@ -52,7 +43,11 @@ write_opencode_stub() {
 #!/usr/bin/env bash
 echo "argv $*" >>"$STATEFILE"
 echo "env OPENCODE_CONFIG_CONTENT=${OPENCODE_CONFIG_CONTENT-}" >>"$STATEFILE"
-echo "env OPENAI_API_KEY=${OPENAI_API_KEY-}" >>"$STATEFILE"
+if [[ ${OPENAI_API_KEY+x} == x ]]; then
+  echo "env OPENAI_API_KEY=$OPENAI_API_KEY" >>"$STATEFILE"
+else
+  echo "env OPENAI_API_KEY=<unset>" >>"$STATEFILE"
+fi
 exit 0
 EOF
   chmod +x "$STUBDIR/opencode"
@@ -186,22 +181,16 @@ EOF
   refute_output --partial "wpromote-context.md"
 }
 
-@test "wrapper: 'web' subcommand gets OPENAI_API_KEY before exec" {
+@test "wrapper: 'web' subcommand does not inherit parent OPENAI_API_KEY" {
   write_opencode_stub
   cd "$HOME"
+  export OPENAI_API_KEY=test-should-not-leak
   run "$SCRIPT" web --port 4096
   assert_success
   run cat "$STATEFILE"
-  assert_output --partial "env OPENAI_API_KEY=sk-test-wrapper-key"
-}
-
-@test "wrapper: 'attach' subcommand gets OPENAI_API_KEY before exec" {
-  write_opencode_stub
-  cd "$HOME"
-  run "$SCRIPT" attach http://127.0.0.1:4096
-  assert_success
-  run cat "$STATEFILE"
-  assert_output --partial "env OPENAI_API_KEY=sk-test-wrapper-key"
+  assert_output --partial "argv web --port 4096"
+  assert_output --partial "env OPENAI_API_KEY=<unset>"
+  refute_output --partial "test-should-not-leak"
 }
 
 # --- drift detection: missing instruction file ------------------------------
