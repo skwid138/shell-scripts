@@ -63,6 +63,10 @@ gh-watch-say() {
 # shellcheck disable=SC2139
 [[ ! -f "$HOME/code/scripts/agent/chrome_mcp.sh" ]] || alias chrome_mcp="$HOME/code/scripts/agent/chrome_mcp.sh"
 
+## OpenCode token totals
+# shellcheck disable=SC2139
+[[ ! -f "$HOME/code/scripts/agent/opencode-token-totals.sh" ]] || alias opentokens="$HOME/code/scripts/agent/opencode-token-totals.sh"
+
 ## ───────────────────────────────────────────────────────────────────
 ## Neovim
 ## ───────────────────────────────────────────────────────────────────
