@@ -36,7 +36,7 @@ $ ./gh-pr-checks-summary.sh --filter sonar
 {"version":1,"summary":{"passed":1,"failed":0,"running":0,...},"checks":[...]}
 
 $ ./jira-fetch-ticket.sh BIXB-18835
-{"version":1,"key":"BIXB-18835","summary":"...",...}
+{"version":1,"ticket_id":"BIXB-18835","plain_view":"...","description":"...",...}
 ```
 
 For pipelines, redirect stderr if you don't want the `info` decoration:
