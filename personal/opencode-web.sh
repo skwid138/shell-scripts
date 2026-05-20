@@ -218,7 +218,15 @@ fi
 # wrapper $$ ≠ daemon pid across 5 iterations.
 info "Press Ctrl+C to stop. (Daemon will reparent to launchd; close the terminal at will.)"
 
-caffeinate -is opencode web --port "$PORT" --hostname "$HOST" &
+# Suppress opencode's auto-browser-open by shadowing `open` in PATH.
+# The shim dir is intentionally NOT cleaned up — opencode resolves `open` lazily
+# (seconds after fork, once the listener binds), so the file must persist on disk.
+# It's one 27-byte file in $TMPDIR; cleaned on reboot.
+_OPEN_SHIM_DIR="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$_OPEN_SHIM_DIR/open"
+chmod +x "$_OPEN_SHIM_DIR/open"
+
+PATH="$_OPEN_SHIM_DIR:$PATH" caffeinate -is opencode web --port "$PORT" --hostname "$HOST" &
 CAFFEINATE_PID=$!
 # Do NOT `wait` on $CAFFEINATE_PID — once opencode reparents to launchd
 # caffeinate may exit on its own (its child is gone), and we'd block forever

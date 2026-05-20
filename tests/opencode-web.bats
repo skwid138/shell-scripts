@@ -58,6 +58,7 @@ echo "caffeinate $*" >>"$STATEFILE"
 # Also log relevant exported env vars so tests can assert they were set.
 echo "env OPENCODE_SERVER_USERNAME=${OPENCODE_SERVER_USERNAME-}" >>"$STATEFILE"
 echo "env OPENCODE_SERVER_PASSWORD_LEN=${#OPENCODE_SERVER_PASSWORD}" >>"$STATEFILE"
+echo "env PATH_HEAD=${PATH%%:*}" >>"$STATEFILE"
 # Stay alive past the wrapper's wait-for-listener window so the post-wait
 # `kill -0 $CAFFEINATE_PID` premature-exit diagnostic doesn't fire.
 sleep 2
@@ -658,4 +659,23 @@ write_all_stubs() {
   [[ ! -e "$OPENCODE_DAEMON_STATE_DIR/daemon-config-hash-4096-80006" ]]
   # New sidecar present.
   [[ -f "$OPENCODE_DAEMON_STATE_DIR/daemon-config-hash-4096-99999" ]]
+}
+
+@test "opencode-web: caffeinate child receives PATH with open-shim prepended" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  run "$SCRIPT"
+  assert_success
+  # The caffeinate stub logs PATH_HEAD=<first PATH component>.
+  # That component must be a temp dir containing an executable `open` shim.
+  run grep "^env PATH_HEAD=" "$STATEFILE"
+  assert_success
+  shim_dir="${output#env PATH_HEAD=}"
+  # The shim dir should exist and contain an executable `open`.
+  [[ -d "$shim_dir" ]]
+  [[ -x "$shim_dir/open" ]]
+  # Verify shim is actually a no-op (exits 0, does nothing).
+  run cat "$shim_dir/open"
+  assert_line --index 0 '#!/usr/bin/env bash'
+  assert_line --index 1 'exit 0'
 }
