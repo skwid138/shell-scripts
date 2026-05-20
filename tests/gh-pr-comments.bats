@@ -33,6 +33,59 @@ EOF
   chmod +x "$STUBDIR/gh"
 }
 
+write_gh_happy_path_stub() {
+  cat >"$STUBDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  auth)
+    exit 0
+    ;;
+  pr)
+    case "$2" in
+      view)
+        args=" $* "
+        if [[ "$args" == *" --jq "* ]]; then
+          cat <<'JSON'
+["src/foo.ts","src/bar.ts"]
+JSON
+        else
+          cat <<'JSON'
+{"number":123,"title":"Test PR","body":"Body","state":"OPEN","baseRefName":"main","headRefName":"feature/test","author":{"login":"alice"},"mergeable":"MERGEABLE","url":"https://github.com/wpromote/polaris-web/pull/123"}
+JSON
+        fi
+        ;;
+      *)
+        echo "stub gh: unhandled pr command: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  api)
+    args=" $* "
+    if [[ "$args" == *"reviewThreads"* ]]; then
+      cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"bob"},"body":"Please fix","path":"src/foo.ts","line":10,"originalLine":10,"createdAt":"2026-05-20T00:00:00Z","url":"https://example.test/thread","outdated":false}]}}]}}}}}
+JSON
+    elif [[ "$args" == *"reviews"* ]]; then
+      cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"carol"},"state":"COMMENTED","body":"Looks good","createdAt":"2026-05-20T00:00:00Z","url":"https://example.test/review"}]}}}}}
+JSON
+    else
+      echo "stub gh: unhandled graphql query: $*" >&2
+      exit 99
+    fi
+    ;;
+  *)
+    echo "stub gh: unhandled: $*" >&2
+    exit 99
+    ;;
+esac
+EOF
+  chmod +x "$STUBDIR/gh"
+}
+
+get_json() { printf '%s\n' "$output" | awk '/^\{/,/^\}$/'; }
+
 # --- --help -------------------------------------------------------------------
 
 @test "gh-pr-comments: --help exits 0 and prints usage" {
@@ -83,6 +136,30 @@ EOF
   assert_failure
   assert_output --partial "Could not access PR #123"
   assert_output --partial "wpromote/polaris-api"
+}
+
+@test "gh-pr-comments: happy path output has version, counts, and expected arrays" {
+  write_gh_happy_path_stub
+  run "$SCRIPT" --owner wpromote --repo polaris-web --pr 123 --no-diff --no-commits
+  assert_success
+  get_json | jq -e '
+    .version == 1 and
+    .metadata.number == 123 and
+    .metadata.title == "Test PR" and
+    (.reviews | type == "array") and
+    (.threads | type == "array") and
+    (.files | type == "array") and
+    (.commits | type == "array") and
+    .diff == "" and
+    .counts.reviews == (.reviews | length) and
+    .counts.threads == (.threads | length) and
+    .counts.files == (.files | length) and
+    .counts.commits == (.commits | length) and
+    .counts.reviews == 1 and
+    .counts.threads == 1 and
+    .counts.files == 2 and
+    .counts.commits == 0
+  ' >/dev/null
 }
 
 # --- gh auth gating -----------------------------------------------------------

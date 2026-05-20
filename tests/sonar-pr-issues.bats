@@ -113,7 +113,8 @@ EOF
   )
   cd "$tmpdir"
   run "$SCRIPT" 1
-  cd /; rm -rf "$tmpdir"
+  cd /
+  rm -rf "$tmpdir"
   assert_success
   get_json | jq -e '.project == "wpromote_client-portal"' >/dev/null
 }
@@ -125,7 +126,8 @@ EOF
   (cd "$tmpdir" && git init -q && git remote add origin "git@github.com:wpromote/polaris-api.git")
   cd "$tmpdir"
   run "$SCRIPT" 1
-  cd /; rm -rf "$tmpdir"
+  cd /
+  rm -rf "$tmpdir"
   assert_success
   get_json | jq -e '.project == "wpromote_polaris-api"' >/dev/null
 }
@@ -137,7 +139,8 @@ EOF
   (cd "$tmpdir" && git init -q && git remote add origin "git@github.com:wpromote/polaris-web.git")
   cd "$tmpdir"
   run "$SCRIPT" 1
-  cd /; rm -rf "$tmpdir"
+  cd /
+  rm -rf "$tmpdir"
   assert_success
   get_json | jq -e '.project == "wpromote_polaris-web"' >/dev/null
 }
@@ -149,7 +152,8 @@ EOF
   (cd "$tmpdir" && git init -q && git remote add origin "git@github.com:wpromote/kraken.git")
   cd "$tmpdir"
   run "$SCRIPT" 1
-  cd /; rm -rf "$tmpdir"
+  cd /
+  rm -rf "$tmpdir"
   assert_success
   get_json | jq -e '.project == "wpromote_kraken"' >/dev/null
 }
@@ -161,7 +165,8 @@ EOF
   (cd "$tmpdir" && git init -q && git remote add origin "git@github.com:wpromote/unsupported-repo.git")
   cd "$tmpdir"
   run "$SCRIPT" 1
-  cd /; rm -rf "$tmpdir"
+  cd /
+  rm -rf "$tmpdir"
   assert_failure
   assert_output --partial "has no SonarCloud project"
   assert_output --partial "client-portal"
@@ -194,7 +199,14 @@ EOF
   run "$SCRIPT" --project wpromote_polaris-web 1
   assert_success
   # Stub returns 4 issues; 1 is CLOSED so 3 should remain.
-  get_json | jq -e '.total == 3' >/dev/null
+  get_json | jq -e '
+    .counts.total == 3 and
+    .counts.blocker == 1 and
+    .counts.critical == 0 and
+    .counts.major == 1 and
+    .counts.minor == 0 and
+    .counts.info == 1
+  ' >/dev/null
 }
 
 @test "sonar-pr-issues: --severity MAJOR keeps only BLOCKER+CRITICAL+MAJOR" {
@@ -203,7 +215,7 @@ EOF
   run "$SCRIPT" --project wpromote_polaris-web --severity MAJOR 1
   assert_success
   # Stub OPEN issues: BLOCKER, MAJOR, INFO -> filter keeps BLOCKER+MAJOR = 2.
-  get_json | jq -e '.total == 2' >/dev/null
+  get_json | jq -e '.counts.total == 2' >/dev/null
   # And no INFO should remain.
   get_json | jq -e '[.issues[].severity] | (index("INFO") // null) == null' >/dev/null
 }
@@ -213,7 +225,7 @@ EOF
   write_gh_stub_nochecks
   run "$SCRIPT" --project wpromote_polaris-web --severity BLOCKER 1
   assert_success
-  get_json | jq -e '.total == 1 and .issues[0].severity == "BLOCKER"' >/dev/null
+  get_json | jq -e '.counts.total == 1 and .issues[0].severity == "BLOCKER"' >/dev/null
 }
 
 @test "sonar-pr-issues: --severity is case-insensitive (lowercase accepted)" {
@@ -221,7 +233,7 @@ EOF
   write_gh_stub_nochecks
   run "$SCRIPT" --project wpromote_polaris-web --severity blocker 1
   assert_success
-  get_json | jq -e '.total == 1' >/dev/null
+  get_json | jq -e '.counts.total == 1' >/dev/null
 }
 
 # --- component-path stripping -------------------------------------------------
@@ -244,8 +256,12 @@ EOF
   run "$SCRIPT" --project wpromote_polaris-web 1
   assert_success
   get_json | jq -e '
+    has("version") and .version == 1 and
+    has("counts") and (.counts | type == "object") and
+    (has("total") | not) and
     has("project") and has("pr") and has("ci_status") and
-    has("total") and has("issues") and
+    has("issues") and
+    (.counts.total == (.issues | length)) and
     (.issues | type == "array")
   ' >/dev/null
 }

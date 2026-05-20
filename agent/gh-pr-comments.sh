@@ -22,7 +22,7 @@ Options:
   -h, --help          Show this help
 
 Output:
-  JSON object with keys: metadata, reviews, threads, files, commits, diff
+  JSON object with keys: version, counts, metadata, reviews, threads, files, commits, diff
 
 Examples:
   gh-pr-comments                     # current branch PR
@@ -216,6 +216,13 @@ jq -n \
   --argjson commits "$commits" \
   --rawfile diff "$diff_file" \
   '{
+    version: 1,
+    counts: {
+      reviews: ($reviews | length),
+      threads: ($threads | length),
+      files: ($files | length),
+      commits: ($commits | length)
+    },
     metadata: $metadata,
     reviews: $reviews,
     threads: $threads,

@@ -19,7 +19,7 @@ Options:
   -h, --help          Show this help
 
 Output:
-  JSON object with keys: ticket_id, plain_view, description, fields
+  JSON object with keys: version, ticket_id, plain_view, description, fields
   With --comments:    adds .comments    (Atlassian envelope: {comments[], isLast, maxResults, startAt, total})
   With --links:       adds .links       (Atlassian envelope; shape varies by Jira instance)
   With --attachments: adds .attachments (Atlassian envelope; shape varies by Jira instance)
@@ -146,6 +146,7 @@ jq -n \
   --argjson links "$links" \
   --argjson attachments "$attachments" \
   '{
+    version: 1,
     ticket_id: $ticket_id,
     plain_view: $plain_view,
     description: $description,

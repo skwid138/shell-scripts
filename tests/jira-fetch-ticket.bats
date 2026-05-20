@@ -134,6 +134,7 @@ get_json() {
   run "$SCRIPT" BIXB-1
   assert_success
   get_json | jq -e '
+    .version == 1 and
     .ticket_id == "BIXB-1" and
     (.plain_view | type) == "string" and
     (.description | type) == "string" and

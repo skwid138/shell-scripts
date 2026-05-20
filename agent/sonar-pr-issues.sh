@@ -182,10 +182,18 @@ else
     --arg ci_status "$ci_status" \
     --argjson issues "$all_issues" \
     '{
+      version: 1,
+      counts: {
+        total: ($issues | length),
+        blocker: ([$issues[] | select(.severity == "BLOCKER")] | length),
+        critical: ([$issues[] | select(.severity == "CRITICAL")] | length),
+        major: ([$issues[] | select(.severity == "MAJOR")] | length),
+        minor: ([$issues[] | select(.severity == "MINOR")] | length),
+        info: ([$issues[] | select(.severity == "INFO")] | length)
+      },
       project: $project,
       pr: $pr,
       ci_status: $ci_status,
-      total: ($issues | length),
       issues: $issues
     }'
 fi

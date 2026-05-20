@@ -42,7 +42,7 @@ $ ./jira-fetch-ticket.sh BIXB-18835
 For pipelines, redirect stderr if you don't want the `info` decoration:
 
 ```bash
-$ ./sonar-pr-issues.sh 275 2>/dev/null | jq '.summary'
+$ ./sonar-pr-issues.sh 275 2>/dev/null | jq '.counts.total'
 ```
 
 ## Stable contract
