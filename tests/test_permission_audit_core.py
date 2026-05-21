@@ -37,6 +37,28 @@ class PermissionAuditParsingTest(unittest.TestCase):
         self.assertEqual(event.matched_rule, "~/code/scripts/agent/*")
         self.assertEqual(event.action, "ask")
 
+    def test_parse_permission_line_documents_action_json_delimiter_limitation(self) -> None:
+        # Known limitation: the log format does not quote or length-prefix the
+        # pattern field. If the command text itself contains the delimiter shape
+        # ` action={...} evaluated`, PERM_RE treats that embedded JSON as the
+        # permission action payload. This documents current behavior; do not
+        # change the regex as part of this edge-case characterization.
+        line = (
+            'INFO 2026-05-21T10:00:06 +1ms service=permission permission=bash '
+            'pattern=printf " action={"foo":"bar"} evaluated " '
+            'action={"permission":"bash","pattern":"~/code/scripts/agent/*","action":"ask"} evaluated'
+        )
+
+        event = core.parse_permission_line(line, source="fixture.log", sequence=8)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.timestamp, "2026-05-21T10:00:06")
+        self.assertEqual(event.permission, "bash")
+        self.assertEqual(event.pattern, 'printf "')
+        self.assertIsNone(event.matched_rule)
+        self.assertIsNone(event.action)
+
     def test_parse_all_correlation_regex_line_types(self) -> None:
         direct = core.parse_session_agent_line(
             "INFO 2026-05-21T10:00:00 +1ms service=session id=ses_direct title=Main agent=gandalf created",
@@ -95,6 +117,41 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
         self.assertEqual(by_pattern["/tmp/before-prompt.txt"]["agents"], [None])
         self.assertEqual(by_pattern["/tmp/same-millisecond.txt"]["agents"], ["legolas"])
 
+    def test_large_scale_fixture_preserves_permission_agent_attribution(self) -> None:
+        fixture = FIXTURE_DIR / "2026-05-21T120000.log"
+        lines = fixture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum("service=session id=ses_scale_" in line for line in lines), 42)
+        self.assertEqual(sum("service=session.prompt session.id=ses_scale_" in line for line in lines), 42)
+
+        report = core.audit_logs(
+            FIXTURE_DIR,
+            start_date="2026-05-21",
+            end_date="2026-05-21",
+            action_filter="ask",
+        )
+
+        scale_entries = {
+            entry["pattern"]: entry
+            for entry in report["entries"]
+            if entry["pattern"].startswith("/tmp/scale-")
+            or entry["pattern"].startswith("~/code/scripts/agent/scale-")
+            or entry["pattern"].startswith("/Users/hunter/.config/opencode/scale-")
+            or entry["pattern"].startswith("printf scale-")
+        }
+        self.assertEqual(
+            {pattern: entry["agents"] for pattern, entry in scale_entries.items()},
+            {
+                "/tmp/scale-gandalf-01.txt": ["gandalf"],
+                "~/code/scripts/agent/scale-legolas.sh": ["legolas"],
+                "/Users/hunter/.config/opencode/scale-aragorn.json": ["aragorn"],
+                "/tmp/scale-saruman-review.txt": ["saruman"],
+                "printf scale-radagast": ["radagast"],
+            },
+        )
+        unique_agents = {agent for entry in scale_entries.values() for agent in entry["agents"]}
+        self.assertEqual(unique_agents, {"gandalf", "aragorn", "legolas", "saruman", "radagast"})
+        self.assertEqual(len(unique_agents), 5)
+
     def test_aggregation_counts_unique_agents_and_sessions(self) -> None:
         report = core.audit_logs(
             FIXTURE_DIR,
@@ -140,7 +197,7 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
             FIXTURE_DIR,
             start_date="2026-05-21",
             end_date="2026-05-21",
-            action_filter="all",
+            action_filter="deny",
             agent_filter="ARAGORN",
         )
 
