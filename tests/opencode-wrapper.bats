@@ -18,15 +18,21 @@ setup() {
   # finds our fake opencode and not /opt/homebrew/bin/opencode.
   export PATH="$STUBDIR:/usr/bin:/bin"
   export STATEFILE
+  # Default Keychain value for wrapper invocations. Individual tests unset
+  # KEYCHAIN_VALUE to exercise the missing-secret path.
+  export KEYCHAIN_VALUE="default-api-key"
   # Force HOME to a sandbox so we can simulate $HOME/code/wpromote/* and
   # $HOME/.config/opencode/instruction/wpromote-context.md without
   # touching the real ones.
   HOMESANDBOX="$(mktemp -d)"
   export HOME="$HOMESANDBOX"
   mkdir -p "$HOME/.config/opencode/instruction"
+  export OPENCODE_KEYCHAIN_LIB="$BATS_TEST_DIRNAME/../lib/keychain.sh"
   # Default: instruction file present so the warn-branch isn't hit
   # unless a test explicitly removes it.
   echo "stub wpromote context" >"$HOME/.config/opencode/instruction/wpromote-context.md"
+
+  write_security_stub
 
 }
 
@@ -43,6 +49,7 @@ write_opencode_stub() {
 #!/usr/bin/env bash
 echo "argv $*" >>"$STATEFILE"
 echo "env OPENCODE_CONFIG_CONTENT=${OPENCODE_CONFIG_CONTENT-}" >>"$STATEFILE"
+echo "env OPENCODE_API_KEY_LEN=${#OPENCODE_API_KEY}" >>"$STATEFILE"
 if [[ ${OPENAI_API_KEY+x} == x ]]; then
   echo "env OPENAI_API_KEY=$OPENAI_API_KEY" >>"$STATEFILE"
 else
@@ -51,6 +58,22 @@ fi
 exit 0
 EOF
   chmod +x "$STUBDIR/opencode"
+}
+
+# Stub `security find-generic-password -s NAME -a ACCT -w` — returns the
+# value held in $KEYCHAIN_VALUE, or fails (rc=44, matching real `security`'s
+# "item not found") if KEYCHAIN_VALUE is unset.
+write_security_stub() {
+  cat >"$STUBDIR/security" <<'EOF'
+#!/usr/bin/env bash
+echo "security $*" >>"$STATEFILE"
+if [[ "${KEYCHAIN_VALUE+set}" != "set" ]]; then
+  echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2
+  exit 44
+fi
+printf '%s' "$KEYCHAIN_VALUE"
+EOF
+  chmod +x "$STUBDIR/security"
 }
 
 # --- help / arg parsing -----------------------------------------------------
@@ -97,6 +120,26 @@ EOF
   assert_output --partial "argv run --some-flag"
   assert_output --partial "env OPENCODE_CONFIG_CONTENT="
   refute_output --partial "wpromote-context.md"
+}
+
+@test "wrapper: exports OPENCODE_API_KEY for the child process" {
+  write_opencode_stub
+  export KEYCHAIN_VALUE="0123456789"
+  cd "$HOME"
+  run "$SCRIPT" run
+  assert_success
+  run cat "$STATEFILE"
+  assert_output --partial "env OPENCODE_API_KEY_LEN=10"
+}
+
+@test "wrapper: missing opencode API key exits 1 with hint" {
+  write_opencode_stub
+  unset KEYCHAIN_VALUE
+  cd "$HOME"
+  run "$SCRIPT" run
+  assert_failure 1
+  assert_output --partial "Secret not found"
+  assert_output --partial "opencode-api-key"
 }
 
 # --- happy path: under wpromote ---------------------------------------------
