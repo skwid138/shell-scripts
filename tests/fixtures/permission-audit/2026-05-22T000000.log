@@ -1,0 +1,3 @@
+INFO 2026-05-22T00:00:00 +1ms service=session id=ses_next title=Next agent=gandalf created
+INFO 2026-05-22T00:00:01 +1ms service=session.prompt session.id=ses_next step=1 loop
+INFO 2026-05-22T00:00:02 +1ms service=permission permission=read pattern=/tmp/next-day.txt action={"permission":"read","pattern":"*","action":"ask"} evaluated
