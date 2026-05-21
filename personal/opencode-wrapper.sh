@@ -68,9 +68,20 @@ else
   # ~/.config/opencode/bin/install-wrapper.sh.
   info() { [[ "${OPENCODE_WRAPPER_VERBOSE:-0}" == "1" ]] && printf '[wrapper] %s\n' "$*" >&2; }
   warn() { printf '[wrapper:warn] %s\n' "$*" >&2; }
+  die() {
+    printf '[wrapper:fatal] %s\n' "$*" >&2
+    exit 1
+  }
   die_missing_dep() {
     printf '[wrapper:fatal] missing dependency: %s\n' "$*" >&2
     exit 3
+  }
+fi
+
+if ! declare -F die >/dev/null 2>&1; then
+  die() {
+    printf '[wrapper:fatal] %s\n' "$*" >&2
+    exit 1
   }
 fi
 
@@ -192,6 +203,22 @@ REAL_OPENCODE="$(find_real_opencode)" || die_missing_dep \
 # opencode now authenticates OpenAI through OAuth. Avoid leaking a legacy
 # parent-shell API key into the real opencode process.
 unset OPENAI_API_KEY
+
+# keychain.sh expects common.sh-style helpers to be loaded already. Preserve
+# OPENCODE_COMMON_LIB overrides / fallback stubs by marking the common helper
+# contract loaded before sourcing the keychain helper.
+_LIB_COMMON_LOADED="${_LIB_COMMON_LOADED:-1}"
+KEYCHAIN_LIB="${OPENCODE_KEYCHAIN_LIB:-$HOME/code/scripts/lib/keychain.sh}"
+if [[ -r "$KEYCHAIN_LIB" ]]; then
+  # shellcheck source=../lib/keychain.sh
+  source "$KEYCHAIN_LIB"
+else
+  die_missing_dep "keychain helper not found at $KEYCHAIN_LIB"
+fi
+
+# Load OpenCode Go (Zen) API key from Keychain
+OPENCODE_API_KEY="$(keychain_get 'opencode-api-key')" || exit $?
+export OPENCODE_API_KEY
 
 # --- subcommand carve-out: web / attach pass through unmodified --------------
 
