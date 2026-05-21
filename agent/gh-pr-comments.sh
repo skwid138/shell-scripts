@@ -129,7 +129,7 @@ _fetch_reviews() {
         }
       }' \
       -f owner="$OWNER" -f repo="$REPO" -F number="$PR_NUMBER" \
-      "${cursor_arg[@]}" 2>&1)" || die "GraphQL reviews query failed: $result"
+      ${cursor_arg[@]+"${cursor_arg[@]}"} 2>&1)" || die "GraphQL reviews query failed: $result"
 
     local nodes
     nodes="$(echo "$result" | jq '.data.repository.pullRequest.reviews.nodes // []')"
@@ -168,7 +168,7 @@ _fetch_threads() {
         }
       }' \
       -f owner="$OWNER" -f repo="$REPO" -F number="$PR_NUMBER" \
-      "${cursor_arg[@]}" 2>&1)" || die "GraphQL threads query failed: $result"
+      ${cursor_arg[@]+"${cursor_arg[@]}"} 2>&1)" || die "GraphQL threads query failed: $result"
 
     local nodes
     nodes="$(echo "$result" | jq '.data.repository.pullRequest.reviewThreads.nodes // []')"
