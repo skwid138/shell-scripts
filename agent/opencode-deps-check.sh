@@ -3,8 +3,8 @@
 #
 # Surfaces checked:
 #   - ~/.config/opencode/package.json dependencies
-#   - ~/.config/opencode/opencode.json `plugin: [...]` entries
-#   - ~/.config/opencode/opencode.json `mcp.<name>.command` arrays (npm packages)
+#   - ~/.config/opencode/opencode.json(c) `plugin: [...]` entries
+#   - ~/.config/opencode/opencode.json(c) `mcp.<name>.command` arrays (npm packages)
 #
 # Default output: human-readable table. Use --json for machine output.
 
@@ -96,8 +96,8 @@ Check OpenCode config for outdated and unpinned dependencies.
 
 Surfaces:
   - package.json dependencies
-  - opencode.json `plugin` array entries (e.g. "name@version")
-  - opencode.json MCP `command` arrays referencing npm packages
+  - opencode.json(c) `plugin` array entries (e.g. "name@version")
+  - opencode.json(c) MCP `command` arrays referencing npm packages
     (e.g. "npx -y pkg@version")
 
 Options:
@@ -190,11 +190,17 @@ require_cmd "perl" "perl ships with macOS — if missing, install via brew"
   die "OpenCode config dir not found: $OPENCODE_CONFIG_DIR"
 
 PKG_JSON="$OPENCODE_CONFIG_DIR/package.json"
-OC_JSON="$OPENCODE_CONFIG_DIR/opencode.json"
+# Support both opencode.json and opencode.jsonc
+if [[ -f "$OPENCODE_CONFIG_DIR/opencode.jsonc" ]]; then
+  OC_JSON="$OPENCODE_CONFIG_DIR/opencode.jsonc"
+else
+  OC_JSON="$OPENCODE_CONFIG_DIR/opencode.json"
+fi
+OC_BASENAME="$(basename "$OC_JSON")"
 
 # At least one source must exist; otherwise nothing to do.
 if [[ ! -f "$PKG_JSON" && ! -f "$OC_JSON" ]]; then
-  die "Neither package.json nor opencode.json found under $OPENCODE_CONFIG_DIR"
+  die "Neither package.json nor opencode.json(c) found under $OPENCODE_CONFIG_DIR"
 fi
 
 # Validate package.json JSON early
@@ -203,14 +209,14 @@ if [[ -f "$PKG_JSON" ]]; then
     die "package.json is not valid JSON: $PKG_JSON"
 fi
 
-# Validate opencode.json JSONC (after stripping comments)
+# Validate opencode.json(c) JSONC (after stripping comments)
 oc_clean=""
 if [[ -f "$OC_JSON" ]]; then
   if ! oc_clean="$(strip_jsonc "$OC_JSON")"; then
-    die "Failed to strip comments from opencode.json: $OC_JSON"
+    die "Failed to strip comments from $OC_BASENAME: $OC_JSON"
   fi
   if ! echo "$oc_clean" | jq empty 2>/dev/null; then
-    die "opencode.json is not valid JSON (after JSONC strip): $OC_JSON"
+    die "$OC_BASENAME is not valid JSON (after JSONC strip): $OC_JSON"
   fi
 fi
 
@@ -242,7 +248,7 @@ if [[ -f "$PKG_JSON" ]]; then
   done < <(jq -r '.dependencies // {} | to_entries[] | "\(.key)\t\(.value)"' "$PKG_JSON")
 fi
 
-# 2 & 3. opencode.json
+# 2 & 3. opencode.json(c)
 if [[ -n "$oc_clean" ]]; then
   # plugin array
   while IFS= read -r ref; do
@@ -250,7 +256,7 @@ if [[ -n "$oc_clean" ]]; then
     parsed="$(parse_pkg_ref "$ref")"
     name="$(echo "$parsed" | sed -n '1p')"
     version="$(echo "$parsed" | sed -n '2p')"
-    entries+="${name}"$'\t'"${version}"$'\t'"opencode.json:plugin"$'\n'
+    entries+="${name}"$'\t'"${version}"$'\t'"$OC_BASENAME:plugin"$'\n'
   done < <(echo "$oc_clean" | jq -r '.plugin // [] | .[] | if type=="string" then . else .[0] end')
 
   # MCP commands
@@ -260,7 +266,7 @@ if [[ -n "$oc_clean" ]]; then
     name="$(echo "$parsed" | sed -n '1p')"
     version="$(echo "$parsed" | sed -n '2p')"
     [[ -z "$name" ]] && continue
-    entries+="${name}"$'\t'"${version}"$'\t'"opencode.json:mcp.${mcp_name}.command"$'\n'
+    entries+="${name}"$'\t'"${version}"$'\t'"$OC_BASENAME:mcp.${mcp_name}.command"$'\n'
   done < <(echo "$oc_clean" | jq -r '.mcp // {} | to_entries[] | .key as $k | (.value.command // [])[] | "\($k)\t\(.)"')
 fi
 

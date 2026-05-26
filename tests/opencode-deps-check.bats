@@ -226,10 +226,10 @@ EOF
   assert_output --partial "config dir not found"
 }
 
-@test "script: empty config dir (no package.json or opencode.json) exits 1" {
+@test "script: empty config dir (no package.json or opencode.json(c)) exits 1" {
   run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --config-dir "$TMP_CFG"
   assert_failure
-  assert_output --partial "Neither package.json nor opencode.json found"
+  assert_output --partial "Neither package.json nor opencode.json(c) found"
 }
 
 @test "script: invalid package.json JSON exits 1" {
@@ -280,6 +280,44 @@ EOF
   assert_output --partial "another-fake-pkg"
   # Must report outdated (current 1.0.0 vs stub latest 9.9.9)
   assert_output --partial '"outdated": true'
+}
+
+@test "script: --json supports opencode.jsonc config filename" {
+  # Minimal opencode.jsonc with a JSONC comment
+  cat >"$TMP_CFG/opencode.jsonc" <<'EOF'
+{
+  // JSONC comments should be accepted
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["jsonc-fake-pkg@3.0.0"],
+  "mcp": {
+    "fixture": {
+      "type": "local",
+      "command": ["npx", "-y", "jsonc-mcp-fake-pkg@4.0.0"]
+    }
+  }
+}
+EOF
+  # Stub npm: prepend a tmpdir with a fake `npm` to PATH
+  mkdir -p "$TMP_CFG/bin"
+  cat >"$TMP_CFG/bin/npm" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "view" ]]; then
+  case "$2" in
+    jsonc-fake-pkg) echo "3.0.0" ;;
+    jsonc-mcp-fake-pkg) echo "4.0.0" ;;
+    *) exit 1 ;;
+  esac
+else
+  exit 1
+fi
+EOF
+  chmod +x "$TMP_CFG/bin/npm"
+
+  PATH="$TMP_CFG/bin:$PATH" run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --config-dir "$TMP_CFG" --json
+  assert_success
+  echo "$output" | jq empty
+  echo "$output" | jq -e '.deps[] | select(.package == "jsonc-fake-pkg" and .location == "opencode.jsonc:plugin")' >/dev/null
+  echo "$output" | jq -e '.deps[] | select(.package == "jsonc-mcp-fake-pkg" and .location == "opencode.jsonc:mcp.fixture.command")' >/dev/null
 }
 
 @test "script: human format default (no --json) produces table" {
