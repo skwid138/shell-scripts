@@ -22,6 +22,9 @@
 #                   info line because this disconnects any other clients.
 #   -f, --force     Pass-through to `openattach --force` (bypass staleness
 #                   check). Equivalent to OPENCODE_ATTACH_FORCE=1.
+#   -d, --debug     Restart the daemon with --log-level DEBUG. Implies --restart
+#                   because log level is baked in at daemon launch. Sets
+#                   OPENCODE_WEB_LOG_LEVEL=DEBUG for opencode-web.sh to consume.
 #   -h, --help      Show this help.
 #
 # Process model: the daemon self-daemonizes (PPID=1, owned by launchd). This
@@ -38,6 +41,7 @@
 #   OPENCODE_WEB_PORT         Port to query/spawn on        (default: 4096)
 #   OPENCODE_WEB_HOSTNAME     Hostname (passed to openweb)  (default: 127.0.0.1)
 #   OPENCODE_ATTACH_FORCE     Set to 1 to bypass staleness  (same as --force)
+#   OPENCODE_WEB_LOG_LEVEL    opencode log-level passthrough (DEBUG|INFO|WARN|ERROR)
 #
 # Exit codes follow lib/common.sh:
 #   0  success (clean exec into opencode attach, or deliberate openattach abort)
@@ -68,6 +72,9 @@ Options:
                   config files when you want a clean refresh.
   -f, --force     Pass through to `openattach --force` — bypass the
                   staleness check. Equivalent to setting OPENCODE_ATTACH_FORCE=1.
+  -d, --debug     Restart the daemon with opencode --log-level DEBUG. Implies
+                  --restart (log level is baked in at daemon launch). Use when
+                  diagnosing plugin debug events (e.g. council-plugin lifecycle).
   -h, --help      Show this help.
 
 Default behavior: query the port; if no daemon, background-spawn `openweb`
@@ -79,6 +86,7 @@ Environment overrides:
   OPENCODE_WEB_PORT         Port to query/spawn on        (default: 4096)
   OPENCODE_WEB_HOSTNAME     Hostname (passed to openweb)  (default: 127.0.0.1)
   OPENCODE_ATTACH_FORCE     Set to 1 to bypass staleness  (same as --force)
+  OPENCODE_WEB_LOG_LEVEL    opencode log-level passthrough (DEBUG|INFO|WARN|ERROR)
 
 See: ~/.config/opencode/README.md → "OpenCode daemon and the wrapper trio"
 EOF
@@ -87,6 +95,7 @@ EOF
 # --- arg parsing ---
 RESTART=0
 FORCE=0
+DEBUG=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
@@ -101,6 +110,10 @@ while [[ $# -gt 0 ]]; do
       FORCE=1
       shift
       ;;
+    -d | --debug)
+      DEBUG=1
+      shift
+      ;;
     *)
       die_usage "unknown flag: $1"
       ;;
@@ -108,6 +121,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 PORT="${OPENCODE_WEB_PORT:-4096}"
+
+# --debug implies --restart because opencode's log level is baked in at daemon
+# launch — there's no way to flip it on a running daemon. Export the env var
+# that opencode-web.sh consumes to add `--log-level DEBUG` to the opencode
+# invocation. The env var is unset before exec'ing into openattach so it does
+# not leak into the attached TUI's process tree.
+if [[ "$DEBUG" == "1" ]]; then
+  export OPENCODE_WEB_LOG_LEVEL=DEBUG
+  RESTART=1
+  info "--debug: forcing --restart so daemon starts with --log-level DEBUG"
+fi
 
 # --- locate sibling wrappers -------------------------------------------------
 # Use absolute paths so opensession works regardless of $PATH (matters because
@@ -141,6 +165,7 @@ if [[ "$RESTART" == "1" ]]; then
   "$OPENWEB" --restart || die_upstream "openweb --restart failed (exit $?)"
   # openweb exits only after the listener is bound + sidecar written, so
   # we can attach immediately. No additional wait needed here.
+  unset OPENCODE_WEB_LOG_LEVEL
   exec "$OPENATTACH" ${ATTACH_ARGS[@]+"${ATTACH_ARGS[@]}"}
 fi
 
@@ -215,4 +240,5 @@ fi
 # Single `exec` site for both fresh-daemon and just-spawned-daemon paths.
 # `exec` replaces this wrapper with the openattach process so the user's TUI
 # gets the terminal cleanly; opensession does not linger in the process tree.
+unset OPENCODE_WEB_LOG_LEVEL
 exec "$OPENATTACH" ${ATTACH_ARGS[@]+"${ATTACH_ARGS[@]}"}

@@ -61,6 +61,25 @@ EOF
   chmod +x "$STUBDIR/opencode-attach.sh"
 }
 
+# Stubs that ALSO log OPENCODE_WEB_LOG_LEVEL so tests can assert env passthrough
+# (or absence of leak into openattach).
+write_log_level_logging_stubs() {
+  cat >"$STUBDIR/opencode-web.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "openweb $*" >>"$STATEFILE"
+echo "openweb-env OPENCODE_WEB_LOG_LEVEL=${OPENCODE_WEB_LOG_LEVEL-<unset>}" >>"$STATEFILE"
+exit "${OPENWEB_EXIT:-0}"
+EOF
+  chmod +x "$STUBDIR/opencode-web.sh"
+  cat >"$STUBDIR/opencode-attach.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "openattach $*" >>"$STATEFILE"
+echo "openattach-env OPENCODE_WEB_LOG_LEVEL=${OPENCODE_WEB_LOG_LEVEL-<unset>}" >>"$STATEFILE"
+exit "${OPENATTACH_EXIT:-0}"
+EOF
+  chmod +x "$STUBDIR/opencode-attach.sh"
+}
+
 # openweb stub for the listener/sidecar race: the lsof stub reports the
 # listener as bound before this stub writes the sidecar, matching real openweb's
 # ordering. Tests pair it with write_sidecar_asserting_openattach_stub.
@@ -462,6 +481,89 @@ arm_spawn_timeout() {
   assert_success
   grep -qE "^openweb --restart\$" "$STATEFILE"
   grep -qE "^openattach --force\$" "$STATEFILE"
+}
+
+# --- --debug flag -----------------------------------------------------------
+
+@test "opensession: --help mentions --debug" {
+  run "$SCRIPT" --help
+  assert_success
+  assert_output --partial "--debug"
+  assert_output --partial "DEBUG"
+}
+
+@test "opensession: --debug implies --restart and exports OPENCODE_WEB_LOG_LEVEL=DEBUG to openweb" {
+  write_lsof_stub
+  write_ps_stub
+  write_pgrep_stub
+  write_log_level_logging_stubs
+  run "$SCRIPT" --debug
+  assert_success
+  grep -qE "^openweb --restart\$" "$STATEFILE"
+  grep -qE "^openweb-env OPENCODE_WEB_LOG_LEVEL=DEBUG\$" "$STATEFILE"
+  grep -qE "^openattach\b" "$STATEFILE"
+  assert_output --partial "forcing --restart"
+}
+
+@test "opensession: -d is alias for --debug" {
+  write_lsof_stub
+  write_ps_stub
+  write_pgrep_stub
+  write_log_level_logging_stubs
+  run "$SCRIPT" -d
+  assert_success
+  grep -qE "^openweb --restart\$" "$STATEFILE"
+  grep -qE "^openweb-env OPENCODE_WEB_LOG_LEVEL=DEBUG\$" "$STATEFILE"
+}
+
+@test "opensession: --debug does not leak OPENCODE_WEB_LOG_LEVEL into openattach" {
+  write_lsof_stub
+  write_ps_stub
+  write_pgrep_stub
+  write_log_level_logging_stubs
+  run "$SCRIPT" --debug
+  assert_success
+  # openweb sees the env var; openattach must NOT (unset before exec).
+  grep -qE "^openweb-env OPENCODE_WEB_LOG_LEVEL=DEBUG\$" "$STATEFILE"
+  grep -qE "^openattach-env OPENCODE_WEB_LOG_LEVEL=<unset>\$" "$STATEFILE"
+}
+
+@test "opensession: --debug + --force passes --force to openattach and still restarts" {
+  write_lsof_stub
+  write_ps_stub
+  write_pgrep_stub
+  write_log_level_logging_stubs
+  run "$SCRIPT" --debug --force
+  assert_success
+  grep -qE "^openweb --restart\$" "$STATEFILE"
+  grep -qE "^openattach --force\$" "$STATEFILE"
+  grep -qE "^openattach-env OPENCODE_WEB_LOG_LEVEL=<unset>\$" "$STATEFILE"
+}
+
+@test "opensession: --debug with openweb --restart failure → exit 5, no openattach" {
+  write_lsof_stub
+  write_ps_stub
+  write_pgrep_stub
+  write_log_level_logging_stubs
+  OPENWEB_EXIT=5 run "$SCRIPT" --debug
+  assert_failure 5
+  assert_output --partial "openweb --restart failed"
+  if grep -q "^openattach" "$STATEFILE"; then
+    echo "unexpected openattach exec after openweb --restart failure" >&2
+    return 1
+  fi
+}
+
+# --- --debug under bash 3.2 -------------------------------------------------
+
+@test "opensession: --debug runs cleanly under /bin/bash (3.2)" {
+  write_lsof_stub
+  write_ps_stub
+  write_pgrep_stub
+  write_log_level_logging_stubs
+  run /bin/bash "$SCRIPT" --debug
+  assert_success
+  grep -qE "^openweb --restart\$" "$STATEFILE"
 }
 
 # --- bash 3.2 regression ----------------------------------------------------
