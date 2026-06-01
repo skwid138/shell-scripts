@@ -74,6 +74,7 @@ refuse with a distinct error that names the offending pid + comm.
 Environment overrides:
   OPENCODE_WEB_PORT         Port to listen on            (default: 4096)
   OPENCODE_WEB_HOSTNAME     Hostname to bind             (default: 127.0.0.1)
+  OPENCODE_WEB_LOG_LEVEL    opencode --log-level passthrough (DEBUG|INFO|WARN|ERROR)
   OPENCODE_SERVER_USERNAME  Basic Auth username          (default: opencode)
   OPENCODE_WEB_FORCE        Set to 1 to bypass the port-bound refusal.
 
@@ -226,7 +227,22 @@ _OPEN_SHIM_DIR="$(mktemp -d)"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$_OPEN_SHIM_DIR/open"
 chmod +x "$_OPEN_SHIM_DIR/open"
 
-PATH="$_OPEN_SHIM_DIR:$PATH" caffeinate -is opencode web --port "$PORT" --hostname "$HOST" &
+# Optional log-level passthrough. Set OPENCODE_WEB_LOG_LEVEL=DEBUG to capture
+# plugin debug events (e.g. council-plugin councillor lifecycle). Daemon must
+# be restarted (`opensession --restart`) for the flag to take effect.
+LOG_LEVEL_ARGS=()
+if [[ -n "${OPENCODE_WEB_LOG_LEVEL:-}" ]]; then
+  case "$OPENCODE_WEB_LOG_LEVEL" in
+    DEBUG | INFO | WARN | ERROR)
+      LOG_LEVEL_ARGS+=(--log-level "$OPENCODE_WEB_LOG_LEVEL")
+      ;;
+    *)
+      die_usage "OPENCODE_WEB_LOG_LEVEL must be DEBUG|INFO|WARN|ERROR (got: $OPENCODE_WEB_LOG_LEVEL)"
+      ;;
+  esac
+fi
+
+PATH="$_OPEN_SHIM_DIR:$PATH" caffeinate -is opencode web --port "$PORT" --hostname "$HOST" ${LOG_LEVEL_ARGS[@]+"${LOG_LEVEL_ARGS[@]}"} &
 CAFFEINATE_PID=$!
 # Do NOT `wait` on $CAFFEINATE_PID — once opencode reparents to launchd
 # caffeinate may exit on its own (its child is gone), and we'd block forever

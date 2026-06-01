@@ -352,6 +352,58 @@ write_all_stubs() {
   assert_output --partial "--hostname 0.0.0.0"
 }
 
+# --- OPENCODE_WEB_LOG_LEVEL passthrough -------------------------------------
+
+@test "opencode-web: no OPENCODE_WEB_LOG_LEVEL → no --log-level in caffeinate call" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  unset OPENCODE_WEB_LOG_LEVEL
+  run "$SCRIPT"
+  assert_success
+  run cat "$STATEFILE"
+  refute_output --partial "--log-level"
+}
+
+@test "opencode-web: OPENCODE_WEB_LOG_LEVEL=DEBUG appends --log-level DEBUG" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  export OPENCODE_WEB_LOG_LEVEL=DEBUG
+  run "$SCRIPT"
+  assert_success
+  run cat "$STATEFILE"
+  assert_output --partial "--log-level DEBUG"
+}
+
+@test "opencode-web: OPENCODE_WEB_LOG_LEVEL=INFO appends --log-level INFO" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  export OPENCODE_WEB_LOG_LEVEL=INFO
+  run "$SCRIPT"
+  assert_success
+  run cat "$STATEFILE"
+  assert_output --partial "--log-level INFO"
+}
+
+@test "opencode-web: empty OPENCODE_WEB_LOG_LEVEL is treated as unset" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  export OPENCODE_WEB_LOG_LEVEL=""
+  run "$SCRIPT"
+  assert_success
+  run cat "$STATEFILE"
+  refute_output --partial "--log-level"
+}
+
+@test "opencode-web: invalid OPENCODE_WEB_LOG_LEVEL exits 2 with validation error" {
+  write_all_stubs
+  export KEYCHAIN_VALUE="x"
+  export OPENCODE_WEB_LOG_LEVEL=TRACE
+  run "$SCRIPT"
+  assert_failure 2
+  assert_output --partial "OPENCODE_WEB_LOG_LEVEL must be DEBUG|INFO|WARN|ERROR"
+  assert_output --partial "TRACE"
+}
+
 # --- banner tests -----------------------------------------------------------
 
 @test "opencode-web: banner includes localhost URL" {
