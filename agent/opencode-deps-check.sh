@@ -3,8 +3,8 @@
 #
 # Surfaces checked:
 #   - ~/.config/opencode/package.json dependencies
-#   - ~/.config/opencode/opencode.json(c) `plugin: [...]` entries
-#   - ~/.config/opencode/opencode.json(c) `mcp.<name>.command` arrays (npm packages)
+#   - ~/.config/opencode/opencode.jsonc (preferred) or opencode.json `plugin: [...]` entries
+#   - ~/.config/opencode/opencode.jsonc (preferred) or opencode.json `mcp.<name>.command` arrays (npm packages)
 #
 # Default output: human-readable table. Use --json for machine output.
 
@@ -99,8 +99,8 @@ Check OpenCode config for outdated and unpinned dependencies.
 
 Surfaces:
   - package.json dependencies
-  - opencode.json(c) `plugin` array entries (e.g. "name@version")
-  - opencode.json(c) MCP `command` arrays referencing npm packages
+  - opencode.jsonc (preferred) or opencode.json `plugin` array entries (e.g. "name@version")
+  - opencode.jsonc (preferred) or opencode.json MCP `command` arrays referencing npm packages
     (e.g. "npx -y pkg@version")
 
 Options:
