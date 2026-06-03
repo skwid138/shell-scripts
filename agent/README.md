@@ -2,8 +2,8 @@
 
 These scripts are designed to be invoked by [opencode](https://opencode.ai)
 skills and commands. They follow a strict contract: structured JSON output
-on stdout, predictable exit codes, `--help` always supported, no
-side-effects on remote systems.
+on stdout, predictable exit codes, `--help` always supported, and no remote
+side effects unless an explicit off-by-default mutation flag is passed.
 
 For the rules every script in this directory follows, see
 [`../docs/CONVENTIONS.md`](../docs/CONVENTIONS.md). For exit-code semantics,
@@ -17,6 +17,7 @@ follow [`../docs/ADDING-A-SCRIPT.md`](../docs/ADDING-A-SCRIPT.md).
 | [`branch-to-ticket.sh`](branch-to-ticket.sh) | Extract a Jira ticket ID (e.g. `BIXB-18835`) from a git branch name. | `ticket-plan`, `jira-enhance` skills |
 | [`chrome_mcp.sh`](chrome_mcp.sh) | Launch / check / kill the Chrome instance used by the chrome-devtools MCP server. Foreground or background, configurable port and profile. | `chrome-devtools` skill |
 | [`gh-current-pr.sh`](gh-current-pr.sh) | Resolve the current branch's open PR number. JSON or bare-number output. | `sonarcloud`, `ticket-plan`, `pr-review`, `gh-fetch-pr-comments` skills |
+| [`gh-label-sync.sh`](gh-label-sync.sh) | Converge GitHub labels on `skwid138`-owned repos to the declarative taxonomy. Dry-run default; `--apply` mutates. | `triage`, `to-issues` skills |
 | [`gh-pr-checks-summary.sh`](gh-pr-checks-summary.sh) | Fetch GitHub PR check runs and roll them up to a single status (`passed`/`failed`/`running`/`not_found`). Filterable by check-name regex. | `sonarcloud`, `ticket-plan`, `pr-review` skills; consumed internally by `sonar-pr-issues.sh`. |
 | [`gh-pr-comments.sh`](gh-pr-comments.sh) | Fetch all review comments, threads, reviews, and review metadata for a PR via gh's GraphQL API. Handles large diff hunks via `--rawfile`. | `gh-fetch-pr-comments` skill |
 | [`jira-fetch-ticket.sh`](jira-fetch-ticket.sh) | Fetch a Jira ticket (description, AC, comments, links, attachments) via `acli`. Multiple output modes: full / summary / fields-only. | `jira-ticket`, `jira-enhance`, `ticket-plan` skills |
@@ -53,8 +54,8 @@ All scripts in this directory:
   if explicitly requested).
 - Use the shared `lib/common.sh` `die_*` family — exit codes are
   predictable per [`../docs/EXIT-CODES.md`](../docs/EXIT-CODES.md).
-- Are read-only with respect to remote systems: they query, they don't
-  mutate. Any mutation flag (`--post-jira`, etc.) defaults off.
+- Are read-only with respect to remote systems unless an explicit
+  off-by-default mutation flag (`--apply`, `--post-jira`, etc.) is passed.
 - Are covered by bats tests under [`../tests/`](../tests/).
 
 ## Testing

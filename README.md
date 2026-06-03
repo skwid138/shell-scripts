@@ -16,6 +16,7 @@ This repo contains two distinct things:
 ```
 shell/         # sourced by zsh — three-tier init (env/login/rc), see below
 agent/         # opencode-coupled tools; call directly
+data/          # declarative manifests/templates consumed by agent scripts
 lib/           # shared helpers sourced by agent/ and shell/
 personal/      # personal utilities (gist-linked tools, helpers)
 tests/         # bats test suites + bats submodules
@@ -205,11 +206,14 @@ The hook is a no-op when no shell files are staged. It runs `shellcheck`
 
 ## Conventions
 
-- All scripts start with `#!/usr/bin/env bash` and `set -euo pipefail`.
+- All scripts start with `#!/usr/bin/env bash` and `set -uo pipefail` (not
+  `-e`; see `docs/CONVENTIONS.md`).
 - All scripts accept `-h`/`--help`.
 - All scripts exit non-zero on error with a clear message to **stderr**.
 - Data-retrieval scripts emit JSON to stdout; nothing else.
-- Scripts never commit, push, deploy, delete, or mutate remote systems.
+- Scripts are read-only with respect to remote systems unless you pass an
+  explicit, off-by-default opt-in flag (e.g. `--apply`, `--post-jira`); see
+  `docs/CONVENTIONS.md`.
 - Scripts validate their own dependencies up front (`require_cmd`, `require_auth`).
 
 ## License

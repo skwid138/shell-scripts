@@ -146,14 +146,18 @@ code.
 
 ## Mutating remote systems
 
-Scripts in this repo are **read-only with respect to remote systems**. They
+Scripts in this repo are **read-only with respect to remote systems unless an
+explicit, off-by-default flag opts into mutation**. Without such a flag, they
 must not:
 
 - `git push`, `gh pr create`, `gh pr merge`, `gh issue close`
 - deploy, redeploy, restart services
 - delete records or rotate secrets
-- post comments to Jira/GitHub *unless* the user explicitly opted in via a
-  `--post-jira` or similar flag (and the flag is off by default)
+- post comments to Jira/GitHub; create, edit, or rename labels; or delete
+  labels guarded by a zero-association safety check
+
+Remote mutation is permitted only when the user explicitly opts in via a
+flag such as `--post-jira` or `--apply`, and that flag must default off.
 
 This makes them safe for agents to invoke without escalating consequences.
 
