@@ -198,6 +198,81 @@ EOF
   echo "$output" | jq -r '.url' | grep -q "https://example.com/path"
 }
 
+@test "strip_jsonc: removes trailing comma before array close" {
+  cat >"$TMP_CFG/input.jsonc" <<'EOF'
+{
+  "model_order": [
+    "openai/gpt-5.5",
+  ]
+}
+EOF
+  run strip_jsonc "$TMP_CFG/input.jsonc"
+  assert_success
+  run jq empty <<<"$output"
+  assert_success
+}
+
+@test "strip_jsonc: removes trailing comma before object close" {
+  cat >"$TMP_CFG/input.jsonc" <<'EOF'
+{
+  "model": {
+    "provider": "openai",
+  }
+}
+EOF
+  run strip_jsonc "$TMP_CFG/input.jsonc"
+  assert_success
+  run jq empty <<<"$output"
+  assert_success
+}
+
+@test "strip_jsonc: removes consecutive trailing commas before array close" {
+  cat >"$TMP_CFG/input.jsonc" <<'EOF'
+{
+  "model_order": [
+    "openai/gpt-5.5",,
+  ]
+}
+EOF
+  run strip_jsonc "$TMP_CFG/input.jsonc"
+  assert_success
+  run jq empty <<<"$output"
+  assert_success
+}
+
+@test "strip_jsonc: removes trailing commas at multiple array and object sites" {
+  cat >"$TMP_CFG/input.jsonc" <<'EOF'
+{
+  "model_order": [
+    "openai/gpt-5.5",
+  ],
+  "model": {
+    "provider": "openai",
+  },
+}
+EOF
+  run strip_jsonc "$TMP_CFG/input.jsonc"
+  assert_success
+  run jq empty <<<"$output"
+  assert_success
+}
+
+@test "strip_jsonc: handles comments whose removal exposes trailing comma" {
+  cat >"$TMP_CFG/input.jsonc" <<'EOF'
+{
+  "model_order": [
+    "openai/gpt-5.5",
+    // "anthropic/claude-sonnet-4-20250514",
+    // "google/gemini-2.5-pro"
+  ]
+}
+EOF
+  run strip_jsonc "$TMP_CFG/input.jsonc"
+  assert_success
+  run jq empty <<<"$output"
+  assert_success
+}
+
 # --- end-to-end integration smoke (no network) ------------------------------
 # These run the script as a child process with `npm` stubbed so registry
 # lookups are deterministic.
@@ -318,6 +393,34 @@ EOF
   echo "$output" | jq empty
   echo "$output" | jq -e '.deps[] | select(.package == "jsonc-fake-pkg" and .location == "opencode.jsonc:plugin")' >/dev/null
   echo "$output" | jq -e '.deps[] | select(.package == "jsonc-mcp-fake-pkg" and .location == "opencode.jsonc:mcp.fixture.command")' >/dev/null
+}
+
+@test "script: --json accepts opencode.jsonc with trailing comma" {
+  cat >"$TMP_CFG/opencode.jsonc" <<'EOF'
+{
+  "plugin": [
+    "trailing-comma-fake-pkg@1.0.0",
+  ]
+}
+EOF
+  mkdir -p "$TMP_CFG/bin"
+  cat >"$TMP_CFG/bin/npm" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "view" && "$2" == "trailing-comma-fake-pkg" ]]; then
+  echo "1.0.0"
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$TMP_CFG/bin/npm"
+
+  PATH="$TMP_CFG/bin:$PATH" run "$BATS_TEST_DIRNAME/../agent/opencode-deps-check.sh" --config-dir "$TMP_CFG" --json
+  assert_success
+  refute_output --partial "not valid JSON (after JSONC strip)"
+  script_output="$output"
+  run jq empty <<<"$script_output"
+  assert_success
+  echo "$script_output" | jq -e '.deps[] | select(.package == "trailing-comma-fake-pkg" and .location == "opencode.jsonc:plugin")' >/dev/null
 }
 
 @test "script: human format default (no --json) produces table" {

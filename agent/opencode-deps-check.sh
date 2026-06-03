@@ -22,7 +22,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 # Strip JSONC comments (// and /* */) so jq can parse opencode.json variants.
 # Naive but works for typical configs without // inside strings.
 strip_jsonc() {
-  perl -0pe 's{/\*.*?\*/}{}gs; s{(^|[^:"])//[^\n]*}{$1}g' "$1"
+  # Note: like the comment stripper above, the trailing-comma pass is naive
+  # about commas-before-brace inside string literals (e.g. "foo,}"). Such
+  # sequences do not occur in real JSON config; not handled by design.
+  perl -0pe 's{/\*.*?\*/}{}gs; s{(^|[^:"])//[^\n]*}{$1}g; s/,+(\s*[\]}])/$1/g' "$1"
 }
 
 # Parse "name@version" strings — handles scoped packages (@scope/name@1.2.3).
