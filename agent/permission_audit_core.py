@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Audit opencode permission evaluations from local log files.
+"""Audit opencode permission evaluations and prompt events from local log files.
 
 The shell wrapper owns dependency checks and broad CLI convention. This module
 keeps the parsing, temporal correlation, aggregation, and output formatting in
 Python so commands and paths with shell metacharacters remain data, not syntax.
+opencode v1.15.13 keeps only about 10 log files, does not retain useful
+permission prompt rows in SQLite, and cannot reliably recover pre-plugin agent
+attribution from logs alone.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,9 +38,22 @@ LLM_RE = re.compile(
 PROMPT_RE = re.compile(
     r"INFO\s+(\S+)\s+\+\S+\s+service=session\.prompt\s+session\.id=(ses_\S+)\s+step=\d+"
 )
+ASKING_RE = re.compile(
+    r"INFO\s+(\S+)\s+\+\S+\s+service=permission\s+id=per_\S+\s+permission=(\S+)\s+patterns=(.*)\sasking\s*$",
+    re.DOTALL,
+)
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 LOG_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T.*\.log$")
+DEFAULT_PLUGIN_AUDIT_LOG = Path("~/.local/share/opencode/permission-audit-plugin/audit.log").expanduser()
+PLUGIN_JOIN_WINDOW = timedelta(seconds=5)
+
+
+@dataclass(frozen=True)
+class LogRecord:
+    text: str
+    source: str
+    sequence: int
 
 
 @dataclass(frozen=True)
@@ -47,6 +63,15 @@ class PermissionEvent:
     pattern: str
     matched_rule: str | None
     action: str | None
+    source: str
+    sequence: int
+
+
+@dataclass(frozen=True)
+class AskingEvent:
+    timestamp: str
+    permission: str
+    patterns: list[str]
     source: str
     sequence: int
 
@@ -68,6 +93,18 @@ class PromptMarker:
     sequence: int
 
 
+@dataclass(frozen=True)
+class PluginAuditRecord:
+    timestamp: str
+    timestamp_value: datetime
+    session_id: str | None
+    agent: str | None
+    call_id: str | None
+    command_node_text: str
+    source: str
+    sequence: int
+
+
 def _warn(message: str) -> None:
     print(f"Warning: {message}", file=sys.stderr)
 
@@ -83,6 +120,142 @@ def _event_date(timestamp: str) -> date | None:
         return _parse_date(timestamp[:10])
     except ValueError:
         return None
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    try:
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _utc_aware_for_plugin_join(value: datetime) -> datetime:
+    # Real opencode INFO timestamps are offset-naive but UTC-aligned: the log
+    # filename/line timestamp matches UTC while the filesystem mtime is local
+    # time with the corresponding offset. The plugin writes new Date().toISOString()
+    # (UTC with Z), so naive opencode values must be tagged as UTC for the 5s
+    # same-prompt join window to compare safely and align genuine matches.
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _json_array_state(payload: str) -> tuple[bool, bool]:
+    """Return (started, balanced) for a JSON-array-looking payload.
+
+    The scanner is intentionally small: it tracks quotes, escapes, and square
+    bracket depth so a heredoc body line ending in `` asking`` cannot terminate
+    a multiline permission prompt before the ``patterns=[...]`` array is closed.
+    """
+
+    depth = 0
+    in_string = False
+    escaped = False
+    started = False
+    for char in payload:
+        if escaped:
+            escaped = False
+            continue
+        if in_string:
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+            started = True
+        elif char == "]" and started:
+            depth -= 1
+            if depth < 0:
+                return started, False
+    return started, started and depth == 0 and not in_string and not escaped
+
+
+def _escape_raw_newlines_in_json_strings(payload: str) -> str:
+    repaired: list[str] = []
+    in_string = False
+    escaped = False
+    for char in payload:
+        if escaped:
+            repaired.append(char)
+            escaped = False
+            continue
+        if in_string:
+            if char == "\\":
+                repaired.append(char)
+                escaped = True
+            elif char == '"':
+                repaired.append(char)
+                in_string = False
+            elif char == "\n":
+                repaired.append("\\n")
+            else:
+                repaired.append(char)
+            continue
+        repaired.append(char)
+        if char == '"':
+            in_string = True
+    return "".join(repaired)
+
+
+def _asking_payload_candidate(text: str) -> str | None:
+    if not text.rstrip().endswith(" asking"):
+        return None
+    marker = " patterns="
+    index = text.find(marker)
+    if index < 0:
+        return None
+    return text[index + len(marker) : text.rfind(" asking")]
+
+
+def _is_complete_asking_record(text: str) -> bool:
+    payload = _asking_payload_candidate(text)
+    if payload is None:
+        return False
+    _, balanced = _json_array_state(payload)
+    return balanced
+
+
+def reassemble_log_records(lines: Iterable[str], *, source: str) -> Iterable[LogRecord]:
+    """Yield logical log records, reassembling multiline permission prompts.
+
+    opencode currently retains only ten log files, so multiline reassembly must
+    be tolerant: malformed or drifted records warn and remain isolated instead
+    of aborting the audit.
+    """
+
+    buffer: list[str] = []
+    start_sequence = 0
+    for sequence, raw_line in enumerate(lines, start=1):
+        line = raw_line.rstrip("\n")
+        if buffer:
+            buffer.append(line)
+            text = "\n".join(buffer)
+            if _is_complete_asking_record(text):
+                yield LogRecord(text, source, start_sequence)
+                buffer = []
+            continue
+
+        if "service=permission" in line and "patterns=" in line:
+            if _is_complete_asking_record(line):
+                yield LogRecord(line, source, sequence)
+            else:
+                buffer = [line]
+                start_sequence = sequence
+            continue
+
+        yield LogRecord(line, source, sequence)
+
+    if buffer:
+        text = "\n".join(buffer)
+        if text.rstrip().endswith(" asking"):
+            yield LogRecord(text, source, start_sequence)
+        else:
+            _warn(f"skipping unterminated permission asking record in {source}:{start_sequence}")
 
 
 def parse_permission_line(line: str, *, source: str, sequence: int) -> PermissionEvent | None:
@@ -112,6 +285,36 @@ def parse_permission_line(line: str, *, source: str, sequence: int) -> Permissio
         source=source,
         sequence=sequence,
     )
+
+
+def parse_asking_record(text: str, *, source: str, sequence: int) -> AskingEvent | None:
+    """Parse one permission prompt ``asking`` record.
+
+    ``patterns`` is a JSON string array emitted by opencode. Do not extract it
+    with a non-greedy bracket regex: command text can contain brackets, escaped
+    quotes, and heredoc bodies. Malformed JSON still represents one prompt, so
+    it is bucketed as ``unparseable`` rather than skipped.
+    """
+
+    if "service=permission" not in text or "patterns=" not in text or not text.rstrip().endswith(" asking"):
+        return None
+    match = ASKING_RE.search(text)
+    if not match:
+        _warn(f"skipping unrecognized permission asking record in {source}:{sequence}")
+        return None
+    timestamp, permission, patterns_json = match.groups()
+    try:
+        patterns = json.loads(patterns_json)
+    except json.JSONDecodeError as exc:
+        try:
+            patterns = json.loads(_escape_raw_newlines_in_json_strings(patterns_json))
+        except json.JSONDecodeError:
+            _warn(f"malformed permission asking patterns JSON in {source}:{sequence}: {exc}")
+            return AskingEvent(timestamp, permission, ["unparseable"], source, sequence)
+    if not isinstance(patterns, list) or not all(isinstance(item, str) for item in patterns):
+        _warn(f"malformed permission asking patterns JSON in {source}:{sequence}: expected string array")
+        return AskingEvent(timestamp, permission, ["unparseable"], source, sequence)
+    return AskingEvent(timestamp, permission, patterns, source, sequence)
 
 
 def _parse_council_session_line(line: str, *, source: str, sequence: int) -> SessionAgent | None:
@@ -175,19 +378,20 @@ def discover_log_files(log_dir: Path, start_date: str, end_date: str) -> list[Pa
     return sorted(files, key=lambda item: item.name)
 
 
-def _read_log_lines(paths: Iterable[Path]) -> tuple[dict[str, str], list[PromptMarker], list[PermissionEvent]]:
+def _read_log_lines(paths: Iterable[Path]) -> tuple[dict[str, str], list[PromptMarker], list[PermissionEvent], list[AskingEvent]]:
     session_agents: dict[str, str] = {}
     prompts: list[PromptMarker] = []
     permissions: list[PermissionEvent] = []
+    asking_events: list[AskingEvent] = []
     sequence = 0
 
     for path in paths:
         try:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
-                for raw_line in handle:
+                source = str(path)
+                for record in reassemble_log_records(handle, source=source):
                     sequence += 1
-                    line = raw_line.rstrip("\n")
-                    source = str(path)
+                    line = record.text
 
                     session_agent = parse_session_agent_line(line, source=source, sequence=sequence)
                     if session_agent and session_agent.session_id not in session_agents:
@@ -200,12 +404,95 @@ def _read_log_lines(paths: Iterable[Path]) -> tuple[dict[str, str], list[PromptM
                     permission = parse_permission_line(line, source=source, sequence=sequence)
                     if permission:
                         permissions.append(permission)
+
+                    asking_event = parse_asking_record(line, source=source, sequence=sequence)
+                    if asking_event:
+                        asking_events.append(asking_event)
         except OSError as exc:
             _warn(f"skipping unreadable log file {path}: {exc}")
 
     prompts.sort(key=lambda item: (item.timestamp, item.sequence))
     permissions.sort(key=lambda item: (item.timestamp, item.sequence))
-    return session_agents, prompts, permissions
+    asking_events.sort(key=lambda item: (item.timestamp, item.sequence))
+    return session_agents, prompts, permissions, asking_events
+
+
+def _read_plugin_audit_log(path: Path | None) -> list[PluginAuditRecord]:
+    if path is None:
+        return []
+    expanded = path.expanduser()
+    if not expanded.is_file():
+        return []
+
+    records: list[PluginAuditRecord] = []
+    try:
+        with expanded.open("r", encoding="utf-8", errors="replace") as handle:
+            for sequence, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    _warn(f"skipping malformed plugin audit JSON in {expanded}:{sequence}: {exc}")
+                    continue
+                timestamp = payload.get("ts")
+                command_node_text = payload.get("command_node_text")
+                timestamp_value = _parse_timestamp(timestamp) if isinstance(timestamp, str) else None
+                if timestamp_value is None or not isinstance(command_node_text, str):
+                    _warn(f"skipping malformed plugin audit record in {expanded}:{sequence}")
+                    continue
+                timestamp_value = _utc_aware_for_plugin_join(timestamp_value)
+                session_id = payload.get("sessionID")
+                agent = payload.get("agent")
+                call_id = payload.get("callID")
+                records.append(
+                    PluginAuditRecord(
+                        timestamp=timestamp,
+                        timestamp_value=timestamp_value,
+                        session_id=session_id if isinstance(session_id, str) else None,
+                        agent=agent if isinstance(agent, str) else None,
+                        call_id=call_id if isinstance(call_id, str) else None,
+                        command_node_text=command_node_text,
+                        source=str(expanded),
+                        sequence=sequence,
+                    )
+                )
+    except OSError as exc:
+        _warn(f"skipping unreadable plugin audit log {expanded}: {exc}")
+    records.sort(key=lambda item: (item.timestamp_value, item.sequence))
+    return records
+
+
+def _attribute_from_plugin(
+    *,
+    pattern: str,
+    asking_timestamp: str,
+    plugin_records: list[PluginAuditRecord],
+) -> tuple[str, str | None]:
+    # Known limitation: plugin command_node_text can include trailing shell
+    # redirections that opencode's permission asking pattern may omit. Do not
+    # normalize those here without a source-verified AST contract; an exact-text
+    # miss degrades safely to unknown, while a guessed match could misattribute
+    # a prompt to the wrong agent.
+    parsed_asking_time = _parse_timestamp(asking_timestamp)
+    if parsed_asking_time is None:
+        return "unknown (pre-plugin)", None
+    asking_time = _utc_aware_for_plugin_join(parsed_asking_time)
+
+    candidates = [
+        record
+        for record in plugin_records
+        if record.command_node_text == pattern
+        and record.timestamp_value <= asking_time
+        and asking_time - record.timestamp_value <= PLUGIN_JOIN_WINDOW
+    ]
+    if not candidates:
+        return "unknown (pre-plugin)", None
+    if len(candidates) > 1:
+        return "ambiguous", None
+    candidate = candidates[0]
+    return candidate.agent or "unknown", candidate.session_id
 
 
 def _correlate(event: PermissionEvent, prompts: list[PromptMarker]) -> PromptMarker | None:
@@ -233,6 +520,7 @@ def audit_logs(
     *,
     action_filter: str = "ask",
     agent_filter: str | None = None,
+    plugin_log_path: str | Path | None = DEFAULT_PLUGIN_AUDIT_LOG,
 ) -> dict[str, Any]:
     """Build a schema-versioned permission audit report."""
 
@@ -245,15 +533,55 @@ def audit_logs(
         raise ValueError("end date must be on or after start date")
 
     paths = discover_log_files(Path(log_dir).expanduser(), start_date, end_date)
-    session_agents, prompts, permissions = _read_log_lines(paths)
+    session_agents, prompts, permissions, asking_events = _read_log_lines(paths)
+    plugin_records = _read_plugin_audit_log(Path(plugin_log_path) if plugin_log_path is not None else None)
 
     agent_filter_normalized = agent_filter.casefold() if agent_filter else None
-    filtered_events: list[tuple[PermissionEvent, str | None, str | None]] = []
+    filtered_events: list[dict[str, Any]] = []
+    prompt_event_count = 0
+    asking_identity_keys = {
+        (asking_event.timestamp, asking_event.permission, pattern)
+        for asking_event in asking_events
+        for pattern in asking_event.patterns
+    }
+
+    if action_filter in {"ask", "all"}:
+        for asking_event in asking_events:
+            event_day = _event_date(asking_event.timestamp)
+            if event_day is None or event_day < start or event_day > end:
+                continue
+
+            included_prompt = False
+            for pattern in asking_event.patterns:
+                agent, session_id = _attribute_from_plugin(
+                    pattern=pattern,
+                    asking_timestamp=asking_event.timestamp,
+                    plugin_records=plugin_records,
+                )
+                if agent_filter_normalized is not None and agent.casefold() != agent_filter_normalized:
+                    continue
+                filtered_events.append(
+                    {
+                        "timestamp": asking_event.timestamp,
+                        "permission": asking_event.permission,
+                        "pattern": pattern,
+                        "matched_rule": None,
+                        "action": "ask",
+                        "agent": agent,
+                        "session_id": session_id,
+                    }
+                )
+                included_prompt = True
+            if included_prompt:
+                prompt_event_count += 1
+
     for event in permissions:
         event_day = _event_date(event.timestamp)
         if event_day is None or event_day < start or event_day > end:
             continue
         if action_filter != "all" and event.action != action_filter:
+            continue
+        if event.action == "ask" and (event.timestamp, event.permission, event.pattern) in asking_identity_keys:
             continue
 
         prompt = _correlate(event, prompts)
@@ -264,33 +592,43 @@ def audit_logs(
             if agent is None or agent.casefold() != agent_filter_normalized:
                 continue
 
-        filtered_events.append((event, agent, session_id))
-
-    aggregate: dict[tuple[str, str, str | None], dict[str, Any]] = {}
-    for event, agent, session_id in filtered_events:
-        key = (event.permission, event.pattern, event.action)
-        entry = aggregate.setdefault(
-            key,
+        filtered_events.append(
             {
+                "timestamp": event.timestamp,
                 "permission": event.permission,
                 "pattern": event.pattern,
                 "matched_rule": event.matched_rule,
                 "action": event.action,
+                "agent": agent,
+                "session_id": session_id,
+            }
+        )
+
+    aggregate: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+    for event in filtered_events:
+        key = (event["permission"], event["pattern"], event["action"])
+        entry = aggregate.setdefault(
+            key,
+            {
+                "permission": event["permission"],
+                "pattern": event["pattern"],
+                "matched_rule": event["matched_rule"],
+                "action": event["action"],
                 "count": 0,
                 "agents": set(),
                 "session_ids": set(),
-                "first_seen": event.timestamp,
-                "last_seen": event.timestamp,
+                "first_seen": event["timestamp"],
+                "last_seen": event["timestamp"],
             },
         )
         entry["count"] += 1
-        entry["agents"].add(agent)
-        if session_id is not None:
-            entry["session_ids"].add(session_id)
-        if event.timestamp < entry["first_seen"]:
-            entry["first_seen"] = event.timestamp
-        if event.timestamp > entry["last_seen"]:
-            entry["last_seen"] = event.timestamp
+        entry["agents"].add(event["agent"])
+        if event["session_id"] is not None:
+            entry["session_ids"].add(event["session_id"])
+        if event["timestamp"] < entry["first_seen"]:
+            entry["first_seen"] = event["timestamp"]
+        if event["timestamp"] > entry["last_seen"]:
+            entry["last_seen"] = event["timestamp"]
 
     entries: list[dict[str, Any]] = []
     for entry in aggregate.values():
@@ -300,15 +638,18 @@ def audit_logs(
         entries.append(normalized)
     entries.sort(key=lambda item: (-item["count"], item["permission"], item["pattern"], item["action"] or ""))
 
-    total_ask = sum(1 for event, _, _ in filtered_events if event.action == "ask")
-    total_deny = sum(1 for event, _, _ in filtered_events if event.action == "deny")
+    total_ask = sum(1 for event in filtered_events if event["action"] == "ask")
+    total_deny = sum(1 for event in filtered_events if event["action"] == "deny")
+    pattern_occurrence_count = len(filtered_events)
 
     return {
         "version": 1,
         "date_range": {"start": start_date, "end": end_date},
         "filters": {"action": action_filter, "agent": agent_filter},
         "summary": {
-            "total_events": len(filtered_events),
+            "total_events": pattern_occurrence_count,
+            "prompt_event_count": prompt_event_count,
+            "pattern_occurrence_count": pattern_occurrence_count,
             "total_ask": total_ask,
             "total_deny": total_deny,
             "unique_patterns": len(entries),
@@ -353,7 +694,10 @@ def format_human(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            f"Total: {summary['total_events']} events, {summary['unique_patterns']} unique patterns",
+            "Total: "
+            f"{summary['prompt_event_count']} prompt events, "
+            f"{summary['pattern_occurrence_count']} pattern occurrences, "
+            f"{summary['unique_patterns']} unique patterns",
         ]
     )
     return "\n".join(lines)
@@ -364,7 +708,13 @@ def _default_today() -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Audit opencode permission decisions from local logs.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Audit opencode permission prompts from local logs. opencode retains only about "
+            "10 log files; pre-plugin agent attribution is not reliably recoverable; "
+            "SQLite permission/event tables are empty in v1.15.13."
+        )
+    )
     parser.add_argument("--start", default=_default_today(), help="Start date, YYYY-MM-DD (default: today)")
     parser.add_argument("--end", default=_default_today(), help="End date, YYYY-MM-DD (default: today)")
     parser.add_argument("--action", choices=("ask", "deny", "all"), default="ask", help="Permission decision filter")

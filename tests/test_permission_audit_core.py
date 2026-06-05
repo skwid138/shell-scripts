@@ -20,6 +20,35 @@ import permission_audit_core as core  # noqa: E402
 
 
 class PermissionAuditParsingTest(unittest.TestCase):
+    def test_parse_asking_record_json_parses_patterns_with_inner_brackets(self) -> None:
+        line = (
+            'INFO 2026-06-05T10:00:00.123Z +1ms service=permission id=per_abc '
+            'permission=bash patterns=["printf \\\"[value]\\\"", "cat <<\\\"EOF\\\"\\nline asking\\nEOF"] asking'
+        )
+
+        event = core.parse_asking_record(line, source="fixture.log", sequence=1)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.timestamp, "2026-06-05T10:00:00.123Z")
+        self.assertEqual(event.permission, "bash")
+        self.assertEqual(event.patterns, ['printf "[value]"', 'cat <<"EOF"\nline asking\nEOF'])
+
+    def test_complete_asking_record_waits_for_parseable_json_before_asking_suffix(self) -> None:
+        lines = [
+            'INFO 2026-06-05T10:00:00.123Z +1ms service=permission id=per_abc permission=bash patterns=["cat <<EOF',
+            'body line ending asking',
+            'EOF"] asking',
+        ]
+
+        records = list(core.reassemble_log_records(lines, source="fixture.log"))
+        event = core.parse_asking_record(records[0].text, source="fixture.log", sequence=1)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].text, "\n".join(lines))
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.patterns, ["cat <<EOF\nbody line ending asking\nEOF"])
     def test_parse_permission_line_handles_complex_patterns(self) -> None:
         line = (
             'INFO 2026-05-21T10:00:06 +1ms service=permission permission=bash '
@@ -102,6 +131,231 @@ class PermissionAuditParsingTest(unittest.TestCase):
 
 
 class PermissionAuditBehaviorTest(unittest.TestCase):
+    def test_asking_events_report_prompt_and_pattern_counts_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "2026-06-05T100000.log"
+            log_path.write_text(
+                'INFO 2026-06-05T10:00:00.123Z +1ms service=permission id=per_one '
+                'permission=bash patterns=["~/code/scripts/agent/foo.sh", "pwd"] asking\n',
+                encoding="utf-8",
+            )
+
+            report = core.audit_logs(
+                tmpdir,
+                "2026-06-05",
+                "2026-06-05",
+                action_filter="ask",
+                plugin_log_path=None,
+            )
+
+        self.assertEqual(report["summary"]["prompt_event_count"], 1)
+        self.assertEqual(report["summary"]["pattern_occurrence_count"], 2)
+        self.assertEqual({entry["pattern"] for entry in report["entries"]}, {"~/code/scripts/agent/foo.sh", "pwd"})
+        self.assertEqual({tuple(entry["agents"]) for entry in report["entries"]}, {("unknown (pre-plugin)",)})
+
+    def test_malformed_asking_pattern_json_counts_prompt_as_unparseable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "2026-06-05T100000.log"
+            log_path.write_text(
+                "INFO 2026-06-05T10:00:00.123Z +1ms service=permission id=per_bad "
+                "permission=bash patterns=[not-json] asking\n",
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                report = core.audit_logs(
+                    tmpdir,
+                    "2026-06-05",
+                    "2026-06-05",
+                    action_filter="ask",
+                    plugin_log_path=None,
+                )
+
+        self.assertIn("malformed permission asking patterns JSON", stderr.getvalue())
+        self.assertEqual(report["summary"]["prompt_event_count"], 1)
+        self.assertEqual(report["summary"]["pattern_occurrence_count"], 1)
+        self.assertEqual(report["entries"][0]["pattern"], "unparseable")
+
+    def test_plugin_audit_log_attributes_asking_events_by_exact_prior_command_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "2026-06-05T100000.log"
+            plugin_path = Path(tmpdir) / "audit.log"
+            log_path.write_text(
+                'INFO 2026-06-05T10:00:01.000Z +1ms service=permission id=per_one '
+                'permission=bash patterns=["/Users/hunter/code/scripts/agent/foo.sh --json"] asking\n',
+                encoding="utf-8",
+            )
+            plugin_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T10:00:00.900Z",
+                        "sessionID": "ses_1",
+                        "agent": "aragorn",
+                        "callID": "call_1",
+                        "command_node_text": "/Users/hunter/code/scripts/agent/foo.sh --json",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = core.audit_logs(
+                tmpdir,
+                "2026-06-05",
+                "2026-06-05",
+                action_filter="ask",
+                agent_filter="ARAGORN",
+                plugin_log_path=plugin_path,
+            )
+
+        self.assertEqual(report["summary"]["prompt_event_count"], 1)
+        self.assertEqual(report["entries"][0]["agents"], ["aragorn"])
+
+    def test_plugin_audit_join_handles_naive_opencode_utc_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "2026-06-05T155129.log"
+            plugin_path = Path(tmpdir) / "audit.log"
+            command = "/Users/hunter/code/scripts/agent/foo.sh --json"
+            log_path.write_text(
+                f'INFO 2026-06-05T15:51:31 +1ms service=permission id=per_one permission=bash patterns=[{json.dumps(command)}] asking\n',
+                encoding="utf-8",
+            )
+            plugin_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T15:51:30.500Z",
+                        "sessionID": "ses_utc",
+                        "agent": "aragorn",
+                        "callID": "call_utc",
+                        "command_node_text": command,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = core.audit_logs(
+                tmpdir,
+                "2026-06-05",
+                "2026-06-05",
+                action_filter="ask",
+                plugin_log_path=plugin_path,
+            )
+
+        self.assertEqual(report["summary"]["prompt_event_count"], 1)
+        self.assertEqual(report["entries"][0]["agents"], ["aragorn"])
+        self.assertEqual(report["entries"][0]["session_ids"], ["ses_utc"])
+
+    def test_plugin_audit_join_ignores_records_outside_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "2026-06-05T155129.log"
+            plugin_path = Path(tmpdir) / "audit.log"
+            command = "/Users/hunter/code/scripts/agent/foo.sh --json"
+            log_path.write_text(
+                f'INFO 2026-06-05T15:51:31 +1ms service=permission id=per_one permission=bash patterns=[{json.dumps(command)}] asking\n',
+                encoding="utf-8",
+            )
+            plugin_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T15:51:20.000Z",
+                        "sessionID": "ses_old",
+                        "agent": "aragorn",
+                        "callID": "call_old",
+                        "command_node_text": command,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = core.audit_logs(
+                tmpdir,
+                "2026-06-05",
+                "2026-06-05",
+                action_filter="ask",
+                plugin_log_path=plugin_path,
+            )
+
+        self.assertEqual(report["summary"]["prompt_event_count"], 1)
+        self.assertEqual(report["entries"][0]["agents"], ["unknown (pre-plugin)"])
+        self.assertEqual(report["entries"][0]["session_ids"], [])
+
+    def test_mixed_legacy_evaluated_and_asking_prompts_are_both_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "2026-06-05T100000.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "INFO 2026-06-05T10:00:00 +1ms service=permission permission=bash "
+                        'pattern=legacy-only.sh action={"permission":"bash","pattern":"*","action":"ask"} evaluated',
+                        "INFO 2026-06-05T10:01:00 +1ms service=permission permission=bash "
+                        'pattern=new-format.sh action={"permission":"bash","pattern":"*","action":"ask"} evaluated',
+                        'INFO 2026-06-05T10:01:00 +1ms service=permission id=per_one permission=bash patterns=["new-format.sh"] asking',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = core.audit_logs(
+                tmpdir,
+                "2026-06-05",
+                "2026-06-05",
+                action_filter="ask",
+                plugin_log_path=None,
+            )
+
+        self.assertEqual(report["summary"]["prompt_event_count"], 1)
+        self.assertEqual(report["summary"]["pattern_occurrence_count"], 2)
+        self.assertEqual({entry["pattern"] for entry in report["entries"]}, {"legacy-only.sh", "new-format.sh"})
+
+    def test_plugin_audit_ambiguous_when_same_command_has_multiple_candidates_in_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "2026-06-05T100000.log"
+            plugin_path = Path(tmpdir) / "audit.log"
+            command = "/Users/hunter/code/scripts/agent/foo.sh"
+            log_path.write_text(
+                f'INFO 2026-06-05T10:00:01.000Z +1ms service=permission id=per_one permission=bash patterns=[{json.dumps(command)}] asking\n',
+                encoding="utf-8",
+            )
+            plugin_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "ts": "2026-06-05T10:00:00.800Z",
+                                "sessionID": "ses_1",
+                                "agent": "gandalf",
+                                "callID": "call_1",
+                                "command_node_text": command,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "ts": "2026-06-05T10:00:00.900Z",
+                                "sessionID": "ses_2",
+                                "agent": "aragorn",
+                                "callID": "call_2",
+                                "command_node_text": command,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = core.audit_logs(
+                tmpdir,
+                "2026-06-05",
+                "2026-06-05",
+                action_filter="ask",
+                plugin_log_path=plugin_path,
+            )
+
+        self.assertEqual(report["entries"][0]["agents"], ["ambiguous"])
+
     def test_temporal_correlation_handles_single_multi_and_resumed_sessions(self) -> None:
         report = core.audit_logs(
             FIXTURE_DIR,
@@ -211,7 +465,17 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
         self.assertEqual(report["version"], 1)
         self.assertEqual(report["date_range"], {"start": "2026-05-21", "end": "2026-05-21"})
         self.assertEqual(report["filters"], {"action": "ask", "agent": None})
-        self.assertEqual(report["summary"], {"total_events": 0, "total_ask": 0, "total_deny": 0, "unique_patterns": 0})
+        self.assertEqual(
+            report["summary"],
+            {
+                "total_events": 0,
+                "prompt_event_count": 0,
+                "pattern_occurrence_count": 0,
+                "total_ask": 0,
+                "total_deny": 0,
+                "unique_patterns": 0,
+            },
+        )
         self.assertEqual(report["entries"], [])
         json.dumps(report)
 
