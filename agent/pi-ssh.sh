@@ -56,6 +56,10 @@ Contract exceptions:
      allow-listed, arbitrary remote Pi execution including sudo is unprompted.
      opencode's local start-anchored "sudo *" deny rule does not catch remote
      sudo issued through this wrapper.
+  4. Exact-match host validation scopes the literal ssh destination argument,
+     but does not override trusted local ~/.ssh/config. Existing HostName,
+     ProxyCommand, ProxyJump, or Match rules for canonical Pi names can still
+     remap or pivot the connection outside this wrapper's control.
 
 Examples:
   pi-ssh uptime

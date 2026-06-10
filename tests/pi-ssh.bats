@@ -106,6 +106,15 @@ assert_argv_sequence() {
   done
 }
 
+@test "pi-ssh: host validation rejects whitespace and control-char injections" {
+  local host
+  for host in $'pi ' $'pi\tx' $'pi\nhunter@evil'; do
+    run env PI_SSH_HOST="$host" "$SCRIPT" uptime
+    assert_failure 2
+    assert_output --partial "canonical Pi short form"
+  done
+}
+
 @test "pi-ssh: host validation accepts all six Pi identity forms" {
   local identity expected
   for identity in pi hunter@pi 100.86.205.116 hunter@100.86.205.116 192.168.50.53 hunter@192.168.50.53; do
@@ -200,6 +209,16 @@ assert_argv_sequence() {
   assert_argv_sequence $'<hunter@pi>\n<ls>'
 }
 
+@test "pi-ssh: dash-starting remote tokens after double-dash stay verbatim" {
+  run "$SCRIPT" -- -J attacker
+  assert_success
+  assert_argv_sequence $'<hunter@pi>\n<-J>\n<attacker>'
+
+  run "$SCRIPT" -- -o ProxyCommand=evil
+  assert_success
+  assert_argv_sequence $'<hunter@pi>\n<-o>\n<ProxyCommand=evil>'
+}
+
 @test "pi-ssh: leading -t and -T pass through to ssh before remote command" {
   run "$SCRIPT" -t sudo systemctl edit x
   assert_success
@@ -215,6 +234,18 @@ assert_argv_sequence() {
   run "$SCRIPT" -x
   assert_failure 2
   assert_output --partial "use --"
+}
+
+@test "pi-ssh: dangerous ssh and host-pivot wrapper flags stay rejected" {
+  # These surfaces were deliberately removed or never added to close local-RCE
+  # and host-pivot vectors (ProxyCommand, ProxyJump, and -F config). Keep them
+  # rejected if someone later adds a parser arm for -o or --ssh-arg.
+  local flag
+  for flag in -o --ssh-arg -J -F --host --lan; do
+    run "$SCRIPT" "$flag" ProxyCommand=evil
+    assert_failure 2
+    assert_output --partial "use --"
+  done
 }
 
 @test "pi-ssh: missing ssh dependency exits 3" {
@@ -242,6 +273,7 @@ assert_argv_sequence() {
   assert_output --partial "Remote exit codes 1, 2, 3, 4, and 5"
   assert_output --partial "emit the normal agent-script JSON envelope"
   assert_output --partial "arbitrary remote Pi execution including sudo is unprompted"
+  assert_output --partial "does not override trusted local ~/.ssh/config"
   assert_output --partial "There is no arbitrary"
   assert_output --partial "FQDNs and near-matches are intentionally unsupported"
 }

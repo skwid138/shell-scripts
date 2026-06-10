@@ -164,7 +164,10 @@ safety tool. When allow-listed by opencode it permits unprompted arbitrary
 remote command execution on the Pi, including remote `sudo`, without an
 off-by-default mutation flag. It remains acceptable only because it exact-matches
 the target against canonical Pi identities and explicitly does not support
-arbitrary hosts.
+arbitrary hosts. That exact match scopes the literal SSH destination argument;
+it does not override a trusted local `~/.ssh/config`, where pre-existing
+`HostName`, `ProxyCommand`, `ProxyJump`, or `Match` rules for canonical Pi names
+can still remap or pivot the connection outside the wrapper's control.
 
 Except for documented exceptions such as `pi-ssh.sh`, this makes scripts safe
 for agents to invoke without escalating consequences.
