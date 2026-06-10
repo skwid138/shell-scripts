@@ -159,7 +159,15 @@ must not:
 Remote mutation is permitted only when the user explicitly opts in via a
 flag such as `--post-jira` or `--apply`, and that flag must default off.
 
-This makes them safe for agents to invoke without escalating consequences.
+Documented exception: `agent/pi-ssh.sh` is a convenience/scoping wrapper, not a
+safety tool. When allow-listed by opencode it permits unprompted arbitrary
+remote command execution on the Pi, including remote `sudo`, without an
+off-by-default mutation flag. It remains acceptable only because it exact-matches
+the target against canonical Pi identities and explicitly does not support
+arbitrary hosts.
+
+Except for documented exceptions such as `pi-ssh.sh`, this makes scripts safe
+for agents to invoke without escalating consequences.
 
 ## Dependency checks
 

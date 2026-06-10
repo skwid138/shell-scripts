@@ -3,7 +3,10 @@
 These scripts are designed to be invoked by [opencode](https://opencode.ai)
 skills and commands. They follow a strict contract: structured JSON output
 on stdout, predictable exit codes, `--help` always supported, and no remote
-side effects unless an explicit off-by-default mutation flag is passed.
+side effects unless an explicit off-by-default mutation flag is passed. The
+documented exception is `pi-ssh.sh`: it is a transparent SSH passthrough whose
+stdout/exit status belong to `ssh` or the remote command, and allow-listed use
+permits unprompted arbitrary Pi command execution, including remote `sudo`.
 
 For the rules every script in this directory follows, see
 [`../docs/CONVENTIONS.md`](../docs/CONVENTIONS.md). For exit-code semantics,
@@ -22,6 +25,7 @@ follow [`../docs/ADDING-A-SCRIPT.md`](../docs/ADDING-A-SCRIPT.md).
 | [`gh-pr-comments.sh`](gh-pr-comments.sh) | Fetch all review comments, threads, reviews, and review metadata for a PR via gh's GraphQL API. Handles large diff hunks via `--rawfile`. | `gh-fetch-pr-comments` skill |
 | [`jira-fetch-ticket.sh`](jira-fetch-ticket.sh) | Fetch a Jira ticket (description, AC, comments, links, attachments) via `acli`. Multiple output modes: full / summary / fields-only. | `jira-ticket`, `jira-enhance`, `ticket-plan` skills |
 | [`opencode-deps-check.sh`](opencode-deps-check.sh) | Audit `~/.config/opencode/opencode.json` for outdated or unpinned MCP-server / plugin / agent dependencies. | `update-opencode-deps` command |
+| [`pi-ssh.sh`](pi-ssh.sh) | Pi-only scoped SSH wrapper for agent use. Convenience/scoping exception: transparent SSH passthrough and unprompted arbitrary remote Pi execution when allow-listed. | Any Pi SSH operation; use instead of raw `ssh` |
 | [`scripts-doctor.sh`](scripts-doctor.sh) | Health-check this repo (and the private wpro-shell mirror) against project conventions: required tooling, CI workflow, per-script `--help` / strict-mode / lib-source / bats coverage. Text and JSON output. | `scripts-doctor` slash command |
 | [`sonar-pr-issues.sh`](sonar-pr-issues.sh) | Fetch SonarCloud issues for a PR, classified by severity and impact. Includes CI-status rollup via `gh-pr-checks-summary.sh`. | `sonarcloud` skill |
 
@@ -56,6 +60,9 @@ All scripts in this directory:
   predictable per [`../docs/EXIT-CODES.md`](../docs/EXIT-CODES.md).
 - Are read-only with respect to remote systems unless an explicit
   off-by-default mutation flag (`--apply`, `--post-jira`, etc.) is passed.
+- Exception: `pi-ssh.sh` is intentionally not read-only and does not emit JSON;
+  it is a Pi-scoped SSH passthrough whose allow-listed use permits arbitrary
+  remote Pi commands, including `sudo`.
 - Are covered by bats tests under [`../tests/`](../tests/).
 
 ## Testing
