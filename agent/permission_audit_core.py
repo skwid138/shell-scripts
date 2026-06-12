@@ -45,8 +45,32 @@ ASKING_RE = re.compile(
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 LOG_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T.*\.log$")
-DEFAULT_PLUGIN_AUDIT_LOG = Path("~/.local/share/opencode/permission-audit-plugin/audit.log").expanduser()
+
+
+def _xdg_data_home() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser()
+
+
+def _default_plugin_audit_log() -> Path:
+    return _xdg_data_home() / "opencode" / "permission-audit-plugin" / "audit.log"
+
+
+def _default_decisions_log() -> Path:
+    return _xdg_data_home() / "opencode" / "permission-audit-plugin" / "decisions.log"
+
+
+DEFAULT_PLUGIN_AUDIT_LOG = _default_plugin_audit_log()
+DEFAULT_DECISIONS_LOG = _default_decisions_log()
 PLUGIN_JOIN_WINDOW = timedelta(seconds=5)
+STATIC_BLINDNESS_CAVEAT = (
+    "interactive-prompt audit; static allow and deny rules that never prompt are not captured — "
+    "not a comprehensive policy audit"
+)
+MISSING_DECISIONS_CAVEAT = (
+    "decisions.log not found — the command-normalizer plugin may not be built or running; "
+    "run its build and restart opencode"
+)
+DENY_STATIC_BLINDNESS_WARNING = "static deny-rule auto-blocks are not captured by the decisions source"
 
 
 @dataclass(frozen=True)
@@ -101,6 +125,20 @@ class PluginAuditRecord:
     agent: str | None
     call_id: str | None
     command_node_text: str
+    source: str
+    sequence: int
+
+
+@dataclass(frozen=True)
+class DecisionRecord:
+    timestamp: str | None
+    timestamp_value: datetime | None
+    session_id: str | None
+    call_id: str | None
+    permission: str
+    patterns: list[str]
+    always: list[str]
+    reply: str
     source: str
     sequence: int
 
@@ -464,6 +502,240 @@ def _read_plugin_audit_log(path: Path | None) -> list[PluginAuditRecord]:
     return records
 
 
+def _as_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _decision_action(reply: str) -> str:
+    if reply in {"once", "always"}:
+        return "allow"
+    if reply == "reject":
+        return "deny"
+    return "unknown"
+
+
+def _read_decisions_log(path: Path | None) -> tuple[bool, list[DecisionRecord]]:
+    if path is None:
+        return False, []
+    expanded = path.expanduser()
+    if not expanded.is_file():
+        return False, []
+
+    records: list[DecisionRecord] = []
+    try:
+        with expanded.open("r", encoding="utf-8", errors="replace") as handle:
+            for sequence, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    _warn(f"skipping malformed decisions JSON in {expanded}:{sequence}: {exc}")
+                    continue
+                timestamp = payload.get("ts")
+                timestamp_value = _parse_timestamp(timestamp) if isinstance(timestamp, str) else None
+                if timestamp_value is not None:
+                    timestamp_value = _utc_aware_for_plugin_join(timestamp_value)
+                session_id = payload.get("sessionID")
+                call_id = payload.get("callID")
+                permission = payload.get("permission")
+                reply = payload.get("reply")
+                records.append(
+                    DecisionRecord(
+                        timestamp=timestamp if isinstance(timestamp, str) else None,
+                        timestamp_value=timestamp_value,
+                        session_id=session_id if isinstance(session_id, str) else None,
+                        call_id=call_id if isinstance(call_id, str) else None,
+                        permission=permission if isinstance(permission, str) else "(missing permission)",
+                        patterns=_as_string_list(payload.get("patterns")),
+                        always=_as_string_list(payload.get("always")),
+                        reply=reply if isinstance(reply, str) else "(missing reply)",
+                        source=str(expanded),
+                        sequence=sequence,
+                    )
+                )
+    except OSError as exc:
+        _warn(f"skipping unreadable decisions log {expanded}: {exc}")
+    records.sort(key=lambda item: (item.timestamp_value or datetime.max.replace(tzinfo=timezone.utc), item.sequence))
+    return True, records
+
+
+def _order_preserving_union(existing: list[str], incoming: list[str]) -> None:
+    seen = set(existing)
+    for item in incoming:
+        if item not in seen:
+            existing.append(item)
+            seen.add(item)
+
+
+def _plugin_agent_indexes(
+    plugin_records: list[PluginAuditRecord],
+    *,
+    start: date,
+    end: date,
+) -> tuple[dict[tuple[str, str], set[str]], dict[str, set[str]]]:
+    by_call: dict[tuple[str, str], set[str]] = {}
+    by_session: dict[str, set[str]] = {}
+    for record in plugin_records:
+        record_day = record.timestamp_value.date()
+        if record_day < start or record_day > end or record.session_id is None:
+            continue
+        agent = record.agent or "unknown"
+        by_session.setdefault(record.session_id, set()).add(agent)
+        if record.call_id is not None:
+            by_call.setdefault((record.session_id, record.call_id), set()).add(agent)
+    return by_call, by_session
+
+
+def _attribute_decision_agent(
+    record: DecisionRecord,
+    *,
+    by_call: dict[tuple[str, str], set[str]],
+    by_session: dict[str, set[str]],
+) -> str:
+    if record.session_id is None:
+        return "unknown (no audit match)"
+    if record.call_id is not None:
+        agents = by_call.get((record.session_id, record.call_id))
+        if agents:
+            return next(iter(agents)) if len(agents) == 1 else "ambiguous"
+    session_agents = by_session.get(record.session_id)
+    if not session_agents:
+        return "unknown (no audit match)"
+    return next(iter(session_agents)) if len(session_agents) == 1 else "unknown"
+
+
+def audit_decisions(
+    decisions_log_path: str | Path | None,
+    start_date: str,
+    end_date: str,
+    *,
+    action_filter: str = "all",
+    agent_filter: str | None = None,
+    plugin_log_path: str | Path | None = DEFAULT_PLUGIN_AUDIT_LOG,
+) -> dict[str, Any]:
+    """Build a v2 report from durable command-normalizer decisions records."""
+
+    if action_filter not in {"allow", "deny", "all"}:
+        raise ValueError("action_filter must be allow, deny, or all for source decisions")
+
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    if end < start:
+        raise ValueError("end date must be on or after start date")
+
+    present, records = _read_decisions_log(Path(decisions_log_path) if decisions_log_path is not None else None)
+    plugin_records = _read_plugin_audit_log(Path(plugin_log_path) if plugin_log_path is not None else None)
+    agents_by_call, agents_by_session = _plugin_agent_indexes(plugin_records, start=start, end=end)
+    caveats = [STATIC_BLINDNESS_CAVEAT]
+    if not present:
+        caveats.append(MISSING_DECISIONS_CAVEAT)
+        _warn(MISSING_DECISIONS_CAVEAT)
+
+    filtered_events: list[dict[str, Any]] = []
+    undated_count = 0
+    agent_filter_normalized = agent_filter.casefold() if agent_filter else None
+
+    for record in records:
+        if record.timestamp_value is None or record.timestamp is None:
+            undated_count += 1
+            continue
+        event_day = record.timestamp_value.date()
+        if event_day < start or event_day > end:
+            continue
+        action = _decision_action(record.reply)
+        if action_filter != "all" and action != action_filter:
+            continue
+        agent = _attribute_decision_agent(record, by_call=agents_by_call, by_session=agents_by_session)
+        if agent_filter_normalized is not None and agent.casefold() != agent_filter_normalized:
+            continue
+        filtered_events.append(
+            {
+                "timestamp": record.timestamp,
+                "permission": record.permission,
+                "action": action,
+                "reply": record.reply,
+                "agent": agent,
+                "session_id": record.session_id,
+                "patterns": record.patterns,
+                "always": record.always,
+            }
+        )
+
+    if undated_count:
+        caveats.append(f"{undated_count} decisions records had unparseable ts values and were excluded from date-filtered counts")
+    if action_filter == "deny":
+        caveats.append(DENY_STATIC_BLINDNESS_WARNING)
+        _warn(DENY_STATIC_BLINDNESS_WARNING)
+
+    aggregate: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in filtered_events:
+        key = (event["permission"], event["reply"])
+        entry = aggregate.setdefault(
+            key,
+            {
+                "permission": event["permission"],
+                "action": event["action"],
+                "reply": event["reply"],
+                "count": 0,
+                "agents": set(),
+                "session_ids": set(),
+                "patterns": [],
+                "always": [],
+                "first_seen": event["timestamp"],
+                "last_seen": event["timestamp"],
+            },
+        )
+        entry["count"] += 1
+        entry["agents"].add(event["agent"])
+        if event["session_id"] is not None:
+            entry["session_ids"].add(event["session_id"])
+        _order_preserving_union(entry["patterns"], event["patterns"])
+        _order_preserving_union(entry["always"], event["always"])
+        if event["timestamp"] < entry["first_seen"]:
+            entry["first_seen"] = event["timestamp"]
+        if event["timestamp"] > entry["last_seen"]:
+            entry["last_seen"] = event["timestamp"]
+
+    entries: list[dict[str, Any]] = []
+    for entry in aggregate.values():
+        normalized = dict(entry)
+        normalized["agents"] = _sort_agents(entry["agents"])
+        normalized["session_ids"] = _sort_session_ids(entry["session_ids"])
+        entries.append(normalized)
+    entries.sort(key=lambda item: (-item["count"], item["permission"], item["reply"]))
+
+    allow_count = sum(event["count"] for event in entries if event["action"] == "allow")
+    deny_count = sum(event["count"] for event in entries if event["action"] == "deny")
+    unknown_count = sum(event["count"] for event in entries if event["action"] == "unknown")
+    total_events = allow_count + deny_count + unknown_count
+    if unknown_count:
+        caveats.append("unknown decisions reply values were kept as action=unknown")
+    if any(event["permission"] == "(missing permission)" for event in filtered_events):
+        caveats.append('missing permission fields were kept as "(missing permission)"')
+
+    return {
+        "version": 2,
+        "date_range": {"start": start_date, "end": end_date},
+        "filters": {"action": action_filter, "agent": agent_filter},
+        "source": "decisions",
+        "decisions_log_present": present,
+        "summary": {
+            "total_events": total_events,
+            "allow_count": allow_count,
+            "deny_count": deny_count,
+            "unknown_count": unknown_count,
+            "unique_permissions": len({entry["permission"] for entry in entries}),
+        },
+        "sources": {"decisions": total_events},
+        "caveats": caveats,
+        "entries": entries,
+    }
+
+
 def _attribute_from_plugin(
     *,
     pattern: str,
@@ -670,6 +942,9 @@ def _truncate(value: Any, width: int) -> str:
 def format_human(report: dict[str, Any]) -> str:
     """Render a compact table for interactive use."""
 
+    if report.get("version") == 2:
+        return _format_human_v2(report)
+
     start = report["date_range"]["start"]
     end = report["date_range"]["end"]
     filters = report["filters"]
@@ -703,22 +978,74 @@ def format_human(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_human_v2(report: dict[str, Any]) -> str:
+    start = report["date_range"]["start"]
+    end = report["date_range"]["end"]
+    filters = report["filters"]
+    agent_suffix = f", agent={filters['agent']}" if filters.get("agent") else ""
+    lines = [
+        f"Permission Audit: {start} to {end} (source=decisions, action={filters['action']}{agent_suffix})",
+        "",
+        " # | Permission | Action/Reply | Count | Agents | Patterns | Always",
+        "---|------------|--------------|-------|--------|----------|-------",
+    ]
+    for index, entry in enumerate(report["entries"], start=1):
+        agents = ", ".join("null" if agent is None else str(agent) for agent in entry["agents"])
+        patterns = ", ".join(entry.get("patterns", []))
+        always = ", ".join(entry.get("always", []))
+        lines.append(
+            f"{index:2d} | "
+            f"{_truncate(entry['permission'], 40)} | "
+            f"{entry['action']}/{entry['reply']} | "
+            f"{entry['count']:5d} | "
+            f"{agents} | "
+            f"{patterns} | "
+            f"{always}"
+        )
+    summary = report["summary"]
+    lines.extend(
+        [
+            "",
+            "Total: "
+            f"{summary['total_events']} events, "
+            f"allow={summary['allow_count']}, "
+            f"deny={summary['deny_count']}, "
+            f"unknown={summary['unknown_count']}, "
+            f"unique permissions={summary['unique_permissions']}",
+            f"Sources: decisions={report['sources']['decisions']}",
+            f"decisions.log present: {str(report['decisions_log_present']).lower()}",
+        ]
+    )
+    if report.get("caveats"):
+        lines.extend(["", "Caveats:"])
+        lines.extend(f"- {caveat}" for caveat in report["caveats"])
+    return "\n".join(lines)
+
+
 def _default_today() -> str:
     return date.today().isoformat()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Audit opencode permission prompts from local logs. opencode retains only about "
             "10 log files; pre-plugin agent attribution is not reliably recoverable; "
             "SQLite permission/event tables are empty in v1.15.13."
+        ),
+        epilog=(
+            "Output:\n"
+            "  JSON object with schema depending on --source. Decisions output is an interactive-prompt audit; "
+            "static allow and deny rules that never prompt are not captured — not a comprehensive policy audit."
         )
     )
     parser.add_argument("--start", default=_default_today(), help="Start date, YYYY-MM-DD (default: today)")
     parser.add_argument("--end", default=_default_today(), help="End date, YYYY-MM-DD (default: today)")
-    parser.add_argument("--action", choices=("ask", "deny", "all"), default="ask", help="Permission decision filter")
+    parser.add_argument("--source", choices=("decisions", "native"), default="decisions", help="Audit source (default: decisions)")
+    parser.add_argument("--action", choices=("ask", "allow", "deny", "all"), default=None, help="Permission decision filter")
     parser.add_argument("--agent", default=None, help="Agent name filter, case-insensitive")
+    parser.add_argument("--decisions-log", default=None, help="Override decisions.log path")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON (default)")
     output.add_argument("--human", action="store_true", help="Emit a human-readable table")
@@ -728,15 +1055,31 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    action = args.action if args.action is not None else ("ask" if args.source == "native" else "all")
+
+    if args.source == "native" and action == "allow":
+        parser.error("--source native does not support --action allow")
+    if args.source == "decisions" and action == "ask":
+        parser.error("--source decisions does not support --action ask")
 
     try:
-        report = audit_logs(
-            Path(os.environ.get("OPENCODE_LOG_DIR", "~/.local/share/opencode/log/")).expanduser(),
-            args.start,
-            args.end,
-            action_filter=args.action,
-            agent_filter=args.agent,
-        )
+        if args.source == "native":
+            report = audit_logs(
+                Path(os.environ.get("OPENCODE_LOG_DIR", "~/.local/share/opencode/log/")).expanduser(),
+                args.start,
+                args.end,
+                action_filter=action,
+                agent_filter=args.agent,
+            )
+        else:
+            decisions_path = args.decisions_log or os.environ.get("OPENCODE_DECISIONS_LOG") or DEFAULT_DECISIONS_LOG
+            report = audit_decisions(
+                decisions_path,
+                args.start,
+                args.end,
+                action_filter=action,
+                agent_filter=args.agent,
+            )
     except ValueError as exc:
         parser.error(str(exc))
 

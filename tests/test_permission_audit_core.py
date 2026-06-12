@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -131,6 +132,499 @@ class PermissionAuditParsingTest(unittest.TestCase):
 
 
 class PermissionAuditBehaviorTest(unittest.TestCase):
+    def test_decisions_source_maps_once_reply_to_allow_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            decisions_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T10:00:00.000Z",
+                        "sessionID": "ses_1",
+                        "callID": "call_1",
+                        "requestID": "req_1",
+                        "permission": "bash -lc pwd",
+                        "patterns": ["bash -lc pwd"],
+                        "always": ["bash -lc *"],
+                        "reply": "once",
+                        "askedTs": "2026-06-05T09:59:59.000Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
+
+        self.assertEqual(report["version"], 2)
+        self.assertEqual(report["source"], "decisions")
+        self.assertTrue(report["decisions_log_present"])
+        self.assertEqual(report["summary"]["total_events"], 1)
+        self.assertEqual(report["summary"]["allow_count"], 1)
+        self.assertEqual(report["summary"]["deny_count"], 0)
+        self.assertEqual(report["summary"]["unknown_count"], 0)
+        self.assertEqual(report["summary"]["unique_permissions"], 1)
+        self.assertEqual(report["sources"], {"decisions": 1})
+        self.assertEqual(report["entries"][0]["permission"], "bash -lc pwd")
+        self.assertEqual(report["entries"][0]["action"], "allow")
+        self.assertEqual(report["entries"][0]["reply"], "once")
+        self.assertEqual(report["entries"][0]["patterns"], ["bash -lc pwd"])
+        self.assertEqual(report["entries"][0]["always"], ["bash -lc *"])
+
+    def test_decisions_source_reads_committed_decisions_fixture(self) -> None:
+        decisions_path = FIXTURE_DIR / "decisions.log"
+
+        report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
+
+        self.assertTrue(report["decisions_log_present"])
+        self.assertEqual(report["summary"]["total_events"], 1)
+        self.assertEqual(report["summary"]["allow_count"], 1)
+        self.assertEqual(report["summary"]["deny_count"], 0)
+        self.assertEqual(report["summary"]["unknown_count"], 0)
+        self.assertEqual(report["sources"], {"decisions": 1})
+        self.assertEqual(len(report["entries"]), 1)
+        entry = report["entries"][0]
+        self.assertEqual(entry["permission"], "bash -lc pwd")
+        self.assertEqual(entry["action"], "allow")
+        self.assertEqual(entry["reply"], "once")
+        self.assertEqual(entry["patterns"], ["bash -lc pwd"])
+        self.assertEqual(entry["always"], ["bash -lc *"])
+
+    def test_decisions_aggregate_by_permission_and_reply_with_ordered_unions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            records = [
+                {
+                    "ts": "2026-06-05T10:00:00.000Z",
+                    "sessionID": "ses_1",
+                    "callID": "call_1",
+                    "requestID": "req_1",
+                    "permission": "bash -lc deploy",
+                    "patterns": ["bash *", "deploy"],
+                    "always": ["bash *"],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T09:59:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:01:00.000Z",
+                    "sessionID": "ses_2",
+                    "callID": "call_2",
+                    "requestID": "req_2",
+                    "permission": "bash -lc deploy",
+                    "patterns": ["deploy", "bash -lc deploy"],
+                    "always": ["bash *", "bash -lc *"],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T10:00:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:02:00.000Z",
+                    "sessionID": "ses_3",
+                    "callID": "call_3",
+                    "requestID": "req_3",
+                    "permission": "bash -lc deploy",
+                    "patterns": ["deploy"],
+                    "always": [],
+                    "reply": "always",
+                    "askedTs": "2026-06-05T10:01:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:03:00.000Z",
+                    "sessionID": "ses_4",
+                    "callID": "call_4",
+                    "requestID": "req_4",
+                    "permission": "bash -lc rm -rf /tmp/nope",
+                    "patterns": ["rm -rf *"],
+                    "always": [],
+                    "reply": "reject",
+                    "askedTs": "2026-06-05T10:02:59.000Z",
+                },
+            ]
+            decisions_path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+            report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
+
+        by_key = {(entry["permission"], entry["reply"]): entry for entry in report["entries"]}
+        self.assertEqual(by_key[("bash -lc deploy", "once")]["count"], 2)
+        self.assertEqual(by_key[("bash -lc deploy", "once")]["patterns"], ["bash *", "deploy", "bash -lc deploy"])
+        self.assertEqual(by_key[("bash -lc deploy", "once")]["always"], ["bash *", "bash -lc *"])
+        self.assertEqual(by_key[("bash -lc deploy", "always")]["action"], "allow")
+        self.assertEqual(by_key[("bash -lc rm -rf /tmp/nope", "reject")]["action"], "deny")
+        self.assertEqual(report["summary"]["total_events"], 4)
+        self.assertEqual(report["summary"]["allow_count"], 3)
+        self.assertEqual(report["summary"]["deny_count"], 1)
+        self.assertEqual(report["summary"]["unknown_count"], 0)
+        self.assertEqual(report["summary"]["unique_permissions"], 2)
+
+    def test_decisions_agent_join_uses_call_id_then_session_fallback_without_null_mass_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            plugin_path = Path(tmpdir) / "audit.log"
+            decisions = [
+                {
+                    "ts": "2026-06-05T10:00:00.000Z",
+                    "sessionID": "ses_direct",
+                    "callID": "call_direct",
+                    "requestID": "req_1",
+                    "permission": "direct",
+                    "patterns": [],
+                    "always": [],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T09:59:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:01:00.000Z",
+                    "sessionID": "ses_ambiguous_call",
+                    "callID": "call_ambiguous",
+                    "requestID": "req_2",
+                    "permission": "ambiguous-call",
+                    "patterns": [],
+                    "always": [],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T10:00:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:02:00.000Z",
+                    "sessionID": "ses_fallback",
+                    "callID": None,
+                    "requestID": "req_3",
+                    "permission": "session-fallback",
+                    "patterns": [],
+                    "always": [],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T10:01:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:03:00.000Z",
+                    "sessionID": "ses_ambiguous_session",
+                    "callID": "call_missing",
+                    "requestID": "req_4",
+                    "permission": "ambiguous-session",
+                    "patterns": [],
+                    "always": [],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T10:02:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:04:00.000Z",
+                    "sessionID": "ses_no_match",
+                    "callID": "call_no_match",
+                    "requestID": "req_5",
+                    "permission": "no-match",
+                    "patterns": [],
+                    "always": [],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T10:03:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:05:00.000Z",
+                    "sessionID": "ses_null_guard",
+                    "callID": None,
+                    "requestID": "req_6",
+                    "permission": "null-guard",
+                    "patterns": [],
+                    "always": [],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T10:04:59.000Z",
+                },
+            ]
+            plugin_records = [
+                {"ts": "2026-06-05T10:00:00.000Z", "sessionID": "ses_direct", "agent": "aragorn", "callID": "call_direct", "command_node_text": "direct"},
+                {"ts": "2026-06-05T10:01:00.000Z", "sessionID": "ses_ambiguous_call", "agent": "gandalf", "callID": "call_ambiguous", "command_node_text": "ambiguous-call-a"},
+                {"ts": "2026-06-05T10:01:00.100Z", "sessionID": "ses_ambiguous_call", "agent": "legolas", "callID": "call_ambiguous", "command_node_text": "ambiguous-call-b"},
+                {"ts": "2026-06-05T10:02:00.000Z", "sessionID": "ses_fallback", "agent": "radagast", "callID": "call_other", "command_node_text": "session-fallback"},
+                {"ts": "2026-06-05T10:03:00.000Z", "sessionID": "ses_ambiguous_session", "agent": "gandalf", "callID": "call_a", "command_node_text": "ambiguous-session-a"},
+                {"ts": "2026-06-05T10:03:00.100Z", "sessionID": "ses_ambiguous_session", "agent": "saruman", "callID": "call_b", "command_node_text": "ambiguous-session-b"},
+                {"ts": "2026-06-05T10:05:00.000Z", "sessionID": "ses_other", "agent": "wrong", "callID": None, "command_node_text": "null-guard"},
+            ]
+            decisions_path.write_text("\n".join(json.dumps(record) for record in decisions) + "\n", encoding="utf-8")
+            plugin_path.write_text("\n".join(json.dumps(record) for record in plugin_records) + "\n", encoding="utf-8")
+
+            report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=plugin_path)
+
+        agents = {entry["permission"]: entry["agents"] for entry in report["entries"]}
+        self.assertEqual(agents["direct"], ["aragorn"])
+        self.assertEqual(agents["ambiguous-call"], ["ambiguous"])
+        self.assertEqual(agents["session-fallback"], ["radagast"])
+        self.assertEqual(agents["ambiguous-session"], ["unknown"])
+        self.assertEqual(agents["no-match"], ["unknown (no audit match)"])
+        self.assertEqual(agents["null-guard"], ["unknown (no audit match)"])
+
+    def test_decisions_action_filter_counts_post_filter_and_preserves_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            records = [
+                {"ts": "2026-06-05T10:00:00.000Z", "sessionID": "ses_1", "callID": "call_1", "requestID": "req_1", "permission": "allow-once", "patterns": [], "always": [], "reply": "once", "askedTs": "2026-06-05T09:59:59.000Z"},
+                {"ts": "2026-06-05T10:01:00.000Z", "sessionID": "ses_2", "callID": "call_2", "requestID": "req_2", "permission": "allow-always", "patterns": [], "always": [], "reply": "always", "askedTs": "2026-06-05T10:00:59.000Z"},
+                {"ts": "2026-06-05T10:02:00.000Z", "sessionID": "ses_3", "callID": "call_3", "requestID": "req_3", "permission": "deny", "patterns": [], "always": [], "reply": "reject", "askedTs": "2026-06-05T10:01:59.000Z"},
+                {"ts": "2026-06-05T10:03:00.000Z", "sessionID": "ses_4", "callID": "call_4", "requestID": "req_4", "permission": "mystery", "patterns": [], "always": [], "reply": "later", "askedTs": "2026-06-05T10:02:59.000Z"},
+            ]
+            decisions_path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+            allow_report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", action_filter="allow", plugin_log_path=None)
+            with contextlib.redirect_stderr(io.StringIO()):
+                deny_report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", action_filter="deny", plugin_log_path=None)
+            all_report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", action_filter="all", plugin_log_path=None)
+
+        self.assertEqual({entry["action"] for entry in allow_report["entries"]}, {"allow"})
+        self.assertEqual(allow_report["summary"]["total_events"], 2)
+        self.assertEqual(deny_report["summary"]["total_events"], 1)
+        self.assertEqual(deny_report["summary"]["deny_count"], 1)
+        self.assertEqual(all_report["summary"], {"total_events": 4, "allow_count": 2, "deny_count": 1, "unknown_count": 1, "unique_permissions": 4})
+        self.assertEqual(
+            all_report["summary"]["total_events"],
+            all_report["summary"]["allow_count"] + all_report["summary"]["deny_count"] + all_report["summary"]["unknown_count"],
+        )
+
+    def test_decisions_absent_file_differs_from_present_empty_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_path = Path(tmpdir) / "missing-decisions.log"
+            present_path = Path(tmpdir) / "decisions.log"
+            present_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-04T10:00:00.000Z",
+                        "sessionID": "ses_1",
+                        "callID": "call_1",
+                        "requestID": "req_1",
+                        "permission": "outside range",
+                        "patterns": [],
+                        "always": [],
+                        "reply": "once",
+                        "askedTs": "2026-06-04T09:59:59.000Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                missing_report = core.audit_decisions(missing_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
+            present_report = core.audit_decisions(present_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
+
+        self.assertFalse(missing_report["decisions_log_present"])
+        self.assertIn(core.MISSING_DECISIONS_CAVEAT, missing_report["caveats"])
+        self.assertIn(core.MISSING_DECISIONS_CAVEAT, stderr.getvalue())
+        self.assertEqual(missing_report["sources"], {"decisions": 0})
+        self.assertTrue(present_report["decisions_log_present"])
+        self.assertNotIn(core.MISSING_DECISIONS_CAVEAT, present_report["caveats"])
+        self.assertEqual(present_report["sources"], {"decisions": 0})
+
+    def test_decisions_drift_records_are_kept_or_caveated_without_silent_drop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            lines = [
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T10:00:00.000Z",
+                        "sessionID": "ses_1",
+                        "callID": 123,
+                        "requestID": "req_1",
+                        "patterns": "not-array",
+                        "always": {"not": "array"},
+                        "reply": "later",
+                        "askedTs": "2026-06-05T09:59:59.000Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "ts": "not-a-date",
+                        "sessionID": "ses_2",
+                        "callID": "call_2",
+                        "requestID": "req_2",
+                        "permission": "undated",
+                        "patterns": [],
+                        "always": [],
+                        "reply": "once",
+                        "askedTs": "2026-06-05T09:59:59.000Z",
+                    }
+                ),
+                "{not-json",
+            ]
+            decisions_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
+
+        self.assertIn("skipping malformed decisions JSON", stderr.getvalue())
+        self.assertEqual(report["summary"]["total_events"], 1)
+        self.assertEqual(report["summary"]["unknown_count"], 1)
+        entry = report["entries"][0]
+        self.assertEqual(entry["permission"], "(missing permission)")
+        self.assertEqual(entry["action"], "unknown")
+        self.assertEqual(entry["patterns"], [])
+        self.assertEqual(entry["always"], [])
+        self.assertIn("unknown decisions reply values were kept as action=unknown", report["caveats"])
+        self.assertIn('missing permission fields were kept as "(missing permission)"', report["caveats"])
+        self.assertIn("1 decisions records had unparseable ts values and were excluded from date-filtered counts", report["caveats"])
+
+    def test_decisions_action_filter_suppresses_filtered_out_drift_caveats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            decisions_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T10:00:00.000Z",
+                        "sessionID": "ses_1",
+                        "callID": "call_1",
+                        "requestID": "req_1",
+                        "patterns": [],
+                        "always": [],
+                        "reply": "later",
+                        "askedTs": "2026-06-05T09:59:59.000Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = core.audit_decisions(
+                decisions_path,
+                "2026-06-05",
+                "2026-06-05",
+                action_filter="allow",
+                plugin_log_path=None,
+            )
+
+        self.assertEqual(report["summary"]["total_events"], 0)
+        self.assertEqual(report["summary"]["unknown_count"], 0)
+        self.assertNotIn("unknown decisions reply values were kept as action=unknown", report["caveats"])
+        self.assertNotIn('missing permission fields were kept as "(missing permission)"', report["caveats"])
+
+    def test_human_output_formats_v2_decisions_report_without_v1_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            decisions_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T10:00:00.000Z",
+                        "sessionID": "ses_1",
+                        "callID": "call_1",
+                        "requestID": "req_1",
+                        "permission": "bash -lc pwd",
+                        "patterns": ["bash -lc pwd"],
+                        "always": ["bash -lc *"],
+                        "reply": "reject",
+                        "askedTs": "2026-06-05T09:59:59.000Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", action_filter="deny", plugin_log_path=None)
+
+        human = core.format_human(report)
+
+        self.assertIn("Permission Audit: 2026-06-05 to 2026-06-05 (source=decisions, action=deny)", human)
+        self.assertIn("Permission | Action/Reply", human)
+        self.assertIn("bash -lc pwd", human)
+        self.assertIn("deny/reject", human)
+        self.assertIn("allow=0, deny=1, unknown=0, unique permissions=1", human)
+        self.assertIn(core.STATIC_BLINDNESS_CAVEAT, human)
+        self.assertIn(core.DENY_STATIC_BLINDNESS_WARNING, human)
+
+    def test_main_dispatches_decisions_source_and_rejects_source_action_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            decisions_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T10:00:00.000Z",
+                        "sessionID": "ses_1",
+                        "callID": "call_1",
+                        "requestID": "req_1",
+                        "permission": "bash -lc pwd",
+                        "patterns": [],
+                        "always": [],
+                        "reply": "once",
+                        "askedTs": "2026-06-05T09:59:59.000Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = core.main([
+                    "--start",
+                    "2026-06-05",
+                    "--end",
+                    "2026-06-05",
+                    "--source",
+                    "decisions",
+                    "--action",
+                    "all",
+                    "--decisions-log",
+                    str(decisions_path),
+                    "--json",
+                ])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["source"], "decisions")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as decisions_ask:
+                core.main(["--source", "decisions", "--action", "ask"])
+        self.assertEqual(decisions_ask.exception.code, 2)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as native_allow:
+                core.main(["--source", "native", "--action", "allow"])
+        self.assertEqual(native_allow.exception.code, 2)
+
+    def test_python_help_discloses_decisions_static_blindness(self) -> None:
+        help_text = core.build_parser().format_help()
+
+        self.assertIn(
+            "Decisions output is an interactive-prompt audit; static allow and deny rules that never prompt are not captured — not a comprehensive policy audit.",
+            help_text,
+        )
+
+    def test_xdg_data_home_controls_decisions_and_plugin_audit_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            previous = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = tmpdir
+            try:
+                self.assertEqual(
+                    core._default_decisions_log(),
+                    Path(tmpdir) / "opencode" / "permission-audit-plugin" / "decisions.log",
+                )
+                self.assertEqual(
+                    core._default_plugin_audit_log(),
+                    Path(tmpdir) / "opencode" / "permission-audit-plugin" / "audit.log",
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                else:
+                    os.environ["XDG_DATA_HOME"] = previous
+
+    def test_decisions_date_filter_uses_reply_ts_not_asked_ts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            decisions_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-05T00:00:01.000Z",
+                        "sessionID": "ses_1",
+                        "callID": "call_1",
+                        "requestID": "req_1",
+                        "permission": "reply in range",
+                        "patterns": [],
+                        "always": [],
+                        "reply": "once",
+                        "askedTs": "2026-06-04T23:59:59.000Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
+
+        self.assertEqual(report["summary"]["total_events"], 1)
+        self.assertEqual(report["entries"][0]["first_seen"], "2026-06-05T00:00:01.000Z")
+
     def test_asking_events_report_prompt_and_pattern_counts_separately(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "2026-06-05T100000.log"

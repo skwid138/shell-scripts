@@ -33,7 +33,7 @@ make_path_without_python3() {
   run "$SCRIPT" --help
   assert_success
   assert_output --partial "Usage: permission-audit"
-  assert_output --partial "--action ask|deny|all"
+  assert_output --partial "--action allow|deny|all"
 }
 
 @test "permission-audit: missing python3 exits 3" {
@@ -56,5 +56,26 @@ make_path_without_python3() {
   run env PATH="$STUBDIR:$PATH" PERMISSION_AUDIT_TODAY=2026-05-21 "$SCRIPT"
   assert_success
   assert_output --partial "core=$BATS_TEST_DIRNAME/../agent/permission_audit_core.py"
-  assert_output --partial "args=--start 2026-05-21 --end 2026-05-21 --action ask --json"
+  assert_output --partial "args=--start 2026-05-21 --end 2026-05-21 --source decisions --action all --json"
+}
+
+@test "permission-audit: invalid source exits 2" {
+  run "$SCRIPT" --source nowhere
+  assert_failure 2
+  assert_output --partial "Usage error"
+  assert_output --partial "Invalid --source"
+}
+
+@test "permission-audit: native source rejects allow action" {
+  run "$SCRIPT" --source native --action allow
+  assert_failure 2
+  assert_output --partial "Usage error"
+  assert_output --partial "source native"
+}
+
+@test "permission-audit: decisions source rejects ask action" {
+  run "$SCRIPT" --source decisions --action ask
+  assert_failure 2
+  assert_output --partial "Usage error"
+  assert_output --partial "source decisions"
 }
