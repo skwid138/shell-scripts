@@ -132,6 +132,15 @@ class PermissionAuditParsingTest(unittest.TestCase):
 
 
 class PermissionAuditBehaviorTest(unittest.TestCase):
+    def _write_decisions(self, path: Path, records: list[dict[str, object]]) -> None:
+        path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+    def _by_rule_key(self, report: dict[str, object]) -> dict[tuple[str, str], dict[str, object]]:
+        return {(entry["permission"], entry["glob"]): entry for entry in report["rules"]}  # type: ignore[index]
+
+    def _by_invocation_permission(self, report: dict[str, object]) -> dict[str, dict[str, object]]:
+        return {entry["permission"]: entry for entry in report["invocations"]}  # type: ignore[index]
+
     def test_decisions_source_maps_once_reply_to_allow_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             decisions_path = Path(tmpdir) / "decisions.log"
@@ -142,7 +151,7 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
                         "sessionID": "ses_1",
                         "callID": "call_1",
                         "requestID": "req_1",
-                        "permission": "bash -lc pwd",
+                        "permission": "bash",
                         "patterns": ["bash -lc pwd"],
                         "always": ["bash -lc *"],
                         "reply": "once",
@@ -155,20 +164,29 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
 
             report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
 
-        self.assertEqual(report["version"], 2)
+        self.assertEqual(report["version"], 3)
         self.assertEqual(report["source"], "decisions")
         self.assertTrue(report["decisions_log_present"])
         self.assertEqual(report["summary"]["total_events"], 1)
         self.assertEqual(report["summary"]["allow_count"], 1)
         self.assertEqual(report["summary"]["deny_count"], 0)
         self.assertEqual(report["summary"]["unknown_count"], 0)
-        self.assertEqual(report["summary"]["unique_permissions"], 1)
+        self.assertEqual(report["summary"]["unique_rules"], 1)
+        self.assertEqual(report["summary"]["unique_invocations"], 1)
+        self.assertEqual(report["summary"]["self_logged_excluded"], 0)
+        self.assertNotIn("unique_permissions", report["summary"])
         self.assertEqual(report["sources"], {"decisions": 1})
-        self.assertEqual(report["entries"][0]["permission"], "bash -lc pwd")
-        self.assertEqual(report["entries"][0]["action"], "allow")
-        self.assertEqual(report["entries"][0]["reply"], "once")
-        self.assertEqual(report["entries"][0]["patterns"], ["bash -lc pwd"])
-        self.assertEqual(report["entries"][0]["always"], ["bash -lc *"])
+        self.assertEqual(report["filters"]["exclude_self"], False)
+        self.assertEqual(report["rules"][0]["permission"], "bash")
+        self.assertEqual(report["rules"][0]["glob"], "bash -lc *")
+        self.assertEqual(report["rules"][0]["count"], 1)
+        self.assertEqual(report["rules"][0]["reply_breakdown"], {"once": 1})
+        self.assertEqual(report["rules"][0]["actions"], {"allow": 1, "deny": 0, "unknown": 0})
+        self.assertEqual(report["invocations"][0]["permission"], "bash")
+        self.assertEqual(report["invocations"][0]["action"], "allow")
+        self.assertEqual(report["invocations"][0]["reply"], "once")
+        self.assertEqual(report["invocations"][0]["patterns"], ["bash -lc pwd"])
+        self.assertEqual(report["invocations"][0]["always"], ["bash -lc *"])
 
     def test_decisions_source_reads_committed_decisions_fixture(self) -> None:
         decisions_path = FIXTURE_DIR / "decisions.log"
@@ -181,15 +199,20 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
         self.assertEqual(report["summary"]["deny_count"], 0)
         self.assertEqual(report["summary"]["unknown_count"], 0)
         self.assertEqual(report["sources"], {"decisions": 1})
-        self.assertEqual(len(report["entries"]), 1)
-        entry = report["entries"][0]
-        self.assertEqual(entry["permission"], "bash -lc pwd")
+        self.assertEqual(len(report["rules"]), 1)
+        self.assertEqual(len(report["invocations"]), 1)
+        rule = report["rules"][0]
+        entry = report["invocations"][0]
+        self.assertEqual(rule["permission"], "bash")
+        self.assertEqual(rule["glob"], "bash -lc *")
+        self.assertEqual(rule["count"], 1)
+        self.assertEqual(entry["permission"], "bash")
         self.assertEqual(entry["action"], "allow")
         self.assertEqual(entry["reply"], "once")
         self.assertEqual(entry["patterns"], ["bash -lc pwd"])
         self.assertEqual(entry["always"], ["bash -lc *"])
 
-    def test_decisions_aggregate_by_permission_and_reply_with_ordered_unions(self) -> None:
+    def test_decisions_aggregate_rules_by_permission_and_glob_and_invocations_by_patterns_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             decisions_path = Path(tmpdir) / "decisions.log"
             records = [
@@ -198,9 +221,9 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
                     "sessionID": "ses_1",
                     "callID": "call_1",
                     "requestID": "req_1",
-                    "permission": "bash -lc deploy",
+                    "permission": "bash",
                     "patterns": ["bash *", "deploy"],
-                    "always": ["bash *"],
+                    "always": ["bash *", "bash *"],
                     "reply": "once",
                     "askedTs": "2026-06-05T09:59:59.000Z",
                 },
@@ -209,7 +232,7 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
                     "sessionID": "ses_2",
                     "callID": "call_2",
                     "requestID": "req_2",
-                    "permission": "bash -lc deploy",
+                    "permission": "bash",
                     "patterns": ["deploy", "bash -lc deploy"],
                     "always": ["bash *", "bash -lc *"],
                     "reply": "once",
@@ -220,7 +243,7 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
                     "sessionID": "ses_3",
                     "callID": "call_3",
                     "requestID": "req_3",
-                    "permission": "bash -lc deploy",
+                    "permission": "bash",
                     "patterns": ["deploy"],
                     "always": [],
                     "reply": "always",
@@ -231,28 +254,95 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
                     "sessionID": "ses_4",
                     "callID": "call_4",
                     "requestID": "req_4",
-                    "permission": "bash -lc rm -rf /tmp/nope",
+                    "permission": "bash",
                     "patterns": ["rm -rf *"],
                     "always": [],
                     "reply": "reject",
                     "askedTs": "2026-06-05T10:02:59.000Z",
                 },
+                {
+                    "ts": "2026-06-05T10:04:00.000Z",
+                    "sessionID": "ses_5",
+                    "callID": "call_5",
+                    "requestID": "req_5",
+                    "permission": "edit",
+                    "patterns": ["deploy"],
+                    "always": ["bash *"],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T10:03:59.000Z",
+                },
             ]
-            decisions_path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+            self._write_decisions(decisions_path, records)
 
             report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
 
-        by_key = {(entry["permission"], entry["reply"]): entry for entry in report["entries"]}
-        self.assertEqual(by_key[("bash -lc deploy", "once")]["count"], 2)
-        self.assertEqual(by_key[("bash -lc deploy", "once")]["patterns"], ["bash *", "deploy", "bash -lc deploy"])
-        self.assertEqual(by_key[("bash -lc deploy", "once")]["always"], ["bash *", "bash -lc *"])
-        self.assertEqual(by_key[("bash -lc deploy", "always")]["action"], "allow")
-        self.assertEqual(by_key[("bash -lc rm -rf /tmp/nope", "reject")]["action"], "deny")
-        self.assertEqual(report["summary"]["total_events"], 4)
-        self.assertEqual(report["summary"]["allow_count"], 3)
+        rules = self._by_rule_key(report)
+        self.assertEqual(set(rules), {("bash", "bash *"), ("bash", "bash -lc *"), ("edit", "bash *")})
+        self.assertEqual(rules[("bash", "bash *")]["count"], 2)
+        self.assertEqual(rules[("bash", "bash *")]["reply_breakdown"], {"once": 2})
+        self.assertEqual(rules[("bash", "bash *")]["actions"], {"allow": 2, "deny": 0, "unknown": 0})
+        self.assertEqual(rules[("bash", "bash *")]["session_ids"], ["ses_1", "ses_2"])
+        self.assertEqual(rules[("bash", "bash *")]["first_seen"], "2026-06-05T10:00:00.000Z")
+        self.assertEqual(rules[("bash", "bash *")]["last_seen"], "2026-06-05T10:01:00.000Z")
+        self.assertEqual(rules[("bash", "bash -lc *")]["count"], 1)
+        self.assertEqual(rules[("edit", "bash *")]["count"], 1)
+        self.assertEqual([entry["count"] for entry in report["invocations"]], [1, 1, 1, 1, 1])
+        invocation_keys = {(entry["permission"], tuple(entry["patterns"]), entry["reply"]) for entry in report["invocations"]}
+        self.assertIn(("bash", ("rm -rf *",), "reject"), invocation_keys)
+        self.assertEqual(report["summary"]["total_events"], 5)
+        self.assertEqual(report["summary"]["allow_count"], 4)
         self.assertEqual(report["summary"]["deny_count"], 1)
         self.assertEqual(report["summary"]["unknown_count"], 0)
-        self.assertEqual(report["summary"]["unique_permissions"], 2)
+        self.assertEqual(report["summary"]["unique_rules"], 3)
+        self.assertEqual(report["summary"]["unique_invocations"], 5)
+
+    def test_decisions_invocations_merge_always_union_for_identical_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            plugin_path = Path(tmpdir) / "audit.log"
+            records = [
+                {
+                    "ts": "2026-06-05T10:00:00.000Z",
+                    "sessionID": "ses_1",
+                    "callID": "call_1",
+                    "requestID": "req_1",
+                    "permission": "bash",
+                    "patterns": ["echo target"],
+                    "always": ["echo *", "cat *"],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T09:59:59.000Z",
+                },
+                {
+                    "ts": "2026-06-05T10:01:00.000Z",
+                    "sessionID": "ses_2",
+                    "callID": "call_2",
+                    "requestID": "req_2",
+                    "permission": "bash",
+                    "patterns": ["echo target"],
+                    "always": ["head *", "echo *", "tail *"],
+                    "reply": "once",
+                    "askedTs": "2026-06-05T10:00:59.000Z",
+                },
+            ]
+            plugin_records = [
+                {"ts": "2026-06-05T10:00:00.000Z", "sessionID": "ses_1", "agent": "aragorn", "callID": "call_1", "command_node_text": "echo target"},
+                {"ts": "2026-06-05T10:01:00.000Z", "sessionID": "ses_2", "agent": "legolas", "callID": "call_2", "command_node_text": "echo target"},
+            ]
+            self._write_decisions(decisions_path, records)
+            plugin_path.write_text("\n".join(json.dumps(record) for record in plugin_records) + "\n", encoding="utf-8")
+
+            report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=plugin_path)
+
+        self.assertEqual(report["summary"]["unique_invocations"], 1)
+        self.assertEqual(len(report["invocations"]), 1)
+        invocation = report["invocations"][0]
+        self.assertEqual(invocation["permission"], "bash")
+        self.assertEqual(invocation["patterns"], ["echo target"])
+        self.assertEqual(invocation["reply"], "once")
+        self.assertEqual(invocation["count"], 2)
+        self.assertEqual(invocation["always"], ["echo *", "cat *", "head *", "tail *"])
+        self.assertEqual(invocation["agents"], ["aragorn", "legolas"])
+        self.assertEqual(invocation["session_ids"], ["ses_1", "ses_2"])
 
     def test_decisions_agent_join_uses_call_id_then_session_fallback_without_null_mass_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -340,7 +430,8 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
 
             report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=plugin_path)
 
-        agents = {entry["permission"]: entry["agents"] for entry in report["entries"]}
+        self.assertEqual(len(report["invocations"]), 6)
+        agents = {entry["permission"]: entry["agents"] for entry in report["invocations"]}
         self.assertEqual(agents["direct"], ["aragorn"])
         self.assertEqual(agents["ambiguous-call"], ["ambiguous"])
         self.assertEqual(agents["session-fallback"], ["radagast"])
@@ -364,11 +455,22 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
                 deny_report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", action_filter="deny", plugin_log_path=None)
             all_report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", action_filter="all", plugin_log_path=None)
 
-        self.assertEqual({entry["action"] for entry in allow_report["entries"]}, {"allow"})
+        self.assertEqual({entry["action"] for entry in allow_report["invocations"]}, {"allow"})
         self.assertEqual(allow_report["summary"]["total_events"], 2)
         self.assertEqual(deny_report["summary"]["total_events"], 1)
         self.assertEqual(deny_report["summary"]["deny_count"], 1)
-        self.assertEqual(all_report["summary"], {"total_events": 4, "allow_count": 2, "deny_count": 1, "unknown_count": 1, "unique_permissions": 4})
+        self.assertEqual(
+            all_report["summary"],
+            {
+                "total_events": 4,
+                "allow_count": 2,
+                "deny_count": 1,
+                "unknown_count": 1,
+                "unique_rules": 0,
+                "unique_invocations": 4,
+                "self_logged_excluded": 0,
+            },
+        )
         self.assertEqual(
             all_report["summary"]["total_events"],
             all_report["summary"]["allow_count"] + all_report["summary"]["deny_count"] + all_report["summary"]["unknown_count"],
@@ -447,7 +549,8 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
         self.assertIn("skipping malformed decisions JSON", stderr.getvalue())
         self.assertEqual(report["summary"]["total_events"], 1)
         self.assertEqual(report["summary"]["unknown_count"], 1)
-        entry = report["entries"][0]
+        self.assertEqual(report["rules"], [])
+        entry = report["invocations"][0]
         self.assertEqual(entry["permission"], "(missing permission)")
         self.assertEqual(entry["action"], "unknown")
         self.assertEqual(entry["patterns"], [])
@@ -489,7 +592,7 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
         self.assertNotIn("unknown decisions reply values were kept as action=unknown", report["caveats"])
         self.assertNotIn('missing permission fields were kept as "(missing permission)"', report["caveats"])
 
-    def test_human_output_formats_v2_decisions_report_without_v1_keys(self) -> None:
+    def test_human_output_formats_v3_decisions_report_without_v1_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             decisions_path = Path(tmpdir) / "decisions.log"
             decisions_path.write_text(
@@ -499,7 +602,7 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
                         "sessionID": "ses_1",
                         "callID": "call_1",
                         "requestID": "req_1",
-                        "permission": "bash -lc pwd",
+                        "permission": "bash",
                         "patterns": ["bash -lc pwd"],
                         "always": ["bash -lc *"],
                         "reply": "reject",
@@ -515,10 +618,13 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
         human = core.format_human(report)
 
         self.assertIn("Permission Audit: 2026-06-05 to 2026-06-05 (source=decisions, action=deny)", human)
-        self.assertIn("Permission | Action/Reply", human)
+        self.assertIn("Rules", human)
+        self.assertIn("Permission | Glob | Count | Replies | Actions | Agents | First | Last", human)
+        self.assertIn("Invocations", human)
+        self.assertIn("Permission | Patterns | Always | Action | Reply | Count | Agents | First | Last", human)
         self.assertIn("bash -lc pwd", human)
-        self.assertIn("deny/reject", human)
-        self.assertIn("allow=0, deny=1, unknown=0, unique permissions=1", human)
+        self.assertIn("reject", human)
+        self.assertIn("allow=0, deny=1, unknown=0, unique rules=1, unique invocations=1", human)
         self.assertIn(core.STATIC_BLINDNESS_CAVEAT, human)
         self.assertIn(core.DENY_STATIC_BLINDNESS_WARNING, human)
 
@@ -532,7 +638,7 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
                         "sessionID": "ses_1",
                         "callID": "call_1",
                         "requestID": "req_1",
-                        "permission": "bash -lc pwd",
+                        "permission": "bash",
                         "patterns": [],
                         "always": [],
                         "reply": "once",
@@ -561,7 +667,7 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(status, 0)
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], 3)
         self.assertEqual(payload["source"], "decisions")
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as decisions_ask:
@@ -623,7 +729,135 @@ class PermissionAuditBehaviorTest(unittest.TestCase):
             report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
 
         self.assertEqual(report["summary"]["total_events"], 1)
-        self.assertEqual(report["entries"][0]["first_seen"], "2026-06-05T00:00:01.000Z")
+        self.assertEqual(report["invocations"][0]["first_seen"], "2026-06-05T00:00:01.000Z")
+
+    def test_decisions_exclude_self_counts_date_scoped_records_before_action_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            records = [
+                {"ts": "2026-06-04T10:00:00.000Z", "sessionID": "ses_old", "callID": "call_old", "requestID": "req_old", "permission": "bash", "patterns": ["permission-audit.sh --json"], "always": [], "reply": "reject", "askedTs": "2026-06-04T09:59:59.000Z"},
+                {"ts": "2026-06-05T10:00:00.000Z", "sessionID": "ses_self", "callID": "call_self", "requestID": "req_self", "permission": "bash", "patterns": ["permission-audit.sh --json"], "always": [], "reply": "reject", "askedTs": "2026-06-05T09:59:59.000Z"},
+                {"ts": "2026-06-05T10:01:00.000Z", "sessionID": "ses_keep", "callID": "call_keep", "requestID": "req_keep", "permission": "bash", "patterns": ["date +%F"], "always": [], "reply": "once", "askedTs": "2026-06-05T10:00:59.000Z"},
+            ]
+            self._write_decisions(decisions_path, records)
+
+            report = core.audit_decisions(
+                decisions_path,
+                "2026-06-05",
+                "2026-06-05",
+                action_filter="allow",
+                exclude_self=True,
+                plugin_log_path=None,
+            )
+
+        self.assertEqual(report["filters"]["exclude_self"], True)
+        self.assertEqual(report["summary"]["self_logged_excluded"], 1)
+        self.assertEqual(report["summary"]["total_events"], 1)
+        self.assertEqual(report["summary"]["allow_count"], 1)
+        self.assertEqual([entry["patterns"] for entry in report["invocations"]], [["date +%F"]])
+        self.assertTrue(any("self-referential" in caveat for caveat in report["caveats"]))
+
+    def test_decisions_exclude_self_counts_before_agent_filter_without_double_counting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            plugin_path = Path(tmpdir) / "audit.log"
+            records = [
+                {"ts": "2026-06-05T10:00:00.000Z", "sessionID": "ses_self", "callID": "call_self", "requestID": "req_self", "permission": "bash", "patterns": ["python3 agent/permission_audit_core.py"], "always": [], "reply": "once", "askedTs": "2026-06-05T09:59:59.000Z"},
+                {"ts": "2026-06-05T10:01:00.000Z", "sessionID": "ses_keep", "callID": "call_keep", "requestID": "req_keep", "permission": "bash", "patterns": ["pwd"], "always": [], "reply": "once", "askedTs": "2026-06-05T10:00:59.000Z"},
+            ]
+            plugin_records = [
+                {"ts": "2026-06-05T10:00:00.000Z", "sessionID": "ses_self", "agent": "legolas", "callID": "call_self", "command_node_text": "self"},
+                {"ts": "2026-06-05T10:01:00.000Z", "sessionID": "ses_keep", "agent": "aragorn", "callID": "call_keep", "command_node_text": "keep"},
+            ]
+            self._write_decisions(decisions_path, records)
+            plugin_path.write_text("\n".join(json.dumps(record) for record in plugin_records) + "\n", encoding="utf-8")
+
+            report = core.audit_decisions(
+                decisions_path,
+                "2026-06-05",
+                "2026-06-05",
+                agent_filter="ARAGORN",
+                exclude_self=True,
+                plugin_log_path=plugin_path,
+            )
+
+        self.assertEqual(report["summary"]["self_logged_excluded"], 1)
+        self.assertEqual(report["summary"]["total_events"], 1)
+        self.assertEqual(report["invocations"][0]["agents"], ["aragorn"])
+        self.assertEqual(report["invocations"][0]["patterns"], ["pwd"])
+
+    def test_main_exposes_exclude_self_filter_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            self._write_decisions(
+                decisions_path,
+                [
+                    {"ts": "2026-06-05T10:00:00.000Z", "sessionID": "ses_self", "callID": "call_self", "requestID": "req_self", "permission": "bash", "patterns": ["permission-audit.sh --json"], "always": [], "reply": "once", "askedTs": "2026-06-05T09:59:59.000Z"},
+                ],
+            )
+
+            default_stdout = io.StringIO()
+            with contextlib.redirect_stdout(default_stdout):
+                default_status = core.main(["--start", "2026-06-05", "--end", "2026-06-05", "--source", "decisions", "--decisions-log", str(decisions_path), "--json"])
+            excluded_stdout = io.StringIO()
+            with contextlib.redirect_stdout(excluded_stdout):
+                excluded_status = core.main(["--start", "2026-06-05", "--end", "2026-06-05", "--source", "decisions", "--decisions-log", str(decisions_path), "--exclude-self", "--json"])
+
+        default_payload = json.loads(default_stdout.getvalue())
+        excluded_payload = json.loads(excluded_stdout.getvalue())
+        self.assertEqual(default_status, 0)
+        self.assertEqual(excluded_status, 0)
+        self.assertEqual(default_payload["filters"]["exclude_self"], False)
+        self.assertEqual(default_payload["summary"]["self_logged_excluded"], 0)
+        self.assertEqual(excluded_payload["filters"]["exclude_self"], True)
+        self.assertEqual(excluded_payload["summary"]["self_logged_excluded"], 1)
+
+    def test_human_output_prints_empty_rules_table_when_only_invocations_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decisions_path = Path(tmpdir) / "decisions.log"
+            self._write_decisions(
+                decisions_path,
+                [
+                    {"ts": "2026-06-05T10:00:00.000Z", "sessionID": "ses_1", "callID": "call_1", "requestID": "req_1", "permission": "bash", "patterns": ["pwd"], "always": [], "reply": "once", "askedTs": "2026-06-05T09:59:59.000Z"},
+                ],
+            )
+            report = core.audit_decisions(decisions_path, "2026-06-05", "2026-06-05", plugin_log_path=None)
+
+        human = core.format_human(report)
+
+        self.assertIn("Rules", human)
+        self.assertIn("Permission | Glob | Count | Replies | Actions | Agents | First | Last", human)
+        self.assertIn("(none)", human)
+        self.assertIn("Invocations", human)
+        self.assertIn("pwd", human)
+
+    def test_format_human_routes_version_3_to_decisions_renderer_not_v1(self) -> None:
+        report = {
+            "version": 3,
+            "date_range": {"start": "2026-06-05", "end": "2026-06-05"},
+            "filters": {"action": "all", "agent": None, "exclude_self": False},
+            "source": "decisions",
+            "decisions_log_present": True,
+            "summary": {
+                "total_events": 0,
+                "allow_count": 0,
+                "deny_count": 0,
+                "unknown_count": 0,
+                "unique_rules": 0,
+                "unique_invocations": 0,
+                "self_logged_excluded": 0,
+            },
+            "sources": {"decisions": 0},
+            "caveats": [],
+            "rules": [],
+            "invocations": [],
+        }
+
+        human = core.format_human(report)
+
+        self.assertIn("Rules", human)
+        self.assertIn("Invocations", human)
+        self.assertEqual(human.count("(none)"), 2)
 
     def test_asking_events_report_prompt_and_pattern_counts_separately(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

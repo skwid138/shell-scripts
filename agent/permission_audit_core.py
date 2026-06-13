@@ -71,6 +71,12 @@ MISSING_DECISIONS_CAVEAT = (
     "run its build and restart opencode"
 )
 DENY_STATIC_BLINDNESS_WARNING = "static deny-rule auto-blocks are not captured by the decisions source"
+SELF_AUDIT_EXCLUSION_CAVEAT = (
+    "self-referential permission-audit records were excluded by --exclude-self; "
+    "matching is a simple substring check for permission-audit.sh or permission_audit_core in patterns[]/always[] "
+    "without path, alias, casing, or symlink normalization, so auditing the auditor can be a false positive"
+)
+SELF_AUDIT_MARKERS = ("permission-audit.sh", "permission_audit_core")
 
 
 @dataclass(frozen=True)
@@ -516,6 +522,11 @@ def _decision_action(reply: str) -> str:
     return "unknown"
 
 
+def _is_self_referential_decision(record: DecisionRecord) -> bool:
+    haystacks = [*record.patterns, *record.always]
+    return any(marker in value for value in haystacks for marker in SELF_AUDIT_MARKERS)
+
+
 def _read_decisions_log(path: Path | None) -> tuple[bool, list[DecisionRecord]]:
     if path is None:
         return False, []
@@ -615,9 +626,10 @@ def audit_decisions(
     *,
     action_filter: str = "all",
     agent_filter: str | None = None,
+    exclude_self: bool = False,
     plugin_log_path: str | Path | None = DEFAULT_PLUGIN_AUDIT_LOG,
 ) -> dict[str, Any]:
-    """Build a v2 report from durable command-normalizer decisions records."""
+    """Build a v3 report from durable command-normalizer decisions records."""
 
     if action_filter not in {"allow", "deny", "all"}:
         raise ValueError("action_filter must be allow, deny, or all for source decisions")
@@ -637,6 +649,7 @@ def audit_decisions(
 
     filtered_events: list[dict[str, Any]] = []
     undated_count = 0
+    self_logged_excluded = 0
     agent_filter_normalized = agent_filter.casefold() if agent_filter else None
 
     for record in records:
@@ -645,6 +658,9 @@ def audit_decisions(
             continue
         event_day = record.timestamp_value.date()
         if event_day < start or event_day > end:
+            continue
+        if exclude_self and _is_self_referential_decision(record):
+            self_logged_excluded += 1
             continue
         action = _decision_action(record.reply)
         if action_filter != "all" and action != action_filter:
@@ -667,50 +683,89 @@ def audit_decisions(
 
     if undated_count:
         caveats.append(f"{undated_count} decisions records had unparseable ts values and were excluded from date-filtered counts")
+    if exclude_self:
+        caveats.append(f"{self_logged_excluded} {SELF_AUDIT_EXCLUSION_CAVEAT}")
     if action_filter == "deny":
         caveats.append(DENY_STATIC_BLINDNESS_WARNING)
         _warn(DENY_STATIC_BLINDNESS_WARNING)
 
-    aggregate: dict[tuple[str, str], dict[str, Any]] = {}
+    rule_aggregate: dict[tuple[str, str], dict[str, Any]] = {}
+    invocation_aggregate: dict[tuple[str, tuple[str, ...], str], dict[str, Any]] = {}
     for event in filtered_events:
-        key = (event["permission"], event["reply"])
-        entry = aggregate.setdefault(
-            key,
+        invocation_key = (event["permission"], tuple(event["patterns"]), event["reply"])
+        invocation = invocation_aggregate.setdefault(
+            invocation_key,
             {
                 "permission": event["permission"],
+                "patterns": list(event["patterns"]),
+                "always": [],
                 "action": event["action"],
                 "reply": event["reply"],
                 "count": 0,
                 "agents": set(),
                 "session_ids": set(),
-                "patterns": [],
-                "always": [],
                 "first_seen": event["timestamp"],
                 "last_seen": event["timestamp"],
             },
         )
-        entry["count"] += 1
-        entry["agents"].add(event["agent"])
+        invocation["count"] += 1
+        invocation["agents"].add(event["agent"])
         if event["session_id"] is not None:
-            entry["session_ids"].add(event["session_id"])
-        _order_preserving_union(entry["patterns"], event["patterns"])
-        _order_preserving_union(entry["always"], event["always"])
-        if event["timestamp"] < entry["first_seen"]:
-            entry["first_seen"] = event["timestamp"]
-        if event["timestamp"] > entry["last_seen"]:
-            entry["last_seen"] = event["timestamp"]
+            invocation["session_ids"].add(event["session_id"])
+        _order_preserving_union(invocation["always"], event["always"])
+        if event["timestamp"] < invocation["first_seen"]:
+            invocation["first_seen"] = event["timestamp"]
+        if event["timestamp"] > invocation["last_seen"]:
+            invocation["last_seen"] = event["timestamp"]
 
-    entries: list[dict[str, Any]] = []
-    for entry in aggregate.values():
-        normalized = dict(entry)
-        normalized["agents"] = _sort_agents(entry["agents"])
-        normalized["session_ids"] = _sort_session_ids(entry["session_ids"])
-        entries.append(normalized)
-    entries.sort(key=lambda item: (-item["count"], item["permission"], item["reply"]))
+        deduped_always: list[str] = []
+        _order_preserving_union(deduped_always, event["always"])
+        for glob in deduped_always:
+            rule_key = (event["permission"], glob)
+            rule = rule_aggregate.setdefault(
+                rule_key,
+                {
+                    "permission": event["permission"],
+                    "glob": glob,
+                    "count": 0,
+                    "reply_breakdown": {},
+                    "actions": {"allow": 0, "deny": 0, "unknown": 0},
+                    "agents": set(),
+                    "session_ids": set(),
+                    "first_seen": event["timestamp"],
+                    "last_seen": event["timestamp"],
+                },
+            )
+            rule["count"] += 1
+            rule["reply_breakdown"][event["reply"]] = rule["reply_breakdown"].get(event["reply"], 0) + 1
+            rule["actions"][event["action"]] += 1
+            rule["agents"].add(event["agent"])
+            if event["session_id"] is not None:
+                rule["session_ids"].add(event["session_id"])
+            if event["timestamp"] < rule["first_seen"]:
+                rule["first_seen"] = event["timestamp"]
+            if event["timestamp"] > rule["last_seen"]:
+                rule["last_seen"] = event["timestamp"]
 
-    allow_count = sum(event["count"] for event in entries if event["action"] == "allow")
-    deny_count = sum(event["count"] for event in entries if event["action"] == "deny")
-    unknown_count = sum(event["count"] for event in entries if event["action"] == "unknown")
+    rules: list[dict[str, Any]] = []
+    for rule in rule_aggregate.values():
+        normalized = dict(rule)
+        normalized["agents"] = _sort_agents(rule["agents"])
+        normalized["session_ids"] = _sort_session_ids(rule["session_ids"])
+        rules.append(normalized)
+    rules.sort(key=lambda item: (-item["count"], item["permission"], item["glob"]))
+
+    invocations: list[dict[str, Any]] = []
+    for invocation in invocation_aggregate.values():
+        normalized = dict(invocation)
+        normalized["agents"] = _sort_agents(invocation["agents"])
+        normalized["session_ids"] = _sort_session_ids(invocation["session_ids"])
+        invocations.append(normalized)
+    invocations.sort(key=lambda item: (-item["count"], item["permission"], item["patterns"], item["reply"]))
+
+    allow_count = sum(1 for event in filtered_events if event["action"] == "allow")
+    deny_count = sum(1 for event in filtered_events if event["action"] == "deny")
+    unknown_count = sum(1 for event in filtered_events if event["action"] == "unknown")
     total_events = allow_count + deny_count + unknown_count
     if unknown_count:
         caveats.append("unknown decisions reply values were kept as action=unknown")
@@ -718,9 +773,9 @@ def audit_decisions(
         caveats.append('missing permission fields were kept as "(missing permission)"')
 
     return {
-        "version": 2,
+        "version": 3,
         "date_range": {"start": start_date, "end": end_date},
-        "filters": {"action": action_filter, "agent": agent_filter},
+        "filters": {"action": action_filter, "agent": agent_filter, "exclude_self": exclude_self},
         "source": "decisions",
         "decisions_log_present": present,
         "summary": {
@@ -728,11 +783,14 @@ def audit_decisions(
             "allow_count": allow_count,
             "deny_count": deny_count,
             "unknown_count": unknown_count,
-            "unique_permissions": len({entry["permission"] for entry in entries}),
+            "unique_rules": len(rules),
+            "unique_invocations": len(invocations),
+            "self_logged_excluded": self_logged_excluded,
         },
         "sources": {"decisions": total_events},
         "caveats": caveats,
-        "entries": entries,
+        "rules": rules,
+        "invocations": invocations,
     }
 
 
@@ -942,8 +1000,8 @@ def _truncate(value: Any, width: int) -> str:
 def format_human(report: dict[str, Any]) -> str:
     """Render a compact table for interactive use."""
 
-    if report.get("version") == 2:
-        return _format_human_v2(report)
+    if report.get("version") == 3:
+        return _format_human_v3(report)
 
     start = report["date_range"]["start"]
     end = report["date_range"]["end"]
@@ -978,30 +1036,65 @@ def format_human(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_human_v2(report: dict[str, Any]) -> str:
+def _format_human_v3(report: dict[str, Any]) -> str:
     start = report["date_range"]["start"]
     end = report["date_range"]["end"]
     filters = report["filters"]
     agent_suffix = f", agent={filters['agent']}" if filters.get("agent") else ""
+    exclude_suffix = ", exclude_self=true" if filters.get("exclude_self") else ""
     lines = [
-        f"Permission Audit: {start} to {end} (source=decisions, action={filters['action']}{agent_suffix})",
+        f"Permission Audit: {start} to {end} (source=decisions, action={filters['action']}{agent_suffix}{exclude_suffix})",
         "",
-        " # | Permission | Action/Reply | Count | Agents | Patterns | Always",
-        "---|------------|--------------|-------|--------|----------|-------",
+        "Rules",
+        " # | Permission | Glob | Count | Replies | Actions | Agents | First | Last",
+        "---|------------|------|-------|---------|---------|--------|-------|-----",
     ]
-    for index, entry in enumerate(report["entries"], start=1):
-        agents = ", ".join("null" if agent is None else str(agent) for agent in entry["agents"])
-        patterns = ", ".join(entry.get("patterns", []))
-        always = ", ".join(entry.get("always", []))
-        lines.append(
-            f"{index:2d} | "
-            f"{_truncate(entry['permission'], 40)} | "
-            f"{entry['action']}/{entry['reply']} | "
-            f"{entry['count']:5d} | "
-            f"{agents} | "
-            f"{patterns} | "
-            f"{always}"
-        )
+    if report["rules"]:
+        for index, entry in enumerate(report["rules"], start=1):
+            agents = ", ".join("null" if agent is None else str(agent) for agent in entry["agents"])
+            replies = ", ".join(f"{reply}:{count}" for reply, count in entry.get("reply_breakdown", {}).items())
+            actions = ", ".join(f"{action}:{count}" for action, count in entry.get("actions", {}).items())
+            lines.append(
+                f"{index:2d} | "
+                f"{_truncate(entry['permission'], 40)} | "
+                f"{entry['glob']} | "
+                f"{entry['count']:5d} | "
+                f"{replies} | "
+                f"{actions} | "
+                f"{agents} | "
+                f"{entry['first_seen']} | "
+                f"{entry['last_seen']}"
+            )
+    else:
+        lines.append("(none)")
+
+    lines.extend(
+        [
+            "",
+            "Invocations",
+            " # | Permission | Patterns | Always | Action | Reply | Count | Agents | First | Last",
+            "---|------------|----------|--------|--------|-------|-------|--------|-------|-----",
+        ]
+    )
+    if report["invocations"]:
+        for index, entry in enumerate(report["invocations"], start=1):
+            agents = ", ".join("null" if agent is None else str(agent) for agent in entry["agents"])
+            patterns = ", ".join(entry.get("patterns", []))
+            always = ", ".join(entry.get("always", []))
+            lines.append(
+                f"{index:2d} | "
+                f"{_truncate(entry['permission'], 40)} | "
+                f"{patterns} | "
+                f"{always} | "
+                f"{entry['action']} | "
+                f"{entry['reply']} | "
+                f"{entry['count']:5d} | "
+                f"{agents} | "
+                f"{entry['first_seen']} | "
+                f"{entry['last_seen']}"
+            )
+    else:
+        lines.append("(none)")
     summary = report["summary"]
     lines.extend(
         [
@@ -1011,7 +1104,9 @@ def _format_human_v2(report: dict[str, Any]) -> str:
             f"allow={summary['allow_count']}, "
             f"deny={summary['deny_count']}, "
             f"unknown={summary['unknown_count']}, "
-            f"unique permissions={summary['unique_permissions']}",
+            f"unique rules={summary['unique_rules']}, "
+            f"unique invocations={summary['unique_invocations']}, "
+            f"self logged excluded={summary['self_logged_excluded']}",
             f"Sources: decisions={report['sources']['decisions']}",
             f"decisions.log present: {str(report['decisions_log_present']).lower()}",
         ]
@@ -1046,6 +1141,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--action", choices=("ask", "allow", "deny", "all"), default=None, help="Permission decision filter")
     parser.add_argument("--agent", default=None, help="Agent name filter, case-insensitive")
     parser.add_argument("--decisions-log", default=None, help="Override decisions.log path")
+    parser.add_argument(
+        "--exclude-self",
+        action="store_true",
+        help="Exclude decision records whose patterns[] or always[] mention permission-audit.sh or permission_audit_core",
+    )
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON (default)")
     output.add_argument("--human", action="store_true", help="Emit a human-readable table")
@@ -1079,6 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.end,
                 action_filter=action,
                 agent_filter=args.agent,
+                exclude_self=args.exclude_self,
             )
     except ValueError as exc:
         parser.error(str(exc))

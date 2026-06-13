@@ -1,1 +1,1 @@
-{"ts":"2026-06-05T10:00:00.000Z","sessionID":"ses_fixture","callID":"call_fixture","requestID":"req_fixture","permission":"bash -lc pwd","patterns":["bash -lc pwd"],"always":["bash -lc *"],"reply":"once","askedTs":"2026-06-05T09:59:59.000Z"}
+{"ts":"2026-06-05T10:00:00.000Z","sessionID":"ses_fixture","callID":"call_fixture","requestID":"req_fixture","permission":"bash","patterns":["bash -lc pwd"],"always":["bash -lc *"],"reply":"once","askedTs":"2026-06-05T09:59:59.000Z"}

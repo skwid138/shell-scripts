@@ -4,7 +4,7 @@ source "$(dirname "$0")/../lib/common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: permission-audit [--start DATE] [--end DATE] [--source decisions|native] [--action allow|deny|all] [--agent AGENT] [--json|--human]
+Usage: permission-audit [--start DATE] [--end DATE] [--source decisions|native] [--action allow|deny|all] [--agent AGENT] [--exclude-self] [--json|--human]
 
 Audit opencode permission decisions from local log files.
 
@@ -14,6 +14,7 @@ Options:
   --source SOURCE     Audit source: decisions or native (default: decisions)
   --action ACTION     Permission decision filter: allow, deny, or all (native uses ask in place of allow)
   --agent AGENT       Filter by agent name (case-insensitive)
+  --exclude-self      Exclude permission-audit's own prompted records from decisions output
   --json              Emit JSON (default)
   --human             Emit a human-readable table
   -h, --help          Show this help
@@ -46,6 +47,7 @@ END="$TODAY"
 SOURCE="decisions"
 ACTION=""
 AGENT=""
+EXCLUDE_SELF=0
 FORMAT_FLAG="--json"
 
 while [[ $# -gt 0 ]]; do
@@ -78,6 +80,10 @@ while [[ $# -gt 0 ]]; do
       need_arg "$1" "${2:-}"
       AGENT="$2"
       shift 2
+      ;;
+    --exclude-self)
+      EXCLUDE_SELF=1
+      shift
       ;;
     --json)
       FORMAT_FLAG="--json"
@@ -123,6 +129,9 @@ SCRIPT_DIR="$(dirname "$0")"
 PY_ARGS=("--start" "$START" "--end" "$END" "--source" "$SOURCE" "--action" "$ACTION")
 if [[ -n "$AGENT" ]]; then
   PY_ARGS+=("--agent" "$AGENT")
+fi
+if [[ "$EXCLUDE_SELF" -eq 1 ]]; then
+  PY_ARGS+=("--exclude-self")
 fi
 PY_ARGS+=("$FORMAT_FLAG")
 

@@ -59,6 +59,13 @@ make_path_without_python3() {
   assert_output --partial "args=--start 2026-05-21 --end 2026-05-21 --source decisions --action all --json"
 }
 
+@test "permission-audit: exclude-self flag passes through when set" {
+  write_python_arg_stub
+  run env PATH="$STUBDIR:$PATH" PERMISSION_AUDIT_TODAY=2026-05-21 "$SCRIPT" --exclude-self
+  assert_success
+  assert_output --partial "args=--start 2026-05-21 --end 2026-05-21 --source decisions --action all --exclude-self --json"
+}
+
 @test "permission-audit: invalid source exits 2" {
   run "$SCRIPT" --source nowhere
   assert_failure 2
