@@ -1,1 +1,2 @@
 tests/opencode-wrapper-openai.bats:generic-api-key:99
+tests/local-models.bats:generic-api-key:91

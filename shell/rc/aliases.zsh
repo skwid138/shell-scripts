@@ -105,7 +105,9 @@ alias nvim-update='nvim --headless "+Lazy! sync" +qa && \
 ## opencode remote access (Tailscale-fronted web UI)
 ## opensession — daily driver. Ensures a daemon is running, then attaches.
 ##               Starts one via openweb if needed; otherwise just openattach.
-##               --restart for a clean refresh; --force to bypass staleness.
+##               --restart for a clean refresh; --force to bypass staleness;
+##               --local to prepare LM Studio before attaching.
+## local-models — start/verify/load/unload LM Studio local OpenCode models.
 ## openweb     — start `opencode web` wrapped in caffeinate, password from Keychain.
 ## openattach  — attach a local TUI to the running web backend so all clients
 ##               (web + terminal) share one session pool. Requires `openweb` running.
@@ -114,6 +116,9 @@ alias nvim-update='nvim --headless "+Lazy! sync" +qa && \
 # shellcheck disable=SC2139
 [[ ! -f "$HOME/code/scripts/personal/opensession.sh" ]] ||
   alias opensession="$HOME/code/scripts/personal/opensession.sh"
+# shellcheck disable=SC2139
+[[ ! -f "$HOME/code/scripts/personal/local-models.sh" ]] ||
+  alias local-models="$HOME/code/scripts/personal/local-models.sh"
 # shellcheck disable=SC2139
 [[ ! -f "$HOME/code/scripts/personal/opencode-web.sh" ]] ||
   alias openweb="$HOME/code/scripts/personal/opencode-web.sh"

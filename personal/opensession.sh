@@ -25,6 +25,9 @@
 #   -d, --debug     Restart the daemon with --log-level DEBUG. Implies --restart
 #                   because log level is baked in at daemon launch. Sets
 #                   OPENCODE_WEB_LOG_LEVEL=DEBUG for opencode-web.sh to consume.
+#   -l, --local     Prepare the LM Studio local-model runtime before any
+#                   openweb/openattach action. Does not imply --restart and
+#                   does not load models.
 #   -h, --help      Show this help.
 #
 # Process model: the daemon self-daemonizes (PPID=1, owned by launchd). This
@@ -42,6 +45,7 @@
 #   OPENCODE_WEB_HOSTNAME     Hostname (passed to openweb)  (default: 127.0.0.1)
 #   OPENCODE_ATTACH_FORCE     Set to 1 to bypass staleness  (same as --force)
 #   OPENCODE_WEB_LOG_LEVEL    opencode log-level passthrough (DEBUG|INFO|WARN|ERROR)
+#   OPENSESSION_LOCAL_MODELS_BIN  Test-only override for local-models.sh
 #
 # Exit codes follow lib/common.sh:
 #   0  success (clean exec into opencode attach, or deliberate openattach abort)
@@ -75,6 +79,11 @@ Options:
   -d, --debug     Restart the daemon with opencode --log-level DEBUG. Implies
                   --restart (log level is baked in at daemon launch). Use when
                   diagnosing plugin debug events (e.g. council-plugin lifecycle).
+  -l, --local     Prepare LM Studio for OpenCode local models before opening or
+                  attaching. This runs `local-models start` only: it verifies the
+                  runtime endpoint, does not load models, and does not imply
+                  --restart. After OpenCode provider/config changes, compose
+                  `opensession --local --restart` or use the stale-daemon prompt.
   -h, --help      Show this help.
 
 Default behavior: query the port; if no daemon, background-spawn `openweb`
@@ -96,6 +105,7 @@ EOF
 RESTART=0
 FORCE=0
 DEBUG=0
+LOCAL=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
@@ -112,6 +122,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -d | --debug)
       DEBUG=1
+      shift
+      ;;
+    -l | --local)
+      LOCAL=1
       shift
       ;;
     *)
@@ -144,8 +158,12 @@ fi
 # you find yourself reaching for them outside tests, file an issue first.
 OPENWEB="${OPENSESSION_OPENWEB_BIN:-$SCRIPT_DIR/opencode-web.sh}"
 OPENATTACH="${OPENSESSION_OPENATTACH_BIN:-$SCRIPT_DIR/opencode-attach.sh}"
+LOCAL_MODELS="${OPENSESSION_LOCAL_MODELS_BIN:-$SCRIPT_DIR/local-models.sh}"
 [[ -x "$OPENWEB" ]] || die_missing_dep "openweb wrapper not found or not executable: $OPENWEB"
 [[ -x "$OPENATTACH" ]] || die_missing_dep "openattach wrapper not found or not executable: $OPENATTACH"
+if [[ "$LOCAL" == "1" ]]; then
+  [[ -x "$LOCAL_MODELS" ]] || die_missing_dep "local-models wrapper not found or not executable: $LOCAL_MODELS"
+fi
 
 # Compose the openattach argv once — used in every branch below.
 # Bash 3.2 idiom: build the array, expand with the conditional form at the
@@ -153,6 +171,18 @@ OPENATTACH="${OPENSESSION_OPENATTACH_BIN:-$SCRIPT_DIR/opencode-attach.sh}"
 ATTACH_ARGS=()
 if [[ "$FORCE" == "1" ]]; then
   ATTACH_ARGS+=("--force")
+fi
+
+# --local is deliberately orthogonal to --restart. It prepares/verifies the LM
+# Studio server before any daemon/attach action, but never edits OpenCode config
+# and never loads a model. Config changes still need the normal restart/stale-
+# daemon flow.
+if [[ "$LOCAL" == "1" ]]; then
+  "$LOCAL_MODELS" start
+  LOCAL_MODELS_RC=$?
+  if [[ "$LOCAL_MODELS_RC" -ne 0 ]]; then
+    die_upstream "local model runtime preparation failed (exit $LOCAL_MODELS_RC); not starting or attaching OpenCode"
+  fi
 fi
 
 # --- restart path ------------------------------------------------------------

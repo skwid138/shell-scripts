@@ -30,6 +30,7 @@ setup() {
   # Test-only injection point for the sibling wrappers.
   export OPENSESSION_OPENWEB_BIN="$STUBDIR/opencode-web.sh"
   export OPENSESSION_OPENATTACH_BIN="$STUBDIR/opencode-attach.sh"
+  export OPENSESSION_LOCAL_MODELS_BIN="$STUBDIR/local-models.sh"
 }
 
 teardown() {
@@ -59,6 +60,15 @@ echo "openattach $*" >>"$STATEFILE"
 exit "${OPENATTACH_EXIT:-0}"
 EOF
   chmod +x "$STUBDIR/opencode-attach.sh"
+}
+
+write_local_models_stub() {
+  cat >"$STUBDIR/local-models.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "local-models $*" >>"$STATEFILE"
+exit "${LOCAL_MODELS_EXIT:-0}"
+EOF
+  chmod +x "$STUBDIR/local-models.sh"
 }
 
 # Stubs that ALSO log OPENCODE_WEB_LOG_LEVEL so tests can assert env passthrough
@@ -280,6 +290,7 @@ arm_spawn_timeout() {
   assert_output --partial "Usage: opensession"
   assert_output --partial "--restart"
   assert_output --partial "--force"
+  assert_output --partial "--local"
 }
 
 @test "opensession: -h exits 0 and prints Usage" {
@@ -552,6 +563,46 @@ arm_spawn_timeout() {
     echo "unexpected openattach exec after openweb --restart failure" >&2
     return 1
   fi
+}
+
+# --- --local flag -----------------------------------------------------------
+
+@test "opensession: --local starts local model runtime before attaching" {
+  write_all_stubs
+  write_local_models_stub
+  arm_fresh_daemon
+  run "$SCRIPT" --local
+  assert_success
+  grep -qE '^local-models start$' "$STATEFILE"
+  grep -qE '^openattach\b' "$STATEFILE"
+  if grep -q '^openweb' "$STATEFILE"; then
+    echo "unexpected openweb restart/spawn on --local fresh-daemon path" >&2
+    return 1
+  fi
+}
+
+@test "opensession: --local failure exits before openweb or openattach" {
+  write_all_stubs
+  write_local_models_stub
+  arm_spawn_succeeds
+  LOCAL_MODELS_EXIT=5 run "$SCRIPT" --local
+  assert_failure 5
+  assert_output --partial "local model runtime preparation failed"
+  grep -qE '^local-models start$' "$STATEFILE"
+  if grep -qE '^openweb|^openattach' "$STATEFILE"; then
+    echo "daemon wrappers ran despite local-models failure" >&2
+    return 1
+  fi
+}
+
+@test "opensession: --local does not imply --restart but composes with --restart" {
+  write_all_stubs
+  write_local_models_stub
+  run "$SCRIPT" --local --restart
+  assert_success
+  grep -qE '^local-models start$' "$STATEFILE"
+  grep -qE '^openweb --restart$' "$STATEFILE"
+  grep -qE '^openattach\b' "$STATEFILE"
 }
 
 # --- --debug under bash 3.2 -------------------------------------------------

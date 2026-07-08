@@ -163,6 +163,10 @@ A few scripts here are interactive launchers wired up via aliases in
   running `openweb` backend so web + terminal clients share one session pool.
   Loads the same Keychain password so basic-auth succeeds without env setup.
   See `~/.config/opencode/README-remote-access.md` for the full setup.
+- `local-models` → `personal/local-models.sh` — start/verify/load/unload LM
+  Studio local models surfaced through OpenCode's static `lmstudio` provider.
+  `opensession --local` calls `local-models start` only; it does not load a
+  model or imply `--restart`. See [`docs/local-models.md`](docs/local-models.md).
 
 ## Development
 
