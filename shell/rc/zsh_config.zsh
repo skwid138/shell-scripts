@@ -15,6 +15,11 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
 # 'l:|=*' - Left side can match anything
 # zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}' 'r:|=*' 'l:|=*'
 
+# Force the emacs keymap. zsh auto-selects vi mode when $EDITOR/$VISUAL
+# contains "vi" (we export EDITOR=vim), which makes Ctrl+A/Ctrl+E insert
+# literal ^A/^E. Must run BEFORE the bindkey calls below so they land in emacs.
+bindkey -e
+
 # Remind myself to use the native shortcuts
 beginning_of_line_with_reminder() {
   zle beginning-of-line
