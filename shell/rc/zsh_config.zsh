@@ -21,32 +21,40 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
 bindkey -e
 
 # Remind myself to use the native shortcuts
+#
+# The tip is cleared from a line-pre-redraw hook on the next keypress of any
+# kind (typed char, backspace, arrows, ...). We deliberately never redefine
+# self-insert: zsh-autosuggestions / zsh-syntax-highlighting (loaded later by
+# zsh_plugins.zsh) wrap it, and swapping it out would bypass their wrappers.
 beginning_of_line_with_reminder() {
   zle beginning-of-line
   zle -M "▶ TIP: You can also use Ctrl+A to move to beginning of line"
-  # Set up a one-time hook to clear the message on next keypress
-  zle -N self-insert clear_message_and_self_insert
+  typeset -g _zsh_reminder_pending=1
 }
 zle -N beginning_of_line_with_reminder
 
 end_of_line_with_reminder() {
   zle end-of-line
   zle -M "▶ TIP: You can also use Ctrl+E to move to end of line"
-  # Set up a one-time hook to clear the message on next keypress
-  zle -N self-insert clear_message_and_self_insert
+  typeset -g _zsh_reminder_pending=1
 }
 zle -N end_of_line_with_reminder
 
-# Clear the message on next keypress
-clear_message_and_self_insert() {
-  # Clear the message
-  zle -M ""
-  # Restore the original self-insert widget
-  zle -A .self-insert self-insert
-  # Process the current key press
-  zle .self-insert
+# Runs before every redraw. $LASTWIDGET is the reminder widget on its own
+# redraw and the next widget on the following one, so clear only then.
+# Must return 0 on every path: add-zle-hook-widget's dispatcher stops at the
+# first failing hook, which would skip hooks registered after this one.
+_zsh_reminder_clear() {
+  if [[ -n ${_zsh_reminder_pending-} ]] &&
+    [[ $LASTWIDGET != beginning_of_line_with_reminder ]] &&
+    [[ $LASTWIDGET != end_of_line_with_reminder ]]; then
+    zle -M ""
+    unset _zsh_reminder_pending
+  fi
+  return 0
 }
-zle -N clear_message_and_self_insert
+autoload -Uz add-zle-hook-widget
+add-zle-hook-widget line-pre-redraw _zsh_reminder_clear
 
 # Add fn+left/right shortcuts with reminder to use native shortcuts
 bindkey '^[[H' beginning_of_line_with_reminder # fn+left arrow
