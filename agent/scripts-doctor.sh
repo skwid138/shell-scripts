@@ -370,8 +370,8 @@ check_repo() {
 
   # Per-script checks for personal/ — same invariants apply (this repo
   # treats personal/ as first-class), but legacy scripts are temporarily
-  # exempt via LEGACY_PERSONAL_ALLOWLIST. Recurses into subdirectories
-  # because some personal/ scripts live in subdirs (docker_rollback/, etc.).
+  # exempt via LEGACY_PERSONAL_ALLOWLIST. Recurses so scripts nested in
+  # personal/ subdirectories are audited too.
   if [[ -d "$repo/personal" ]]; then
     while IFS= read -r script; do
       [[ -f "$script" ]] || continue

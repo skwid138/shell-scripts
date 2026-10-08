@@ -14,10 +14,10 @@ JOBS    ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 #
 # `find` (rather than $(wildcard)) is used uniformly for two reasons:
 #   1. Uniformity / readability — one idiom rather than mixed wildcard+find.
-#   2. Recursion — personal/ has subdirs (e.g. personal/docker_rollback/),
-#      and we don't want lint coverage to silently miss a script just because
-#      someone nests it. The other dirs (shell/, agent/, lib/) are flat today
-#      but recursion costs nothing if that ever changes.
+#   2. Recursion — shell/ is split into tier subdirs (env/, login/, rc/,
+#      lib/), and we don't want lint coverage to silently miss a script just
+#      because someone nests it in a subdirectory of any of the four dirs.
+#      Recursion costs nothing for the dirs that are flat today.
 # The 2>/dev/null protects against any of the dirs being absent.
 #
 # .sh = POSIX/bash-portable (linted by shellcheck in bash mode).

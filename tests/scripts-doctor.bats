@@ -322,7 +322,7 @@ EOF
 # (--help exits 0, set -uo pipefail, sources lib, has bats suite), EXCEPT
 # scripts whose basename is in LEGACY_PERSONAL_ALLOWLIST emit a single
 # 'legacy personal script' warn instead. Allowlist matches by basename so
-# scripts in subdirectories (e.g. personal/docker_rollback/rollback.sh) are
+# scripts in subdirectories (e.g. personal/nested/nested-script.sh) are
 # covered.
 
 @test "scripts-doctor: a fully-compliant personal/ script passes all four invariants" {
@@ -394,18 +394,18 @@ EOF
   # invariant treatment.
   write_valid_ci
   write_valid_script "agent-pass.sh"
-  mkdir -p "$REPO/personal/docker_rollback"
-  cat >"$REPO/personal/docker_rollback/rollback.sh" <<'EOF'
+  mkdir -p "$REPO/personal/nested"
+  cat >"$REPO/personal/nested/nested-script.sh" <<'EOF'
 #!/bin/bash
 set -e
 echo "subdir + violations should fail audit, not warn"
 EOF
-  chmod +x "$REPO/personal/docker_rollback/rollback.sh"
+  chmod +x "$REPO/personal/nested/nested-script.sh"
 
   run "$SCRIPT" --repo "$REPO"
   assert_failure
-  assert_output --partial "rollback.sh: no 'set -e'"
-  refute_output --partial "rollback.sh (personal, legacy)"
+  assert_output --partial "nested-script.sh: no 'set -e'"
+  refute_output --partial "nested-script.sh (personal, legacy)"
 }
 
 @test "scripts-doctor: repo without personal/ dir audits cleanly (skip silently)" {
