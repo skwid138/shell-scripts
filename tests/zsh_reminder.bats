@@ -3,7 +3,8 @@
 #
 # Contract under test (driven through a real interactive zsh via zsh/zpty;
 # see tests/fixtures/zsh_reminder/driver.zsh):
-#   - fn+left (\e[H) / fn+right (\e[F) move the cursor and show a tip.
+#   - fn+left (\e[H) / fn+right (\e[F) move the cursor to the start / end
+#     of the line (asserted via CURSOR/BUFFER) and show a tip.
 #   - The tip clears on the NEXT keypress of any kind: a typed char,
 #     backspace, or an arrow key — not just on self-insert.
 #   - The reminder never redefines self-insert, so a user wrapper installed
@@ -28,51 +29,94 @@ drive() {
   run zsh -f "$DRIVER" "$REPO/shell/rc/zsh_config.zsh" "$BATS_TEST_TMPDIR/zr" "$@"
 }
 
-# Expected transcript for one reminder key ($1 = driver key name,
-# $2 = reminder widget, $3 = tip text). Sequence:
-#   x            typed char, nothing pending      (hook no-op path)
-#   REM, x       tip shown, then cleared by a typed char
-#   REM, bs      tip shown, then cleared by backspace
-#   REM, left    tip shown, then cleared by an arrow key
-#   x            nothing pending again            (hook no-op path)
-# Every key must yield a record from the later stand-in hook, and
-# self-insert must remain the stand-in wrapper throughout.
-expected_transcript() {
-  local key=$1 widget=$2 tip=$3
-  local si='si=user:_zr_self_insert'
+# Every probe record ends with this: self-insert must remain the stand-in
+# wrapper throughout (the reminder never redefines it).
+SI='si=user:_zr_self_insert'
+
+# fn+left: a, b; then home is cleared by a typed char (c lands at the start),
+# by backspace, and by an arrow key. Plain keys with nothing pending (a, b, d,
+# e) exercise the hook's no-op path. cur/buf prove beginning-of-line ran and
+# that the wrapper's .self-insert inserted at the cursor.
+expected_home_transcript() {
+  local w=beginning_of_line_with_reminder
+  local tip='▶ TIP: You can also use Ctrl+A to move to beginning of line'
   cat <<EOF
-@x
+@a
 wrap
-redraw lw=self-insert msg=[] $si
-@$key
-redraw lw=$widget msg=[$tip] $si
-@x
+redraw lw=self-insert cur=1 buf=[a] msg=[] $SI
+@b
 wrap
-redraw lw=self-insert msg=[] $si
-@$key
-redraw lw=$widget msg=[$tip] $si
+redraw lw=self-insert cur=2 buf=[ab] msg=[] $SI
+@home
+redraw lw=$w cur=0 buf=[ab] msg=[$tip] $SI
+@c
+wrap
+redraw lw=self-insert cur=1 buf=[cab] msg=[] $SI
+@home
+redraw lw=$w cur=0 buf=[cab] msg=[$tip] $SI
 @bs
-redraw lw=backward-delete-char msg=[] $si
-@$key
-redraw lw=$widget msg=[$tip] $si
-@left
-redraw lw=backward-char msg=[] $si
-@x
+redraw lw=backward-delete-char cur=0 buf=[cab] msg=[] $SI
+@d
 wrap
-redraw lw=self-insert msg=[] $si
+redraw lw=self-insert cur=1 buf=[dcab] msg=[] $SI
+@home
+redraw lw=$w cur=0 buf=[dcab] msg=[$tip] $SI
+@left
+redraw lw=backward-char cur=0 buf=[dcab] msg=[] $SI
+@e
+wrap
+redraw lw=self-insert cur=1 buf=[edcab] msg=[] $SI
 EOF
 }
 
-@test "zsh reminder: fn+left tip clears on next key without clobbering self-insert or later hooks" {
-  drive x home x home bs home left x
-  assert_success
-  assert_output "$(expected_transcript home beginning_of_line_with_reminder \
-    '▶ TIP: You can also use Ctrl+A to move to beginning of line')"
+# fn+right: the cursor is moved off the end before every end key so
+# end-of-line is observable; the tip is cleared by a typed char (c lands at
+# the end), by backspace, and by an arrow key.
+expected_end_transcript() {
+  local w=end_of_line_with_reminder
+  local tip='▶ TIP: You can also use Ctrl+E to move to end of line'
+  cat <<EOF
+@a
+wrap
+redraw lw=self-insert cur=1 buf=[a] msg=[] $SI
+@b
+wrap
+redraw lw=self-insert cur=2 buf=[ab] msg=[] $SI
+@left
+redraw lw=backward-char cur=1 buf=[ab] msg=[] $SI
+@left
+redraw lw=backward-char cur=0 buf=[ab] msg=[] $SI
+@end
+redraw lw=$w cur=2 buf=[ab] msg=[$tip] $SI
+@c
+wrap
+redraw lw=self-insert cur=3 buf=[abc] msg=[] $SI
+@left
+redraw lw=backward-char cur=2 buf=[abc] msg=[] $SI
+@end
+redraw lw=$w cur=3 buf=[abc] msg=[$tip] $SI
+@bs
+redraw lw=backward-delete-char cur=2 buf=[ab] msg=[] $SI
+@left
+redraw lw=backward-char cur=1 buf=[ab] msg=[] $SI
+@end
+redraw lw=$w cur=2 buf=[ab] msg=[$tip] $SI
+@left
+redraw lw=backward-char cur=1 buf=[ab] msg=[] $SI
+@d
+wrap
+redraw lw=self-insert cur=2 buf=[adb] msg=[] $SI
+EOF
 }
 
-@test "zsh reminder: fn+right tip clears on next key without clobbering self-insert or later hooks" {
-  drive x end x end bs end left x
+@test "zsh reminder: fn+left moves to start, tip clears on next key without clobbering self-insert or later hooks" {
+  drive a b home c home bs d home left e
   assert_success
-  assert_output "$(expected_transcript end end_of_line_with_reminder \
-    '▶ TIP: You can also use Ctrl+E to move to end of line')"
+  assert_output "$(expected_home_transcript)"
+}
+
+@test "zsh reminder: fn+right moves to end, tip clears on next key without clobbering self-insert or later hooks" {
+  drive a b left left end c left end bs left end left d
+  assert_success
+  assert_output "$(expected_end_transcript)"
 }

@@ -5,7 +5,8 @@
 # keystroke by keystroke.
 #
 # Usage: zsh -f driver.zsh <zsh_config.zsh> <workdir> <key>...
-#   keys: home (\e[H)  end (\e[F)  x (literal char)  bs (^?)  left (\e[D)
+#   keys: home (\e[H)  end (\e[F)  bs (^?)  left (\e[D)
+#         any single character is sent literally (e.g. a, b, x)
 #
 # The child shell is isolated: env -i, HOME=ZDOTDIR=<workdir>, and its
 # .zshenv unsets GLOBAL_RCS so /etc/zshrc & friends (which rebind keys on
@@ -19,7 +20,9 @@
 #
 # Output (stdout): for each key, a line "@<key>" followed by the child's log
 # lines produced while handling that key ("wrap" when the self-insert
-# stand-in ran, then one "redraw lw=<LASTWIDGET> msg=[<msg>] si=<widget>").
+# stand-in ran, then one
+#   "redraw lw=<LASTWIDGET> cur=<CURSOR> buf=[<BUFFER>] msg=[<msg>] si=<widget>"
+# so cursor movement and text insertion are observable, not just the tip).
 #
 # Exit: 0 ok; 2 usage; 3 timeout / child failure; 77 zsh/zpty unavailable.
 # Every wait is bounded; the pty child is killed on exit.
@@ -64,7 +67,7 @@ _zr_self_insert() {
 }
 zle -N self-insert _zr_self_insert
 _zr_later_redraw() {
-  print -r -- "redraw lw=$LASTWIDGET msg=[$_zr_msg] si=$widgets[self-insert]" >>"$ZR_LOG"
+  print -r -- "redraw lw=$LASTWIDGET cur=$CURSOR buf=[$BUFFER] msg=[$_zr_msg] si=$widgets[self-insert]" >>"$ZR_LOG"
 }
 add-zle-hook-widget line-pre-redraw _zr_later_redraw
 _zr_ready() { print -r -- ready >>"$ZR_LOG"; }
@@ -92,6 +95,7 @@ tick() {
 
 log_lines=()
 read_log() { log_lines=("${(@f)$(<"$log")}"); }
+redraw_pat='redraw *'
 
 # Wait until the log holds at least $1 lines matching pattern $2.
 wait_for() {
@@ -113,15 +117,20 @@ wait_for() {
 
 wait_for 1 'ready' || exit 3
 read_log
-integer seen=${#log_lines} redraws=0
+# Baseline both counters from the same snapshot. wait_for counts matching
+# records across the whole log, so any redraw already logged here (e.g. a
+# startup redraw) must be included, or the first key's wait would be
+# pre-satisfied and keys could race ahead of their redraws.
+integer seen=${#log_lines}
+integer redraws=${#${(M)log_lines:#$~redraw_pat}}
 
 for key in "$@"; do
   case $key in
     home) bytes=$'\e[H' ;;
     end) bytes=$'\e[F' ;;
-    x) bytes=x ;;
     bs) bytes=$'\x7f' ;;
     left) bytes=$'\e[D' ;;
+    ?) bytes=$key ;;
     *)
       print -u2 -- "driver: unknown key '$key'"
       exit 2
@@ -130,7 +139,7 @@ for key in "$@"; do
   zpty -w -n $pty "$bytes" || exit 3
   # Send one key at a time and wait for its redraw: ZLE skips redisplay
   # while typeahead is pending, so batching keys would hide redraws.
-  wait_for $((++redraws)) 'redraw *' || exit 3
+  wait_for $((++redraws)) "$redraw_pat" || exit 3
   print -r -- "@$key"
   print -rl -- "${(@)log_lines[seen+1,-1]}"
   seen=${#log_lines}
