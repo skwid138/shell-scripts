@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for personal/cache-prune.sh -install. Do not load this file
+  directly: the double-underscore placeholder tokens are rendered (XML-escaped) into
+  ~/Library/LaunchAgents/com.skwid138.cache-prune.plist by the installer.
+  Runs `cache-prune.sh -apply` at 10:00 on day 1 of every month.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.skwid138.cache-prune</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__SCRIPT_PATH__</string>
+    <string>--apply</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key>
+    <integer>1</integer>
+    <key>Hour</key>
+    <integer>10</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__STDOUT_PATH__</string>
+  <key>StandardErrorPath</key>
+  <string>__STDERR_PATH__</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
