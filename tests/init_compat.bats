@@ -50,10 +50,11 @@ setup() {
   # 14-day freshness nag (which IS expected to fire on a stale machine)
   # doesn't make this test flaky.
   #
-  # Known-noise denylist: certain optional tools (nvm, fortune/cowsay/
-  # lolcat) emit "command not found" or "Required commands ... not
-  # installed" stderr when absent, and CI runners legitimately don't
-  # have them. Likewise, running zsh under `zsh -c` with no controlling
+  # Known-noise denylist: optional tools (fortune/cowsay/lolcat) emit
+  # "Required commands ... not installed" stderr when absent, and CI
+  # runners legitimately don't have them. (load_nvmrc no-ops when nvm
+  # isn't loaded, so nvm noise is intentionally NOT scrubbed.)
+  # Likewise, running zsh under `zsh -c` with no controlling
   # tty (as happens under bats) makes compinit print "not interactive
   # and can't open terminal" + "compinit: initialization aborted",
   # which then propagates as "complete:13: command not found: compdef".
@@ -70,7 +71,6 @@ setup() {
   "
   assert_success
   scrubbed="$(printf '%s\n' "$output" |
-    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' |
     grep -Ev 'Required commands \(fortune, cowsay, lolcat\) are not installed' |
     grep -Ev "^not interactive and can't open terminal$" |
     grep -Ev '^compinit: initialization aborted$' |
@@ -94,7 +94,6 @@ setup() {
     print -u2 -- 'GENUINE WARNING that must not be scrubbed'
   "
   scrubbed="$(printf '%s\n' "$output" |
-    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' |
     grep -Ev 'Required commands \(fortune, cowsay, lolcat\) are not installed' |
     grep -Ev "^not interactive and can't open terminal$" |
     grep -Ev '^compinit: initialization aborted$' |

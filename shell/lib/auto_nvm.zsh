@@ -5,6 +5,12 @@ LAST_NVM_DIR=""
 
 # Load the correct Node.js version based on the `.nvmrc` file
 load_nvmrc() {
+  # nvm is only loaded in the login tier (login/nvm.zsh), but this file is
+  # also sourced for interactive non-login shells. No-op until nvm exists.
+  # Must precede the LAST_NVM_DIR sentinel so a shell that loads nvm later
+  # still processes the current directory.
+  typeset -f nvm >/dev/null 2>&1 || return 0
+
   # Get the current working directory.
   # Split declaration from assignment so a non-zero exit from $(pwd)
   # propagates correctly (ShellCheck SC2155).

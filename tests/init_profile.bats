@@ -60,16 +60,19 @@ setup() {
 
 @test "init_profile: does not error when ~/.nvm is absent" {
   # Override HOME to a sandbox where ~/.nvm doesn't exist. The login/nvm.zsh
-  # source line is gated on `-d $HOME/.nvm`, so this should be a no-op.
+  # source line is gated on `-d $HOME/.nvm`, so this should be a no-op, and
+  # lib/auto_nvm.zsh's immediate load_nvmrc must not leak
+  # "command not found: nvm" to stderr.
   SANDBOX="$(mktemp -d)"
   run zsh --no-rcs -c "
     HOME='$SANDBOX'
     source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
-    source '$REPO/shell/init_profile.zsh' >/dev/null 2>&1
+    source '$REPO/shell/init_profile.zsh' 2>&1 >/dev/null
     print -- ok
   "
   assert_success
   assert_output --partial "ok"
+  refute_output --partial "command not found: nvm"
   rm -rf "$SANDBOX"
 }
 

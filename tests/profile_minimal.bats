@@ -169,9 +169,9 @@ setup() {
   # End-to-end: env-tier + login-tier together produce zero stderr noise.
   # Sandbox a fresh sentinel so the freshness nag doesn't fire.
   #
-  # Known-noise denylist: load_nvmrc fires on profile-tier source and
-  # warns "command not found: nvm" when nvm isn't installed (CI runners
-  # legitimately don't have it). Likewise, on Ubuntu CI's zsh, running
+  # load_nvmrc is NOT on the denylist: it no-ops when nvm isn't loaded, so
+  # "command not found: nvm" here is a real regression.
+  # Known-noise denylist: on Ubuntu CI's zsh, running
   # `zsh -c` with no controlling tty surfaces compinit-related stderr
   # ("not interactive and can't open terminal" + "compinit:
   # initialization aborted" + "complete:NN: command not found: compdef"
@@ -191,7 +191,6 @@ setup() {
   "
   assert_success
   scrubbed="$(printf '%s\n' "$output" |
-    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' |
     grep -Ev "^not interactive and can't open terminal$" |
     grep -Ev '^compinit: initialization aborted$' |
     grep -Ev '^complete:[0-9]+: command not found: compdef$' ||
@@ -213,7 +212,6 @@ setup() {
     print -u2 -- 'GENUINE WARNING that must not be scrubbed'
   "
   scrubbed="$(printf '%s\n' "$output" |
-    grep -Ev 'load_nvmrc:[0-9]+: command not found: nvm' |
     grep -Ev "^not interactive and can't open terminal$" |
     grep -Ev '^compinit: initialization aborted$' |
     grep -Ev '^complete:[0-9]+: command not found: compdef$' ||
