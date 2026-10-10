@@ -53,14 +53,17 @@ jobs:
           shellcheck --version
           shfmt --version
 
-      - name: Install shellcheck and shfmt (macOS)
+      - name: Install shellcheck, shfmt, gitleaks (macOS)
         if: runner.os == 'macOS'
         run: |
-          # macOS runners have brew preinstalled. shellcheck and shfmt are
-          # both available as bottles, so this is fast.
-          brew install shellcheck shfmt
+          # macOS runners have brew preinstalled. shellcheck, shfmt, and
+          # gitleaks are all bottles, so this is fast. gitleaks lets the
+          # real-binary tests in tests/gitleaks-hook.bats run instead of skip.
+          brew install shellcheck shfmt gitleaks
           shellcheck --version
           shfmt --version
+          gitleaks version
+          git --version
 
       - name: Lint (errors only)
         run: make lint-strict
@@ -120,7 +123,7 @@ jobs:
           shellcheck --version | head -1
           shfmt --version
 
-      - name: Ensure GNU parallel, shellcheck, shfmt (macOS)
+      - name: Ensure GNU parallel, shellcheck, shfmt, gitleaks (macOS)
         if: runner.os == 'macOS'
         run: |
           # macOS already ships zsh. parallel + shellcheck + shfmt come from brew.
@@ -128,9 +131,13 @@ jobs:
           command -v parallel >/dev/null 2>&1 || brew install parallel
           command -v shellcheck >/dev/null 2>&1 || brew install shellcheck
           command -v shfmt >/dev/null 2>&1 || brew install shfmt
+          # gitleaks: real-binary tests in tests/gitleaks-hook.bats.
+          command -v gitleaks >/dev/null 2>&1 || brew install gitleaks
           parallel --version | head -1
           shellcheck --version | head -1
           shfmt --version
+          gitleaks version
+          git --version
 
       - name: Lint (errors only)
         run: make lint-strict
