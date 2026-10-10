@@ -56,7 +56,7 @@ setup() {
 }
 
 # The shell text the registration must carry, exactly.
-EXPECTED_COMMAND='h="$HOME/code/scripts/personal/gitleaks-hook.sh"; if [ -x "$h" ]; then exec "$h" --run; else echo "gitleaks hook: $h not found, skipping" >&2; fi'
+EXPECTED_COMMAND='h="$HOME/code/scripts/personal/gitleaks-hook.sh"; if [ ! -e "$h" ]; then echo "gitleaks hook: $h not found, skipping" >&2; exit 0; fi; if [ ! -x "$h" ]; then echo "gitleaks hook: $h not executable" >&2; exit 1; fi; exec "$h" --run'
 
 write_gitleaks_stub() {
   cat >"$STUBS/gitleaks" <<'EOF'
@@ -331,6 +331,37 @@ assert_no_secret() {
   assert_success
   assert_output --partial "gitleaks hook: $FAKE_HOME/code/scripts/personal/gitleaks-hook.sh not found, skipping"
   [[ "$(commit_count)" -eq $((before + 1)) ]]
+}
+
+@test "gitleaks-hook: a present but non-executable script blocks the commit (no silent skip)" {
+  require_config_hooks
+  init_repo
+  rm "$FAKE_HOME/code/scripts"
+  mkdir -p "$FAKE_HOME/code/scripts/personal"
+  cp "$SCRIPT" "$FAKE_HOME/code/scripts/personal/gitleaks-hook.sh"
+  chmod 644 "$FAKE_HOME/code/scripts/personal/gitleaks-hook.sh"
+  echo x >"$R/a.txt"
+  g add a.txt
+  local before
+  before="$(commit_count)"
+  run g commit -q -m x
+  assert_failure
+  assert_output --partial "gitleaks hook: $FAKE_HOME/code/scripts/personal/gitleaks-hook.sh not executable"
+  refute_output --partial "skipping"
+  [[ "$(commit_count)" -eq "$before" ]]
+}
+
+@test "gitleaks-hook: a dangling script symlink counts as missing (warns, commit succeeds)" {
+  require_config_hooks
+  init_repo
+  rm "$FAKE_HOME/code/scripts"
+  mkdir -p "$FAKE_HOME/code/scripts/personal"
+  ln -s "$T/nowhere/gitleaks-hook.sh" "$FAKE_HOME/code/scripts/personal/gitleaks-hook.sh"
+  echo x >"$R/a.txt"
+  g add a.txt
+  run g commit -q -m x
+  assert_success
+  assert_output --partial "not found, skipping"
 }
 
 @test "gitleaks-hook: an existing .git/hooks/pre-commit still runs" {

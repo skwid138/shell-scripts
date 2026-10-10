@@ -1,3 +1,3 @@
 [hook "gitleaks"]
 	event = pre-commit
-	command = "h=\"$HOME/code/scripts/personal/gitleaks-hook.sh\"; if [ -x \"$h\" ]; then exec \"$h\" --run; else echo \"gitleaks hook: $h not found, skipping\" >&2; fi"
+	command = "h=\"$HOME/code/scripts/personal/gitleaks-hook.sh\"; if [ ! -e \"$h\" ]; then echo \"gitleaks hook: $h not found, skipping\" >&2; exit 0; fi; if [ ! -x \"$h\" ]; then echo \"gitleaks hook: $h not executable\" >&2; exit 1; fi; exec \"$h\" --run"
