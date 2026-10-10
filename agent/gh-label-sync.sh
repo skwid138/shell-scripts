@@ -109,7 +109,7 @@ check_yq_flavor() {
   local version
   version="$(yq --version 2>&1)" || die_missing_dep "'yq' is required. Install mikefarah yq: brew install yq"
   case "$version" in
-    *mikefarah* | *github.com/mikefarah/yq* | *mikefarah/yq*) return 0 ;;
+    *mikefarah*) return 0 ;;
     *) die_missing_dep "mikefarah yq v4 is required. Install: brew install yq" ;;
   esac
 }

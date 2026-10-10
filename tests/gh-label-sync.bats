@@ -91,7 +91,7 @@ write_yq_stub() {
   cat >"$STUBDIR/yq" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$1" == "--version" ]]; then
-  echo "yq (https://github.com/mikefarah/yq/) version v4.45.1"
+  echo "${YQ_STUB_VERSION:-yq (https://github.com/mikefarah/yq/) version v4.45.1}"
   exit 0
 fi
 if [[ "$1" == "eval" && "$2" == "-o=json" ]]; then
@@ -485,4 +485,32 @@ JSON
     .repos[0].actions[] |
     select(.label == "invalid" and .action == "delete-blocked" and (.reason | contains("nonzero or unknown associations")))
   ' >/dev/null
+}
+
+# --- yq flavor detection (characterization; guards the SC2221/SC2222 cleanup)
+
+@test "gh-label-sync: accepts mikefarah yq version strings" {
+  for v in \
+    "yq (https://github.com/mikefarah/yq/) version v4.45.1" \
+    "yq (https://github.com/mikefarah/yq/) version 4.30.8" \
+    "mikefarah/yq version v4.2.0"; do
+    export YQ_STUB_VERSION="$v"
+    run "$SCRIPT" skwid138/demo
+    assert_success
+    refute_output --partial "mikefarah yq v4 is required"
+  done
+}
+
+@test "gh-label-sync: rejects non-mikefarah yq (python-yq) before any label calls" {
+  export YQ_STUB_VERSION="yq 3.4.3"
+
+  run "$SCRIPT" skwid138/demo
+
+  assert_failure 3
+  assert_output --partial "mikefarah yq v4 is required"
+  if grep -q '^label ' "$GH_STUB_CALLS"; then
+    printf 'unexpected label call:\n' >&2
+    cat "$GH_STUB_CALLS" >&2
+    return 1
+  fi
 }
