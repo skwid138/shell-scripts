@@ -96,7 +96,7 @@ EOF
   cat >"$STUBS/osascript" <<'EOF'
 #!/bin/bash
 printf 'osascript %s\n' "$*" >>"$CALLS"
-exit 0
+exit "$(cat "$FIX/osascript_rc" 2>/dev/null || echo 0)"
 EOF
   chmod +x "$STUBS/osascript"
   cat >"$STUBS/launchctl" <<'EOF'
@@ -434,6 +434,65 @@ assert_no_marker() {
   assert_output "$(printf '%s\n' alpha beta)"
 }
 
+@test "gitleaks-audit: a commit on a detached HEAD in a linked worktree triggers a rescan" {
+  mkrepo alpha
+  git -C "$CODE/alpha" worktree add -q --detach "$T/wt alpha"
+  run_audit --run
+  assert_success
+  run_audit
+  assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+  # No ref and no main-worktree HEAD moves: only the linked worktree's HEAD.
+  git -C "$T/wt alpha" -c user.name=t -c user.email=t@e commit -q --allow-empty -m detached
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(worktree HEADs changed\)'
+  : >"$CALLS"
+  run_audit --run
+  run scanned_repos
+  assert_output "alpha"
+}
+
+@test "gitleaks-audit: files referenced by [extend] path (chained, absolute or repo-relative) are part of the fingerprint" {
+  mkrepo alpha
+  local cfg="$FAKE_HOME/.config/gitleaks"
+  mkdir -p "$cfg"
+  printf '[extend]\npath = "%s/base.toml" # shared\n' "$cfg" >"$CODE/alpha/.gitleaks.toml"
+  printf 'title = "base"\n[extend]\npath = \x27%s/root.toml\x27\n' "$cfg" >"$cfg/base.toml"
+  printf 'title = "root"\n' >"$cfg/root.toml"
+  run_audit --run
+  run_audit
+  assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+  # Second level of the chain changes.
+  echo '# edited' >>"$cfg/root.toml"
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(gitleaks config changed\)'
+  : >"$CALLS"
+  run_audit --run
+  run scanned_repos
+  assert_output "alpha"
+  # Repo-relative extend target that is missing, then created.
+  printf 'extend.path = "shared/x.toml"\n' >"$CODE/alpha/.gitleaks.toml"
+  run_audit --run
+  run_audit
+  assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+  mkdir -p "$CODE/alpha/shared"
+  printf 'title = "x"\n' >"$CODE/alpha/shared/x.toml"
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(gitleaks config changed\)'
+}
+
+@test "gitleaks-audit: a self-extending .gitleaks.toml is bounded by the depth limit" {
+  mkrepo alpha
+  printf '[extend]\npath = ".gitleaks.toml"\n' >"$CODE/alpha/.gitleaks.toml"
+  # Bounded: an unbounded extend walk would hang instead of failing.
+  run --separate-stderr /usr/bin/perl -e 'alarm 60; exec @ARGV or die' env -i HOME="$FAKE_HOME" TMPDIR="$TMPD" \
+    CALLS="$CALLS" FIX="$FIX" MARKER="$MARKER" GITLEAKS_AUDIT_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
+    GITLEAKS_AUDIT_NOW="$NOW" /bin/bash "$SCRIPT" --run </dev/null 3>&-
+  assert_success
+  grep -q '^extend 6 depth-limit$' "$STATE"/repos/*/snapshot
+  run_audit
+  assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+}
+
 @test "gitleaks-audit: a ref change during the scan keeps the old snapshot so the next run rescans" {
   mkrepo alpha
   run_audit --run
@@ -696,6 +755,183 @@ proc_dead() { # <pid>: true once gone (polls up to 3s)
   kill "$holder" 2>/dev/null
   assert_failure 75
   [[ "$(scans)" -eq 0 ]]
+}
+
+LOCKD() { printf '%s' "$FAKE_HOME/Library/Caches/gitleaks-audit.lock"; }
+# age_path <path> <hours>: set mtime N hours in the past (real clock).
+age_path() { touch -t "$(/bin/date -v-"$2"H +%Y%m%d%H%M.%S)" "$1"; }
+
+@test "gitleaks-audit: failing to publish lock owner metadata releases the lock and exits 1 with an error notification" {
+  mkrepo alpha
+  cat >"$STUBS/mv" <<'EOF'
+#!/bin/bash
+case "${@: -1}" in */gitleaks-audit.lock/owner) exit 1 ;; esac
+exec /bin/mv "$@"
+EOF
+  chmod +x "$STUBS/mv"
+  run_audit --run
+  assert_failure 1
+  [[ ! -e "$(LOCKD)" ]]
+  [[ "$(scans)" -eq 0 ]]
+  run notifies
+  assert_output --partial "error"
+  # The next run (mv healthy again) is not blocked by a leftover lock.
+  rm "$STUBS/mv"
+  run_audit --run
+  assert_success
+}
+
+@test "gitleaks-audit: a crash mid-publish (only owner.tmp.* left) blocks while fresh, is reclaimed once stale" {
+  mkrepo alpha
+  mkdir -p "$(LOCKD)"
+  printf 'pid=1
+' >"$(LOCKD)/owner.tmp.4242"
+  run_audit --run
+  assert_failure 75
+  [[ "$(scans)" -eq 0 ]]
+  [[ -e "$(LOCKD)/owner.tmp.4242" ]]
+  age_path "$(LOCKD)" 7
+  run_audit --run
+  assert_success
+  assert_output --partial "reclaiming"
+  [[ "$(scans)" -eq 1 ]]
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: an ambiguous lock (empty, or unparseable owner) is 75 while fresh and reclaimed when older than 6h" {
+  mkrepo alpha
+  mkdir -p "$(LOCKD)"
+  run_audit --run
+  assert_failure 75
+  age_path "$(LOCKD)" 7
+  run_audit --run
+  assert_success
+  assert_output --partial "reclaiming"
+
+  mkdir -p "$(LOCKD)"
+  printf 'garbage\n' >"$(LOCKD)/owner"
+  age_path "$(LOCKD)" 5
+  run_audit --run
+  assert_failure 75
+  age_path "$(LOCKD)" 7
+  run_audit --run
+  assert_success
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: a dead-pid lock with leftover owner.tmp.* is reclaimed" {
+  mkrepo alpha
+  sleep 0 &
+  local dead=$!
+  wait "$dead"
+  mkdir -p "$(LOCKD)"
+  printf 'pid=%s\nhost=%s\nstarted=1\n' "$dead" "$(/bin/hostname)" >"$(LOCKD)/owner"
+  printf 'x\n' >"$(LOCKD)/owner.tmp.777"
+  run_audit --run
+  assert_success
+  assert_output --partial "reclaiming"
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: a live lock held for more than a day notifies; a fresh one does not" {
+  mkrepo alpha
+  sleep 60 &
+  local holder=$!
+  mkdir -p "$(LOCKD)"
+  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$holder" "$(/bin/hostname)" "$(($(/bin/date -u +%s) - 3600))" >"$(LOCKD)/owner"
+  run_audit --run
+  assert_failure 75
+  run notifies
+  assert_output ""
+  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$holder" "$(/bin/hostname)" "$(($(/bin/date -u +%s) - 2 * 86400))" >"$(LOCKD)/owner"
+  run_audit --run
+  kill "$holder" 2>/dev/null
+  assert_failure 75
+  run notifies
+  assert_output --partial "lock held"
+  [[ "$(scans)" -eq 0 ]]
+}
+
+PENDING() { printf '%s' "$STATE/pending-announce"; }
+
+@test "gitleaks-audit: a baseline announcement that fails to notify stays pending and is retried by the next (unchanged) run" {
+  mkrepo alpha
+  findings alpha 2
+  echo 1 >"$FIX/osascript_rc"
+  run_audit --run
+  assert_success
+  assert_no_marker
+  [[ -s "$(PENDING)" ]]
+  grep -q 'pending' "$LOGF"
+  run cat "$(PENDING)"
+  assert_output --partial "baselined"
+  assert_output --partial "alpha"
+  # Next run: nothing changed, osascript healthy -> retried, then cleared.
+  rm "$FIX/osascript_rc"
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(scans)" -eq 0 ]]
+  assert_output --partial "pending"
+  run notifies
+  assert_output --partial "2 existing findings in 1 repos baselined"
+  [[ ! -e "$(PENDING)" ]]
+  # And then it is quiet.
+  : >"$CALLS"
+  run_audit --run
+  run notifies
+  assert_output ""
+}
+
+@test "gitleaks-audit: a missing osascript or --no-notify keeps the announcement pending" {
+  mkrepo alpha
+  findings alpha 1
+  # A notifier that is not on PATH (the real /usr/bin/osascript would be).
+  run --separate-stderr env -i HOME="$FAKE_HOME" TMPDIR="$TMPD" CALLS="$CALLS" FIX="$FIX" MARKER="$MARKER" \
+    GITLEAKS_AUDIT_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" GITLEAKS_AUDIT_NOW="$NOW" \
+    GITLEAKS_AUDIT_NOTIFIER=no-such-notifier /bin/bash "$SCRIPT" --run </dev/null 3>&-
+  assert_success
+  [[ -s "$(PENDING)" ]]
+  run notifies
+  assert_output ""
+  run_audit --run --no-notify
+  [[ -s "$(PENDING)" ]]
+  run notifies
+  assert_output ""
+  : >"$CALLS"
+  run_audit --run
+  run notifies
+  assert_output --partial "1 existing findings in 1 repos baselined"
+  [[ ! -e "$(PENDING)" ]]
+}
+
+@test "gitleaks-audit: a successful notification leaves nothing pending" {
+  mkrepo alpha
+  findings alpha 1
+  run_audit --run
+  run notifies
+  assert_output --partial "baselined"
+  [[ ! -e "$(PENDING)" ]]
+}
+
+@test "gitleaks-audit: undelivered NEW findings stay pending; the retry run exits 0 but still announces them" {
+  mkrepo alpha
+  findings alpha 1
+  run_audit --run
+  commit_in alpha
+  findings alpha 2
+  echo 1 >"$FIX/osascript_rc"
+  run_audit --run
+  assert_failure 10
+  run cat "$(PENDING)"
+  assert_output --partial "new"
+  rm "$FIX/osascript_rc"
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  run notifies
+  assert_output --partial "1 NEW"
+  [[ ! -e "$(PENDING)" ]]
 }
 
 @test "gitleaks-audit: --no-notify suppresses notifications" {

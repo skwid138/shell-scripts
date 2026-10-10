@@ -56,9 +56,11 @@ Each scan runs in its own process group under a watchdog; on timeout or
 interruption the whole group gets TERM, then KILL.
 
 Change detection: before each scan the script snapshots every ref
-(`git for-each-ref`, including refs/stash), HEAD, the sha256 of the
-worktree .gitleaks.toml and .gitleaksignore (or "absent"), and the gitleaks
-version. The snapshot is persisted only after a complete scan (rc 0 or 10,
+(`git for-each-ref`, including refs/stash), HEAD, every worktree's HEAD
+(`git worktree list --porcelain`), the sha256 of the worktree .gitleaks.toml
+and .gitleaksignore (or "absent") and of each file in its [extend] path chain
+(depth <= 5; relative paths resolve against the repo; "missing" recorded),
+and the gitleaks version. The snapshot is persisted only after a complete scan (rc 0 or 10,
 report parsed and reduced, state written) whose refs did not move mid-scan.
 
 Discovery: directories named .git up to 3 levels below ~/code (node_modules
@@ -72,7 +74,10 @@ but unreadable = error (nothing scanned).
 Baseline: the first complete scan of a repo records its findings as known and
 the notification says "N existing findings in M repos baselined — run
 `gitleaks-audit.sh --report`". Afterwards only NEW fingerprints and errors
-notify; clean or known-only runs are silent.
+notify; clean or known-only runs are silent. A baseline/NEW announcement
+whose notification is not delivered (osascript missing or failing, or
+--no-notify) is kept in the state dir (counts and repo names only) and
+retried by every later --run until delivered.
 
 Files:
   State:  ~/Library/Application Support/gitleaks-audit (700; files 600)
@@ -96,6 +101,9 @@ Environment overrides (tests/advanced use):
   GITLEAKS_AUDIT_TIMEOUT     per-scan watchdog seconds (default 1800)
   GITLEAKS_AUDIT_KILL_GRACE  seconds between TERM and KILL (default 5)
   GITLEAKS_AUDIT_NOW         epoch seconds to use as "now"
+  GITLEAKS_AUDIT_NOTIFIER    notification command (default osascript)
+  GITLEAKS_AUDIT_LOCK_STALE_SECS  age after which an ambiguous lock is
+                             reclaimed (default 21600 = 6h)
 EOF
 }
 
@@ -130,6 +138,7 @@ SYSTEM_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH="${GITLEAKS_AUDIT_BASE_PATH:-/opt/homebrew/bin:/usr/local/bin:$SYSTEM_PATH}"
 TIMEOUT="${GITLEAKS_AUDIT_TIMEOUT:-1800}"
 GRACE="${GITLEAKS_AUDIT_KILL_GRACE:-5}"
+NOTIFIER="${GITLEAKS_AUDIT_NOTIFIER:-osascript}"
 [[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die_usage "GITLEAKS_AUDIT_TIMEOUT must be a positive integer"
 [[ "$GRACE" =~ ^[0-9]+$ ]] || die_usage "GITLEAKS_AUDIT_KILL_GRACE must be a non-negative integer"
 
@@ -140,6 +149,7 @@ STATE_DIR="$HOME/Library/Application Support/gitleaks-audit"
 REPOS_DIR="$STATE_DIR/repos"
 META_FILE="$STATE_DIR/meta"
 LAST_RUN_FILE="$STATE_DIR/last-run"
+PENDING_FILE="$STATE_DIR/pending-announce"
 LOG_FILE="$HOME/Library/Logs/gitleaks-audit.log"
 LOG_MAX_BYTES=1048576
 LOCK_DIR="$HOME/Library/Caches/gitleaks-audit.lock"
@@ -210,7 +220,7 @@ cleanup() {
     local owner_pid=""
     owner_pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
     if [[ "$owner_pid" == "$$" ]]; then
-      rm -f "$LOCK_DIR/owner"
+      rm -f "$LOCK_DIR/owner" "$LOCK_DIR/owner.tmp.$$"
       rmdir "$LOCK_DIR" 2>/dev/null
     fi
     LOCK_HELD=0
@@ -263,44 +273,105 @@ log() {
 # --- lock ----------------------------------------------------------------------
 
 LOCK_BUSY_EXIT=75
+# An ambiguous lock (no/unparseable owner, or another hostname — macOS
+# hostnames change with networks) is reclaimed once the lock dir has been
+# untouched this long. A healthy run publishes its owner within milliseconds
+# of mkdir, so 6h (far beyond any run plus watchdogs) is conservative.
+LOCK_STALE_SECS="${GITLEAKS_AUDIT_LOCK_STALE_SECS:-21600}"
+# A live holder older than this is reported by notification (hung run or a
+# recycled pid), so a stuck lock never silently stops the daily audit.
+LOCK_NOTIFY_SECS=86400
 THIS_HOST="$(/bin/hostname 2>/dev/null || echo unknown)"
+LOCK_ERR=""
+LOCK_BUSY_NOTE=""
 
+# write_lock_owner: publish owner metadata atomically (tmp + rename). On
+# failure the tmp file is removed and 1 is returned.
 write_lock_owner() {
-  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$$" "$THIS_HOST" "$(/bin/date -u +%s)" >"$LOCK_DIR/owner.tmp.$$" &&
-    mv -f "$LOCK_DIR/owner.tmp.$$" "$LOCK_DIR/owner"
-}
-
-# acquire_lock: 0 = held; 1 = busy/ambiguous. Reclaims only a clearly stale
-# lock (same host, numeric pid that is not running).
-acquire_lock() {
-  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    LOCK_HELD=1
-    write_lock_owner || log "lock: acquired $LOCK_DIR but could not write owner metadata"
+  local tmp="$LOCK_DIR/owner.tmp.$$"
+  if { printf 'pid=%s\nhost=%s\nstarted=%s\n' "$$" "$THIS_HOST" "$(/bin/date -u +%s)" >"$tmp" &&
+    mv -f "$tmp" "$LOCK_DIR/owner"; } 2>/dev/null; then
     return 0
   fi
-  local pid="" host=""
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# take_lock: 0 = held; 1 = lock dir already exists; 2 = created but the owner
+# could not be published, so the lock was released again (LOCK_ERR set).
+# Everything inside a dir we just created is ours to remove.
+take_lock() {
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  if write_lock_owner; then
+    LOCK_HELD=1
+    return 0
+  fi
+  rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
+  rmdir "$LOCK_DIR" 2>/dev/null
+  LOCK_ERR="lock: could not write owner metadata in $LOCK_DIR; lock released"
+  return 2
+}
+
+# reclaim_lock <why>: remove a stale lock (owner and any owner.tmp.* left by
+# a crash mid-publish) and take it. Same return codes as take_lock.
+reclaim_lock() {
+  log "lock: reclaiming $LOCK_DIR ($1)"
+  rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
+  if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+    log "lock: could not reclaim $LOCK_DIR (unexpected contents); skipping run"
+    return 1
+  fi
+  take_lock
+  case $? in
+    0) return 0 ;;
+    1)
+      log "lock: a concurrent run took $LOCK_DIR first; skipping run"
+      return 1
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+# seconds_since <epoch>: real-clock age (never GITLEAKS_AUDIT_NOW); empty if
+# the argument is not an epoch.
+seconds_since() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 0
+  echo $(($(/bin/date -u +%s) - $1))
+}
+
+# acquire_lock: 0 = held; 1 = busy (exit 75; LOCK_BUSY_NOTE set when a live
+# holder is older than LOCK_NOTIFY_SECS); 2 = owner publish failed (error).
+acquire_lock() {
+  local rc pid="" host="" started="" age
+  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
+  take_lock
+  rc=$?
+  [[ $rc -eq 1 ]] || return $rc
   if [[ -f "$LOCK_DIR/owner" ]]; then
     pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
     host="$(sed -n 's/^host=//p' "$LOCK_DIR/owner" 2>/dev/null)"
+    started="$(sed -n 's/^started=//p' "$LOCK_DIR/owner" 2>/dev/null)"
   fi
-  if [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ || "$host" != "$THIS_HOST" ]]; then
-    log "lock: $LOCK_DIR exists with ambiguous ownership (pid='${pid}' host='${host}'); skipping run"
-    return 1
+  if [[ "$pid" =~ ^[0-9]+$ && "$host" == "$THIS_HOST" ]]; then
+    if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
+      age="$(seconds_since "$started")"
+      [[ -n "$age" ]] || age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
+      log "lock: held by live pid $pid for ${age:-?}s; skipping run"
+      if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_NOTIFY_SECS" ]]; then
+        LOCK_BUSY_NOTE="lock held by pid $pid for $((age / 3600))h; audit not running - see ~/Library/Logs/gitleaks-audit.log"
+      fi
+      return 1
+    fi
+    reclaim_lock "dead pid $pid"
+    return $?
   fi
-  if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
-    log "lock: held by live pid $pid; skipping run"
-    return 1
+  age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
+  if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_STALE_SECS" ]]; then
+    reclaim_lock "ambiguous ownership (pid='${pid}' host='${host}') untouched for ${age}s >= ${LOCK_STALE_SECS}s"
+    return $?
   fi
-  log "lock: reclaiming stale lock from dead pid $pid"
-  rm -f "$LOCK_DIR/owner"
-  if ! rmdir "$LOCK_DIR" 2>/dev/null || ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    log "lock: could not reclaim $LOCK_DIR; skipping run"
-    return 1
-  fi
-  LOCK_HELD=1
-  write_lock_owner || log "lock: could not write owner metadata"
-  return 0
+  log "lock: $LOCK_DIR exists with ambiguous ownership (pid='${pid}' host='${host}', untouched ${age:-?}s < ${LOCK_STALE_SECS}s); skipping run"
+  return 1
 }
 
 # --- process-group runner ----------------------------------------------------
@@ -440,6 +511,56 @@ classify() {
 # --- snapshot ------------------------------------------------------------------
 
 GITLEAKS_VERSION=""
+EXTEND_MAX_DEPTH=5
+
+# toml_extend_path <file>: the value of [extend] path (or a top-level dotted
+# extend.path) in a gitleaks TOML config; prints nothing if absent.
+toml_extend_path() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*\[/ { sect = $0; sub(/#.*/, "", sect); gsub(/[[:space:]]/, "", sect); next }
+    {
+      line = $0
+      if (sect == "[extend]" && line ~ /^[[:space:]]*path[[:space:]]*=/) ok = 1
+      else if (sect == "" && line ~ /^[[:space:]]*extend[[:space:]]*\.[[:space:]]*path[[:space:]]*=/) ok = 1
+      else next
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      q = substr(line, 1, 1)
+      if (q != "\"" && q != "\047") next
+      line = substr(line, 2)
+      i = index(line, q)
+      if (i == 0) next
+      print substr(line, 1, i - 1)
+      exit
+    }' "$1" 2>/dev/null
+}
+
+# snapshot_extends <abs> <config>: one line per [extend] hop (depth, sha256 or
+# "missing", resolved path). Relative paths resolve against the repo, which is
+# gitleaks' cwd for the scan. Bounded by EXTEND_MAX_DEPTH (cycles included).
+snapshot_extends() {
+  local abs="$1" cur="$2" depth=1 p resolved h
+  while [[ $depth -le $EXTEND_MAX_DEPTH ]]; do
+    [[ -f "$cur" ]] || return 0
+    p="$(toml_extend_path "$cur")"
+    [[ -n "$p" ]] || return 0
+    case "$p" in
+      /*) resolved="$p" ;;
+      *) resolved="$abs/$p" ;;
+    esac
+    if [[ ! -f "$resolved" ]]; then
+      printf 'extend %s missing %s\n' "$depth" "$resolved"
+      return 0
+    fi
+    h="$(sha256_file "$resolved")"
+    [[ -n "$h" ]] || return 1
+    printf 'extend %s %s %s\n' "$depth" "$h" "$resolved"
+    cur="$resolved"
+    depth=$((depth + 1))
+  done
+  printf 'extend %s depth-limit\n' "$depth"
+}
+
 # snapshot <abs> <out>: the complete set of scan inputs for one repo.
 snapshot() {
   local abs="$1" out="$2" f h head
@@ -456,12 +577,18 @@ snapshot() {
         printf 'config %s absent\n' "$f"
       fi
     done
+    snapshot_extends "$abs" "$abs/.gitleaks.toml" || return 1
     if head="$(git -C "$abs" rev-parse --verify -q HEAD 2>/dev/null)"; then
       printf 'head %s\n' "$head"
     else
       printf 'head %s\n' "$(git -C "$abs" symbolic-ref -q HEAD 2>/dev/null || echo detached-or-unborn) unborn"
     fi
     git -C "$abs" for-each-ref --format='ref %(refname) %(objectname)' 2>/dev/null || return 1
+    # Every linked worktree's HEAD (gitleaks' `git log --all` scans them, and
+    # a detached commit there moves no ref). The first porcelain record is
+    # the main worktree, already covered by the head line above.
+    git -C "$abs" worktree list --porcelain 2>/dev/null |
+      awk '/^worktree /{ n++; w = substr($0, 10) } /^HEAD / && n > 1 { print "worktree " $2 " " w }' || return 1
   } >"$out"
 }
 
@@ -474,9 +601,10 @@ change_reason() {
   fi
   cmp -s "$old" "$new" && return 0
   [[ "$(grep '^gitleaks-version ' "$old")" == "$(grep '^gitleaks-version ' "$new")" ]] || r="$r, gitleaks version changed"
-  [[ "$(grep '^config ' "$old")" == "$(grep '^config ' "$new")" ]] || r="$r, gitleaks config changed"
+  [[ "$(grep -E '^(config|extend) ' "$old")" == "$(grep -E '^(config|extend) ' "$new")" ]] || r="$r, gitleaks config changed"
   [[ "$(grep '^head ' "$old")" == "$(grep '^head ' "$new")" ]] || r="$r, HEAD moved"
   [[ "$(grep '^ref ' "$old")" == "$(grep '^ref ' "$new")" ]] || r="$r, refs changed"
+  [[ "$(grep '^worktree ' "$old")" == "$(grep '^worktree ' "$new")" ]] || r="$r, worktree HEADs changed"
   [[ -n "$r" ]] || r=", inputs changed"
   echo "${r#, }"
 }
@@ -620,11 +748,13 @@ scan_repo() {
   if [[ $known_existed -eq 0 && "$n" -gt 0 ]]; then
     N_BASELINED=$((N_BASELINED + n))
     N_BASELINED_REPOS=$((N_BASELINED_REPOS + 1))
+    printf 'baselined\t%s\t%s\n' "$n" "$rel" >>"$WORK/announce"
     tag=" (baselined)"
   fi
   if [[ "$n_new" -gt 0 ]]; then
     N_NEW=$((N_NEW + n_new))
     N_NEW_REPOS=$((N_NEW_REPOS + 1))
+    printf 'new\t%s\t%s\n' "$n_new" "$rel" >>"$WORK/announce"
     tag=" (NEW)"
   fi
   log "  scanned $rel: rc=$rc findings=$n new=$n_new$tag $((SECONDS - started))s"
@@ -640,14 +770,38 @@ scan_repo() {
 
 # --- notification ----------------------------------------------------------------
 
+# send_notify <msg>: 0 only when delivered (notifications enabled, osascript
+# present, and it exited 0).
+send_notify() {
+  [[ "$NOTIFY" -eq 1 ]] || return 1
+  command -v "$NOTIFIER" >/dev/null 2>&1 || return 1
+  run_group "$HOME" "$WORK/notify.out" "$WORK/notify.err" \
+    "$NOTIFIER" -e "display notification \"$1\" with title \"gitleaks-audit\""
+}
+
+# announce_counts <kind> <file>: "<total> <distinct repos>" for that kind.
+announce_counts() {
+  awk -F'\t' -v k="$1" '$1 == k { n += $2; if (!($3 in r)) { r[$3] = 1; c++ } } END { print n + 0, c + 0 }' "$2" 2>/dev/null
+}
+
+# notify: one notification for this run's announcements (baselined / NEW
+# findings) merged with any still-pending ones from earlier runs, plus the
+# error count. Announcements are persisted to PENDING_FILE (counts and repo
+# names only) until a notification is actually delivered, so a failed or
+# suppressed notification never loses a baseline or NEW announcement.
+# Errors are not persisted: they are re-detected by the next run.
 notify() {
-  [[ "$NOTIFY" -eq 1 ]] || return 0
-  local msg="" part
-  if [[ "$N_NEW" -gt 0 ]]; then
-    msg="$N_NEW NEW finding(s) in $N_NEW_REPOS repo(s) - run gitleaks-audit.sh --report"
+  local all="$WORK/announce.all" msg="" part nn rn nb rb
+  : >"$all"
+  [[ -s "$PENDING_FILE" ]] && cat "$PENDING_FILE" >>"$all" 2>/dev/null
+  [[ -s "$WORK/announce" ]] && cat "$WORK/announce" >>"$all"
+  read -r nn rn <<<"$(announce_counts new "$all")"
+  read -r nb rb <<<"$(announce_counts baselined "$all")"
+  if [[ "$nn" -gt 0 ]]; then
+    msg="$nn NEW finding(s) in $rn repo(s) - run gitleaks-audit.sh --report"
   fi
-  if [[ "$N_BASELINED" -gt 0 ]]; then
-    part="$N_BASELINED existing findings in $N_BASELINED_REPOS repos baselined — run \`gitleaks-audit.sh --report\`"
+  if [[ "$nb" -gt 0 ]]; then
+    part="$nb existing findings in $rb repos baselined — run \`gitleaks-audit.sh --report\`"
     msg="${msg:+$msg · }$part"
   fi
   if [[ "$RUN_ERRORS" -gt 0 ]]; then
@@ -655,9 +809,20 @@ notify() {
     msg="${msg:+$msg · }$part"
   fi
   [[ -n "$msg" ]] || return 0
-  command -v osascript >/dev/null 2>&1 || return 0
-  run_group "$HOME" "$WORK/notify.out" "$WORK/notify.err" \
-    osascript -e "display notification \"$msg\" with title \"gitleaks-audit\"" || true
+  if send_notify "$msg"; then
+    if [[ -e "$PENDING_FILE" ]] && ! rm -f "$PENDING_FILE" 2>/dev/null; then
+      log "  ERROR: notification delivered but $PENDING_FILE could not be removed (it will be re-announced)"
+    fi
+    return 0
+  fi
+  [[ -s "$all" ]] || return 0
+  if [[ -d "$STATE_DIR" ]] && { cp "$all" "$PENDING_FILE.tmp" && mv -f "$PENDING_FILE.tmp" "$PENDING_FILE"; } 2>/dev/null; then
+    log "  notification not delivered; announcement pending, retried next run ($nn new in $rn repos, $nb baselined in $rb repos)"
+  else
+    rm -f "$PENDING_FILE.tmp" 2>/dev/null
+    RUN_ERRORS=$((RUN_ERRORS + 1))
+    log "  ERROR: notification not delivered and the announcement could not be saved to $PENDING_FILE"
+  fi
 }
 
 # --- modes -----------------------------------------------------------------------
@@ -694,10 +859,19 @@ do_scan_mode() { # dry-run | run | full
   : >"$RULES_FILE"
   if [[ "$mode" != "dry-run" ]]; then
     open_log
-    if ! acquire_lock; then
-      EXIT_CODE=$LOCK_BUSY_EXIT
-      return
-    fi
+    acquire_lock
+    case $? in
+      0) ;;
+      2)
+        fatal_run "$LOCK_ERR"
+        return
+        ;;
+      *)
+        EXIT_CODE=$LOCK_BUSY_EXIT
+        [[ -n "$LOCK_BUSY_NOTE" ]] && { send_notify "$LOCK_BUSY_NOTE" || true; }
+        return
+        ;;
+    esac
     log "gitleaks-audit $mode starting (pid $$, bash $BASH_VERSION)"
   fi
   if ! missing="$(require_tools)"; then
@@ -710,6 +884,16 @@ do_scan_mode() { # dry-run | run | full
     return
   fi
   [[ "$mode" == "dry-run" ]] || log "gitleaks $GITLEAKS_VERSION, $(git --version 2>/dev/null)"
+  if [[ -s "$PENDING_FILE" ]]; then
+    local pn pr pb prb
+    read -r pn pr <<<"$(announce_counts new "$PENDING_FILE")"
+    read -r pb prb <<<"$(announce_counts baselined "$PENDING_FILE")"
+    if [[ "$mode" == "dry-run" ]]; then
+      log "announcement pending from an earlier run ($pn new in $pr repos, $pb baselined in $prb repos); --run retries the notification"
+    else
+      log "announcement pending from an earlier run ($pn new in $pr repos, $pb baselined in $prb repos); retrying the notification at the end of this run"
+    fi
+  fi
   if ! load_excludes; then
     fatal_run "$CONFIG_ERR; nothing scanned"
     return
@@ -834,6 +1018,7 @@ summarize() {
     fi
   fi
   [[ "$LOG_WRITE_FAILED" -eq 1 ]] && RUN_ERRORS=$((RUN_ERRORS + 1))
+  notify
 
   if [[ "$RUN_ERRORS" -gt 0 ]]; then
     EXIT_CODE=1
@@ -850,7 +1035,6 @@ summarize() {
     log "  ERROR: could not write $LAST_RUN_FILE"
   fi
   log "gitleaks-audit finished: exit $EXIT_CODE"
-  notify
 }
 
 do_report() {
