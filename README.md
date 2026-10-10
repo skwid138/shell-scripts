@@ -61,6 +61,15 @@ the login/rc cost. Login shells run env + login. Interactive shells run all
 three. See the dotfiles `README.md` for how the wiring lives in
 `~/.zshenv` / `~/.zprofile` / `~/.zshrc`.
 
+The rc tier (`rc/zsh_config.zsh`) forces zsh's emacs keymap (with
+`EDITOR=vim` zsh would otherwise pick vi mode), binds fn+←/fn+→ to
+beginning/end of line with a reminder to use Ctrl+A / Ctrl+E, and enables
+`HIST_IGNORE_SPACE` so commands typed with a leading space are left out of
+history (they still show up in `ps` and other process listings). Completion
+is initialized by zplug (`rc/zsh_plugins.zsh`) when it's installed; if
+completion isn't initialized by then, `init_rc.zsh` runs a fallback
+`compinit`.
+
 ### `.zsh` vs `.sh` extension convention
 
 - **`.sh`** — POSIX/bash-portable. Linted by `shellcheck` in bash mode
@@ -154,7 +163,7 @@ Every script takes `-h` / `--help`.
 ### Personal launchers (`personal/`)
 
 A few scripts here are interactive launchers wired up via aliases in
-`shell/rc/aliases.zsh`:
+`shell/rc/aliases.zsh`; others are run directly:
 
 - `openweb` → `personal/opencode-web.sh` — start opencode's web UI for remote
   access via Tailscale (loads password lazily from Keychain, wraps in
@@ -167,6 +176,11 @@ A few scripts here are interactive launchers wired up via aliases in
   Studio local models surfaced through OpenCode's static `lmstudio` provider.
   `opensession --local` calls `local-models start` only; it does not load a
   model or imply `--restart`. See [`docs/local-models.md`](docs/local-models.md).
+- `personal/cache-prune.sh` (no alias) — conservative
+  developer-cache cleanup (uv, pnpm, npm, Docker via OrbStack). Dry-run
+  by default; `--apply` prunes. `--install` / `--uninstall` manage a monthly
+  LaunchAgent (day 1, 10:00) that runs `--apply`. Logs to
+  `~/Library/Logs/cache-prune.log`.
 
 ## Development
 
