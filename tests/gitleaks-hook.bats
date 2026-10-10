@@ -81,10 +81,12 @@ require_config_hooks() {
   local d="$T/probe"
   "$REAL_GIT" init -q "$d" 2>/dev/null || skip "git init failed"
   local out
+  # `|| true`: bats runs tests under `set -e`; an old git fails `hook run`
+  # (or ignores hook.<name>.*) and must skip, not error.
   out="$(cd "$d" && env -i PATH="$GITBIN:/usr/bin:/bin" HOME="$FAKE_HOME" GIT_CONFIG_NOSYSTEM=1 \
     GIT_CONFIG_GLOBAL=/dev/null "$REAL_GIT" -c hook.probe.event=pre-commit \
-    -c 'hook.probe.command=echo config-hooks-ok' hook run pre-commit 2>&1)"
-  [[ "$out" == *config-hooks-ok* ]] || skip "git $("$REAL_GIT" --version) lacks config-based hooks"
+    -c 'hook.probe.command=echo config-hooks-ok' hook run pre-commit 2>&1)" || true
+  [[ "$out" == *config-hooks-ok* ]] || skip "$("$REAL_GIT" --version) lacks config-based hooks"
 }
 
 require_real_gitleaks() {
