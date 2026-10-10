@@ -12,7 +12,8 @@
 #   1. Sourcing init.zsh exits 0 (no leaked exit codes from optional sources).
 #   2. After sourcing, REPO_ROOT is exported (env-tier ran).
 #   3. After sourcing, load_nvmrc is defined (login-tier ran).
-#   4. After sourcing, _COMPINIT_DONE=1 (rc-tier ran).
+#   4. After sourcing, _COMPINIT_DONE=1 (rc-tier ran; completion system
+#      ready — initialized by zplug, or by init_rc's fallback compinit).
 #   5. Sourcing produces zero stdout (silence contract preserved end-to-end).
 #   6. The legacy init.sh path resolves: a symlink/path check confirms
 #      the rename is the only change — no consumers broken silently.
@@ -33,6 +34,39 @@ setup() {
   # so plugin behavior outside tests is unchanged.
   export ZPLUG_HOME="$BATS_TEST_TMPDIR/.zplug"
   mkdir -p "$ZPLUG_HOME/log"
+  # Sandbox HOME for every zsh this file spawns. Production barrels resolve
+  # ~/.nvm, ~/miniconda3, ~/code/wpromote/scripts (private layer) and the
+  # default compinit dump relative to $HOME, so a temp HOME keeps tests off
+  # the real ones (see the sandbox canary test below).
+  export HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$HOME"
+  # Keep any fallback compinit dump (${ZDOTDIR:-$HOME}/.zcompdump) in a
+  # temp dir too.
+  export ZDOTDIR="$BATS_TEST_TMPDIR/zdot"
+  mkdir -p "$ZDOTDIR"
+}
+
+@test "compat: barrels resolve HOME-relative private/tool paths inside the test sandbox" {
+  # Canary: plant fake private-layer and nvm files under the sandbox HOME.
+  # If the barrels see them, every $HOME-relative lookup (wpromote layer,
+  # ~/.nvm, ~/miniconda3, ~/.zcompdump) is confined to the sandbox.
+  [[ "$HOME" == "$BATS_TEST_TMPDIR"/* ]]
+  CANARY="$BATS_TEST_TMPDIR/canary.log"
+  : >"$CANARY"
+  priv="$HOME/code/wpromote/scripts/shell"
+  mkdir -p "$priv" "$HOME/.nvm"
+  for tier in env profile rc; do
+    printf 'print -r -- wpromote-%s >>%q\n' "$tier" "$CANARY" >"$priv/init_$tier.zsh"
+  done
+  printf 'nvm() { print -r -- "nvm $*" >>%q; }\n' "$CANARY" >"$HOME/.nvm/nvm.sh"
+
+  run zsh --no-rcs -c "source '$REPO/shell/init.zsh' >/dev/null 2>&1"
+  assert_success
+  run cat "$CANARY"
+  assert_line "wpromote-env"
+  assert_line "wpromote-profile"
+  assert_line "wpromote-rc"
+  assert_line "nvm use default --silent"
 }
 
 @test "compat: sourcing init.zsh exits 0" {
@@ -122,8 +156,15 @@ setup() {
   assert_output "defined"
 }
 
-@test "compat: shim runs rc-tier (_COMPINIT_DONE=1)" {
+@test "compat: shim runs rc-tier (_COMPINIT_DONE=1, completion ready)" {
+  # _COMPINIT_DONE=1 means "completion system ready" whether zplug or the
+  # init_rc fallback initialized it, and is only set when that's true.
+  # compaudit is stubbed because under a tty-less CI harness with
+  # group-writable fpath dirs the real audit aborts compinit (a harness
+  # artifact — see the stderr denylist above), which would correctly leave
+  # _COMPINIT_DONE unset.
   run zsh --no-rcs -c "
+    compaudit() { return 0; }
     source '$REPO/shell/init.zsh' >/dev/null 2>&1
     print -- \"\${_COMPINIT_DONE:-unset}\"
   "

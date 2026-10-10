@@ -4,15 +4,27 @@
 #
 # Contract under test (zsh_init_plan.md §3):
 #   - Sources rc/* sub-files.
-#   - Runs central compinit guard (`_COMPINIT_DONE=1` after first source).
-#   - Re-sourcing does not re-run compinit (guard is effective).
+#   - Completion-system guard: `_COMPINIT_DONE=1` means "completion system
+#     ready" and is set ONLY when that is true.
+#     * If completion is already initialized (compdef defined — e.g. zplug
+#       ran compinit against $ZPLUG_HOME/zcompdump), the barrel does NOT
+#       call compinit again and writes no second dump file.
+#     * Otherwise (zplug absent or its compinit failed) the barrel falls
+#       back to its own compinit on ${ZDOTDIR:-$HOME}/.zcompdump: full
+#       (audited) when the dump is missing or >=24h old, `-C` when fresh.
+#       If that compinit fails or leaves compdef undefined, _COMPINIT_DONE
+#       stays unset so a later source can retry.
+#     * With `_COMPINIT_DONE` already set, compinit is never called.
 #   - Sources lib/auto_nvm.zsh (idempotent re-source, no duplicate hook).
 #
-# Note: rc/zsh_plugins.zsh sources zplug, which calls `compinit` internally
-# during `zplug load` for each plugin. This is independent of our central
-# compinit guard. The guard prevents OUR call from firing twice; it doesn't
-# (and can't) prevent zplug's internal calls. Tests below assert the guard
-# behavior we control, not zplug's.
+# Tests that need exact compinit call counts point SCRIPTS_DIR at an empty
+# dir so no rc sub-file (in particular zplug, which calls compinit itself)
+# runs; only the barrel's own guard block executes.
+#
+# HOME, ZDOTDIR and ZPLUG_HOME are exported as per-test temp dirs in setup(),
+# so no test (including the full-barrel ones) reads or writes the real
+# ~/.zcompdump, ~/.zplug, ~/.nvm, ~/miniconda3 or the private
+# ~/code/wpromote layer — all of those are $HOME-relative in production.
 
 setup() {
   load 'test_helper/bats-support/load'
@@ -25,12 +37,46 @@ setup() {
   # honors a pre-set $ZPLUG_HOME, so behavior outside tests is unchanged.
   export ZPLUG_HOME="$BATS_TEST_TMPDIR/.zplug"
   mkdir -p "$ZPLUG_HOME/log"
+  # Sandbox HOME for every zsh this file spawns (see header).
+  ISO_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$ISO_HOME"
+  export HOME="$ISO_HOME"
+  # Keep compinit's default dump (${ZDOTDIR:-$HOME}/.zcompdump) in a temp dir.
+  export ZDOTDIR="$BATS_TEST_TMPDIR/zdot"
+  mkdir -p "$ZDOTDIR"
+  # Isolated-barrel fixtures (see header).
+  EMPTY_SCRIPTS_DIR="$BATS_TEST_TMPDIR/empty-scripts"
+  mkdir -p "$EMPTY_SCRIPTS_DIR"
+  COMPINIT_LOG="$BATS_TEST_TMPDIR/compinit.log"
+  : >"$COMPINIT_LOG"
 }
 
-# --- compinit guard ---------------------------------------------------------
+# Source only init_rc.zsh's own logic (no rc sub-files, no zplug), with a
+# logging compinit stub that models a successful compinit (defines compdef).
+# $1 = zsh snippet run before sourcing (may redefine compinit).
+run_isolated_rc_with_stub() {
+  run zsh --no-rcs -c "
+    SCRIPTS_DIR='$EMPTY_SCRIPTS_DIR'
+    compinit() { print -r -- \"compinit\${*:+ \$*}\" >>'$COMPINIT_LOG'; compdef() { :; }; }
+    $1
+    source '$REPO/shell/init_rc.zsh'
+    print -- \"done=\${_COMPINIT_DONE:-unset}\"
+  "
+}
+
+# touch -t timestamp for N minutes ago (BSD date on macOS, GNU date on Linux CI).
+stamp_minutes_ago() {
+  date -v-"$1"M +%Y%m%d%H%M.%S 2>/dev/null || date -d "-$1 minutes" +%Y%m%d%H%M.%S
+}
+
+# --- completion-system guard -----------------------------------------------
 
 @test "init_rc: sets _COMPINIT_DONE=1 after first source" {
+  # compaudit stubbed: on a tty-less runner with group-writable fpath dirs
+  # the real audit aborts compinit, and _COMPINIT_DONE (correctly) stays
+  # unset. That's a harness artifact, not what this test is about.
   run zsh --no-rcs -c "
+    compaudit() { return 0; }
     source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
     source '$REPO/shell/init_rc.zsh' >/dev/null 2>&1
     print -- \"\$_COMPINIT_DONE\"
@@ -39,48 +85,188 @@ setup() {
   assert_output "1"
 }
 
-@test "init_rc: re-sourcing does not re-run our central compinit (guard is effective)" {
-  # Our central compinit guard sits at the END of init_rc.zsh and is gated
-  # on `_COMPINIT_DONE`. Set _COMPINIT_DONE=1 BEFORE the first source — if
-  # the guard works, our central compinit call NEVER fires (only zplug's
-  # internal compinit calls during plugin load can still happen, but those
-  # are not what this guard is about).
-  CANARY="$(mktemp)"
+@test "init_rc: skips compinit when completion is already initialized (compdef defined)" {
+  # Simulates zplug having already run compinit (which defines compdef).
+  run_isolated_rc_with_stub 'compdef() { :; }'
+  assert_success
+  assert_output "done=1"
+  run cat "$COMPINIT_LOG"
+  assert_output ""
+}
+
+@test "init_rc: fallback runs full (audited) compinit when no dump exists" {
+  # zplug absent / failed: compdef undefined, so the barrel must init.
+  run_isolated_rc_with_stub ''
+  assert_success
+  assert_output "done=1"
+  run cat "$COMPINIT_LOG"
+  assert_output "compinit"
+}
+
+@test "init_rc: fallback runs fast 'compinit -C' when the dump is fresh" {
+  touch "$ZDOTDIR/.zcompdump"
+  run_isolated_rc_with_stub ''
+  assert_success
+  assert_output "done=1"
+  run cat "$COMPINIT_LOG"
+  assert_output "compinit -C"
+}
+
+@test "init_rc: fallback runs full (audited) compinit when the dump is >24h old" {
+  touch -t 202001010000 "$ZDOTDIR/.zcompdump"
+  run_isolated_rc_with_stub ''
+  assert_success
+  assert_output "done=1"
+  run cat "$COMPINIT_LOG"
+  assert_output "compinit"
+}
+
+@test "init_rc: fallback boundary — dump aged 24h30m gets full compinit" {
+  # Guards against hour-granularity qualifiers: `mh+24` truncates to whole
+  # hours and only matches at >=25h, so 24h30m would wrongly take `-C`.
+  touch -t "$(stamp_minutes_ago 1470)" "$ZDOTDIR/.zcompdump"
+  run_isolated_rc_with_stub ''
+  assert_success
+  assert_output "done=1"
+  run cat "$COMPINIT_LOG"
+  assert_output "compinit"
+}
+
+@test "init_rc: fallback boundary — dump aged 23h30m gets fast 'compinit -C'" {
+  touch -t "$(stamp_minutes_ago 1410)" "$ZDOTDIR/.zcompdump"
+  run_isolated_rc_with_stub ''
+  assert_success
+  assert_output "done=1"
+  run cat "$COMPINIT_LOG"
+  assert_output "compinit -C"
+}
+
+@test "init_rc: fallback dump check does not leak EXTENDED_GLOB into the shell" {
   run zsh --no-rcs -c "
-    source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
-    # Stub compinit BEFORE any sourcing so any call routes through it.
-    compinit() { echo call >>'$CANARY'; }
-    # Pre-set the guard sentinel; central guard MUST honor it.
-    _COMPINIT_DONE=1
-    source '$REPO/shell/init_rc.zsh' >/dev/null 2>&1
-    # zplug calls compinit during 'zplug load'; our guard call should NOT
-    # fire because _COMPINIT_DONE was pre-set. Compare to a baseline source
-    # in a separate sub-shell where _COMPINIT_DONE is unset (guard fires).
-    pre_set_count=\$(wc -l <'$CANARY' | tr -d ' ')
-    print -- \"pre-set: \$pre_set_count\"
+    SCRIPTS_DIR='$EMPTY_SCRIPTS_DIR'
+    compinit() { compdef() { :; }; }
+    unsetopt extendedglob
+    source '$REPO/shell/init_rc.zsh'
+    [[ -o extendedglob ]] && print -- leaked || print -- clean
   "
   assert_success
-  pre_set="$(echo "$output" | grep -oE 'pre-set: [0-9]+' | awk '{print $2}')"
+  assert_output "clean"
+}
 
-  # Now run with _COMPINIT_DONE unset — central guard fires once additional.
-  CANARY2="$(mktemp)"
+@test "init_rc: leaves _COMPINIT_DONE unset when fallback compinit fails" {
+  # Stub models a failed compinit: non-zero status, compdef never defined.
+  run_isolated_rc_with_stub "compinit() { print -r -- compinit >>'$COMPINIT_LOG'; return 1; }"
+  assert_success
+  assert_output "done=unset"
+  run cat "$COMPINIT_LOG"
+  assert_output "compinit"
+}
+
+@test "init_rc: leaves _COMPINIT_DONE unset when compinit succeeds but compdef is missing" {
+  run_isolated_rc_with_stub "compinit() { print -r -- compinit >>'$COMPINIT_LOG'; return 0; }"
+  assert_success
+  assert_output "done=unset"
+}
+
+@test "init_rc: leaves _COMPINIT_DONE unset when compinit fails even though compdef got defined" {
+  # Isolates the return-status gate from the compdef gate: compdef exists
+  # afterwards, so only compinit's non-zero status can keep the flag unset.
+  run_isolated_rc_with_stub "compinit() { print -r -- compinit >>'$COMPINIT_LOG'; compdef() { :; }; return 1; }"
+  assert_success
+  assert_output "done=unset"
+}
+
+@test "init_rc: a later source retries compinit after a failed fallback" {
   run zsh --no-rcs -c "
-    source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
-    compinit() { echo call >>'$CANARY2'; }
-    # _COMPINIT_DONE is unset — central guard SHOULD fire.
-    source '$REPO/shell/init_rc.zsh' >/dev/null 2>&1
-    print -- \"unset: \$(wc -l <'$CANARY2' | tr -d ' ')\"
+    SCRIPTS_DIR='$EMPTY_SCRIPTS_DIR'
+    compinit() { print -r -- \"fail\${*:+ \$*}\" >>'$COMPINIT_LOG'; return 1; }
+    source '$REPO/shell/init_rc.zsh'
+    print -- \"first=\${_COMPINIT_DONE:-unset}\"
+    compinit() { print -r -- \"ok\${*:+ \$*}\" >>'$COMPINIT_LOG'; compdef() { :; }; }
+    source '$REPO/shell/init_rc.zsh'
+    print -- \"second=\${_COMPINIT_DONE:-unset}\"
   "
   assert_success
-  unset_count="$(echo "$output" | grep -oE 'unset: [0-9]+' | awk '{print $2}')"
+  assert_line "first=unset"
+  assert_line "second=1"
+  run cat "$COMPINIT_LOG"
+  assert_line --index 0 "fail"
+  assert_line --index 1 "ok"
+}
 
-  # The unset run must call compinit one more time than the pre-set run
-  # (our guard block contributes exactly +1 compinit call when sentinel
-  # is unset). zplug's own calls are constant across both runs.
-  diff=$((unset_count - pre_set))
-  assert_equal "$diff" "1"
+@test "init_rc: never calls compinit when _COMPINIT_DONE is already set" {
+  run_isolated_rc_with_stub '_COMPINIT_DONE=1'
+  assert_success
+  assert_output "done=1"
+  run cat "$COMPINIT_LOG"
+  assert_output ""
+}
 
-  rm -f "$CANARY" "$CANARY2"
+@test "init_rc: re-sourcing does not re-run compinit" {
+  run zsh --no-rcs -c "
+    SCRIPTS_DIR='$EMPTY_SCRIPTS_DIR'
+    compinit() { print -r -- \"compinit\${*:+ \$*}\" >>'$COMPINIT_LOG'; compdef() { :; }; }
+    source '$REPO/shell/init_rc.zsh'
+    source '$REPO/shell/init_rc.zsh'
+    print -- \"done=\${_COMPINIT_DONE:-unset}\"
+  "
+  assert_success
+  assert_output "done=1"
+  run cat "$COMPINIT_LOG"
+  assert_output "compinit"
+}
+
+@test "init_rc: prior (zplug-style) compinit means the barrel writes no second dump" {
+  # Real compinit, no stubs. A prior `compinit -C -d <dumpA>` mirrors what
+  # zplug's init does; afterwards the barrel must not produce
+  # ${ZDOTDIR}/.zcompdump.
+  DUMP_A="$BATS_TEST_TMPDIR/zplug-zcompdump"
+  run zsh --no-rcs -c "
+    SCRIPTS_DIR='$EMPTY_SCRIPTS_DIR'
+    autoload -Uz compinit
+    compinit -C -d '$DUMP_A'
+    source '$REPO/shell/init_rc.zsh'
+    print -- \"done=\${_COMPINIT_DONE:-unset} compdef=\${+functions[compdef]}\"
+  "
+  assert_success
+  assert_output "done=1 compdef=1"
+  assert [ -f "$DUMP_A" ]
+  assert [ ! -e "$ZDOTDIR/.zcompdump" ]
+  assert [ ! -e "$ISO_HOME/.zcompdump" ]
+}
+
+@test "init_rc: without prior compinit the fallback initializes completion and writes its dump" {
+  # Control for the previous test: proves the dump-absence assertion is
+  # meaningful (the fallback path does write ${ZDOTDIR}/.zcompdump).
+  # compaudit is stubbed so a tty-less CI runner with group-writable fpath
+  # dirs can't abort compinit's audit; this test is about the dump, not the
+  # audit.
+  run zsh --no-rcs -c "
+    SCRIPTS_DIR='$EMPTY_SCRIPTS_DIR'
+    compaudit() { return 0; }
+    source '$REPO/shell/init_rc.zsh'
+    print -- \"done=\${_COMPINIT_DONE:-unset} compdef=\${+functions[compdef]}\"
+  "
+  assert_success
+  assert_output "done=1 compdef=1"
+  assert [ -f "$ZDOTDIR/.zcompdump" ]
+}
+
+@test "init_rc: with real zplug, only zplug's dump is written (no duplicate compinit)" {
+  [[ -f /opt/homebrew/opt/zplug/init.zsh ]] || skip "zplug not installed"
+  # zplug lives under the brew prefix, not $HOME; HOME/ZPLUG_HOME/ZDOTDIR
+  # are still the per-test temp dirs from setup().
+  run zsh --no-rcs -c "
+    compaudit() { return 0; }
+    XDG_CACHE_HOME='$ISO_HOME/.cache'
+    source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
+    source '$REPO/shell/init_rc.zsh' >/dev/null 2>&1
+    print -- \"done=\${_COMPINIT_DONE:-unset} compdef=\${+functions[compdef]}\"
+  " </dev/null
+  assert_success
+  assert_output "done=1 compdef=1"
+  assert [ -f "$ZPLUG_HOME/zcompdump" ]
+  assert [ ! -e "$ZDOTDIR/.zcompdump" ]
 }
 
 # --- auto_nvm dual-source idempotency --------------------------------------
