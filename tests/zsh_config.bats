@@ -12,6 +12,9 @@ setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
+  # Sandbox HOME so sourcing production config never touches real dotfiles.
+  export HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$HOME"
 }
 
 @test "zsh_config: selects emacs keymap and keeps custom bindings when started in vi mode" {
@@ -36,4 +39,14 @@ setup() {
   assert_line '"^[[F" end_of_line_with_reminder'
   assert_line '"^[[102;6u" forward-word'
   assert_line '"^[[98;6u" backward-word'
+}
+
+@test "zsh_config: enables HIST_IGNORE_SPACE so space-prefixed commands skip history" {
+  run zsh -f -c "
+    unsetopt HIST_IGNORE_SPACE
+    source '$REPO/shell/rc/zsh_config.zsh'
+    [[ -o HIST_IGNORE_SPACE ]] && print -- on || print -- off
+  "
+  assert_success
+  assert_output 'on'
 }

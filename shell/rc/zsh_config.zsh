@@ -15,6 +15,11 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
 # 'l:|=*' - Left side can match anything
 # zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}' 'r:|=*' 'l:|=*'
 
+# Commands typed with a leading space are not saved to history (handy for
+# one-off commands carrying secrets). This only affects history; it does NOT
+# hide the command from `ps` or other process listings while it runs.
+setopt HIST_IGNORE_SPACE
+
 # Force the emacs keymap. zsh auto-selects vi mode when $EDITOR/$VISUAL
 # contains "vi" (we export EDITOR=vim), which makes Ctrl+A/Ctrl+E insert
 # literal ^A/^E. Must run BEFORE the bindkey calls below so they land in emacs.
