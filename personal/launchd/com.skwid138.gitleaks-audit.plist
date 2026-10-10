@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for personal/gitleaks-audit.sh -install. Do not load this file
+  directly: the double-underscore placeholder tokens are rendered (XML-escaped) into
+  ~/Library/LaunchAgents/com.skwid138.gitleaks-audit.plist by the installer.
+  Runs `gitleaks-audit.sh -run` every day at 11:00. ExitTimeOut leaves room
+  for the TERM trap to reap the scan's own process group before SIGKILL.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.skwid138.gitleaks-audit</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__SCRIPT_PATH__</string>
+    <string>--run</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>11</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__STDOUT_PATH__</string>
+  <key>StandardErrorPath</key>
+  <string>__STDERR_PATH__</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
