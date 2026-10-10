@@ -185,7 +185,9 @@ A few scripts here are interactive launchers wired up via aliases in
   Registered in the dotfiles `~/.gitconfig` as a git config hook
   (`hook.gitleaks.command` / `hook.gitleaks.event = pre-commit`), so it runs
   in every repo *before* the repo's own `.git/hooks/pre-commit` or
-  `core.hooksPath` hook (which still run). `--run` scans exactly what is being
+  `core.hooksPath` hook (which still run). The registration skips with a warning
+  only when the script is absent; a present but non-executable script
+  blocks the commit. `--run` scans exactly what is being
   committed (`gitleaks git --pre-commit --staged`, honoring git's
   `GIT_INDEX_FILE`); findings block the commit with rotate-first guidance,
   gitleaks errors block as "scan error (not a finding)", and a missing
@@ -193,10 +195,13 @@ A few scripts here are interactive launchers wired up via aliases in
   Opt a repo out with `git config hook.gitleaks.enabled false`.
 - `personal/gitleaks-audit.sh` (no alias) — daily gitleaks *history* audit of
   the repos under `~/code` (depth ≤ 3). Dry-run by default; `--run` rescans
-  only repos whose refs/HEAD/stash, `.gitleaks.toml`/`.gitleaksignore`, or
-  gitleaks version changed (everything weekly); `--report` prints the reduced
+  only repos whose refs/HEAD/stash, linked-worktree HEADs,
+  `.gitleaks.toml`/`.gitleaksignore` (and its `[extend]` chain), or gitleaks
+  version changed (everything weekly); `--report` prints the reduced
   findings (rule, file:line, commit — never the secret). Existing findings are
   baselined on first scan; afterwards only new fingerprints or errors notify.
+  An undelivered baseline/NEW notification stays pending and is retried on
+  every later run.
   Private excludes live in `~/.config/gitleaks-audit/config`. LaunchAgent
   runs `--run` daily at 11:00. Logs to `~/Library/Logs/gitleaks-audit.log`.
 
