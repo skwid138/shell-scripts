@@ -568,6 +568,79 @@ write_lock_owner() { # <pid> <host>
   [[ ! -e "$(LOCK)" ]]
 }
 
+# age_path <path> <hours>: set mtime N hours in the past (real clock).
+age_path() { touch -t "$(/bin/date -v-"$2"H +%Y%m%d%H%M.%S)" "$1"; }
+
+@test "cache-prune: failing to publish lock owner metadata releases the lock, exits 1, mutates nothing, notifies" {
+  write_policy_fixture
+  cat >"$STUBS/mv" <<'EOF'
+#!/bin/bash
+case "${@: -1}" in */cache-prune.lock/owner) exit 1 ;; esac
+exec /bin/mv "$@"
+EOF
+  chmod +x "$STUBS/mv"
+  run_prune --apply
+  assert_failure 1
+  [[ ! -e "$(LOCK)" ]]
+  run mutating_calls
+  assert_output ""
+  run grep '^osascript' "$CALLS"
+  assert_output --partial "lock"
+  rm "$STUBS/mv"
+  run_prune
+  assert_success
+}
+
+@test "cache-prune: a crash mid-publish (only owner.tmp.* left) blocks while fresh, is reclaimed once stale" {
+  mkdir -p "$(LOCK)"
+  printf 'pid=1\n' >"$(LOCK)/owner.tmp.4242"
+  run_prune
+  assert_failure 75
+  age_path "$(LOCK)" 7
+  run_prune
+  assert_success
+  assert_output --partial "reclaiming"
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: an ambiguous lock older than 6h is reclaimed" {
+  mkdir -p "$(LOCK)"
+  age_path "$(LOCK)" 7
+  run_prune
+  assert_success
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: a dead-pid lock with leftover owner.tmp.* is reclaimed" {
+  sleep 0 &
+  local dead=$!
+  wait "$dead"
+  write_lock_owner "$dead" "$(/bin/hostname)"
+  printf 'x\n' >"$(LOCK)/owner.tmp.777"
+  run_prune
+  assert_success
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: --apply notifies when a live lock has been held for more than a day" {
+  sleep 60 &
+  local holder=$!
+  mkdir -p "$(LOCK)"
+  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$holder" "$(/bin/hostname)" "$(($(/bin/date -u +%s) - 3600))" >"$(LOCK)/owner"
+  run_prune --apply
+  assert_failure 75
+  run grep -c '^osascript' "$CALLS"
+  assert_output "0"
+  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$holder" "$(/bin/hostname)" "$(($(/bin/date -u +%s) - 2 * 86400))" >"$(LOCK)/owner"
+  run_prune --apply
+  kill "$holder" 2>/dev/null
+  assert_failure 75
+  run grep '^osascript' "$CALLS"
+  assert_output --partial "lock held"
+  run mutating_calls
+  assert_output ""
+}
+
 @test "cache-prune: a normal run releases its own lock" {
   run_prune
   assert_success

@@ -59,20 +59,27 @@ line (# comments allowed). Listing any tag protects the whole image ID.
 
 Files:
   Log:   ~/Library/Logs/cache-prune.log (rotated to .1 above 1 MiB; authoritative)
-  Lock:  ~/Library/Caches/cache-prune.lock (mkdir lock with owner pid/host/start)
+  Lock:  ~/Library/Caches/cache-prune.lock (mkdir lock with owner pid/host/start).
+         A dead owner pid is reclaimed at once; an ambiguous lock (no or
+         unparseable owner, other hostname) once untouched for 6h. --apply
+         notifies when a live holder has kept it for over a day.
 
 Exit codes:
   0   every step succeeded or was skipped
   1   one or more steps failed or timed out (later steps still ran), or
-      install/uninstall failed, or run as root
+      install/uninstall failed, or run as root, or the lock's owner
+      metadata could not be written (lock released; nothing done)
   2   usage error
-  75  another run holds the lock (or lock ownership is ambiguous); nothing done
+  75  another run holds the lock (or ambiguous ownership younger than 6h);
+      nothing done
 
 Environment overrides (tests/advanced use):
   CACHE_PRUNE_BASE_PATH  PATH used instead of the built-in base PATH
                          (nvm default node bin is still prepended)
   CACHE_PRUNE_NOW        epoch seconds to use as "now" for age checks
   CACHE_PRUNE_TIMEOUT    watchdog seconds for inventory/report commands (default 120)
+  CACHE_PRUNE_LOCK_STALE_SECS  age after which an ambiguous lock is reclaimed
+                         (default 21600 = 6h)
 EOF
 }
 
@@ -286,7 +293,7 @@ cleanup() {
     local owner_pid=""
     owner_pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
     if [[ "$owner_pid" == "$$" ]]; then
-      rm -f "$LOCK_DIR/owner"
+      rm -f "$LOCK_DIR/owner" "$LOCK_DIR/owner.tmp.$$"
       rmdir "$LOCK_DIR" 2>/dev/null
     fi
     LOCK_HELD=0
@@ -360,48 +367,102 @@ log_file() {
 # --- lock ----------------------------------------------------------------------
 
 LOCK_BUSY_EXIT=75
+# Ambiguous lock (no/unparseable owner, or another hostname — macOS hostnames
+# change with networks): reclaimed once the lock dir is untouched this long.
+# A healthy run publishes its owner within milliseconds of mkdir.
+LOCK_STALE_SECS="${CACHE_PRUNE_LOCK_STALE_SECS:-21600}"
+# A live holder older than this is reported (hung run or recycled pid).
+LOCK_NOTIFY_SECS=86400
 THIS_HOST="$(/bin/hostname 2>/dev/null || echo unknown)"
+LOCK_ERR=""
+LOCK_BUSY_NOTE=""
 
+# write_lock_owner: publish owner metadata atomically (tmp + rename). On
+# failure the tmp file is removed and 1 is returned.
 write_lock_owner() {
-  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$$" "$THIS_HOST" "$(/bin/date -u +%s)" >"$LOCK_DIR/owner.tmp.$$" &&
-    mv -f "$LOCK_DIR/owner.tmp.$$" "$LOCK_DIR/owner"
-}
-
-# acquire_lock: 0 = held; 1 = busy/ambiguous (caller exits LOCK_BUSY_EXIT).
-# Reclaims only a clearly stale lock: owner file present, same host, numeric
-# pid that is not running. Anything else is left alone.
-acquire_lock() {
-  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    LOCK_HELD=1
-    if ! write_lock_owner; then
-      log "lock: acquired $LOCK_DIR but could not write owner metadata"
-    fi
+  local tmp="$LOCK_DIR/owner.tmp.$$"
+  if { printf 'pid=%s\nhost=%s\nstarted=%s\n' "$$" "$THIS_HOST" "$(/bin/date -u +%s)" >"$tmp" &&
+    mv -f "$tmp" "$LOCK_DIR/owner"; } 2>/dev/null; then
     return 0
   fi
-  local pid="" host="" started=""
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# take_lock: 0 = held; 1 = lock dir already exists; 2 = created but the owner
+# could not be published, so the lock was released again (LOCK_ERR set).
+take_lock() {
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  if write_lock_owner; then
+    LOCK_HELD=1
+    return 0
+  fi
+  rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
+  rmdir "$LOCK_DIR" 2>/dev/null
+  LOCK_ERR="lock: could not write owner metadata in $LOCK_DIR; lock released, nothing done"
+  return 2
+}
+
+# reclaim_lock <why>: remove a stale lock (owner plus any owner.tmp.* left by
+# a crash mid-publish) and take it. Same return codes as take_lock.
+reclaim_lock() {
+  log "lock: reclaiming $LOCK_DIR ($1)"
+  rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
+  if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+    log "lock: could not reclaim $LOCK_DIR (unexpected contents); skipping run"
+    return 1
+  fi
+  take_lock
+  case $? in
+    0) return 0 ;;
+    1)
+      log "lock: a concurrent run took $LOCK_DIR first; skipping run"
+      return 1
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+# seconds_since <epoch>: real-clock age (never CACHE_PRUNE_NOW).
+seconds_since() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 0
+  echo $(($(/bin/date -u +%s) - $1))
+}
+
+# acquire_lock: 0 = held; 1 = busy/ambiguous (caller exits LOCK_BUSY_EXIT;
+# LOCK_BUSY_NOTE set for a live holder older than a day); 2 = owner metadata
+# could not be written (LOCK_ERR; caller exits 1).
+acquire_lock() {
+  local rc pid="" host="" started="" age
+  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
+  take_lock
+  rc=$?
+  [[ $rc -eq 1 ]] || return $rc
   if [[ -f "$LOCK_DIR/owner" ]]; then
     pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
     host="$(sed -n 's/^host=//p' "$LOCK_DIR/owner" 2>/dev/null)"
     started="$(sed -n 's/^started=//p' "$LOCK_DIR/owner" 2>/dev/null)"
   fi
-  if [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ || "$host" != "$THIS_HOST" ]]; then
-    log "lock: $LOCK_DIR exists with ambiguous ownership (pid='${pid}' host='${host}'); skipping run"
-    return 1
+  if [[ "$pid" =~ ^[0-9]+$ && "$host" == "$THIS_HOST" ]]; then
+    if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
+      age="$(seconds_since "$started")"
+      [[ -n "$age" ]] || age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
+      log "lock: held by live pid $pid on $host (started $started, ${age:-?}s ago); skipping run"
+      if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_NOTIFY_SECS" ]]; then
+        LOCK_BUSY_NOTE="lock held by pid $pid for $((age / 3600))h; cache prune not running - see log"
+      fi
+      return 1
+    fi
+    reclaim_lock "stale lock from dead pid $pid on $host (started $started)"
+    return $?
   fi
-  if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
-    log "lock: held by live pid $pid on $host (started $started); skipping run"
-    return 1
+  age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
+  if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_STALE_SECS" ]]; then
+    reclaim_lock "ambiguous ownership (pid='${pid}' host='${host}') untouched for ${age}s >= ${LOCK_STALE_SECS}s"
+    return $?
   fi
-  log "lock: reclaiming stale lock from dead pid $pid on $host (started $started)"
-  rm -f "$LOCK_DIR/owner"
-  if ! rmdir "$LOCK_DIR" 2>/dev/null || ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    log "lock: could not reclaim $LOCK_DIR (unexpected contents or a concurrent run); skipping run"
-    return 1
-  fi
-  LOCK_HELD=1
-  write_lock_owner || log "lock: could not write owner metadata"
-  return 0
+  log "lock: $LOCK_DIR exists with ambiguous ownership (pid='${pid}' host='${host}', untouched ${age:-?}s < ${LOCK_STALE_SECS}s); skipping run"
+  return 1
 }
 
 # --- step bookkeeping --------------------------------------------------------
@@ -1276,10 +1337,21 @@ df_report() {
 
 run_prune() {
   open_log
-  if ! acquire_lock; then
-    EXIT_CODE=$LOCK_BUSY_EXIT
-    return
-  fi
+  acquire_lock
+  case $? in
+    0) ;;
+    2)
+      log "ERROR: $LOCK_ERR"
+      EXIT_CODE=1
+      notify_msg "Cache prune: $LOCK_ERR"
+      return
+      ;;
+    *)
+      EXIT_CODE=$LOCK_BUSY_EXIT
+      [[ -n "$LOCK_BUSY_NOTE" ]] && notify_msg "Cache prune: $LOCK_BUSY_NOTE"
+      return
+      ;;
+  esac
   if [[ "$MODE" == "apply" && "$LOG_OK" -ne 1 ]]; then
     REFUSE_MUTATIONS=1
     warn "--apply: log is not writable; destructive steps will be skipped"
@@ -1297,6 +1369,14 @@ run_prune() {
 
   summarize
   [[ "$MODE" == "apply" && "$NOTIFY" -eq 1 ]] && notify
+}
+
+# notify_msg <msg>: best-effort notification for --apply (dry-runs and
+# --no-notify never notify).
+notify_msg() {
+  [[ "$MODE" == "apply" && "$NOTIFY" -eq 1 ]] || return 0
+  command -v osascript >/dev/null 2>&1 || return 0
+  run_timed "$WORK/notify.out" osascript -e "display notification \"$1\" with title \"cache-prune\"" || true
 }
 
 # notify: best-effort; failure ignored. "freed" counts only measured du deltas
