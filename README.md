@@ -181,6 +181,24 @@ A few scripts here are interactive launchers wired up via aliases in
   by default; `--apply` prunes. `--install` / `--uninstall` manage a monthly
   LaunchAgent (day 1, 10:00) that runs `--apply`. Logs to
   `~/Library/Logs/cache-prune.log`.
+- `personal/gitleaks-hook.sh` (no alias) — global pre-commit secret scan.
+  Registered in the dotfiles `~/.gitconfig` as a git config hook
+  (`hook.gitleaks.command` / `hook.gitleaks.event = pre-commit`), so it runs
+  in every repo *before* the repo's own `.git/hooks/pre-commit` or
+  `core.hooksPath` hook (which still run). `--run` scans exactly what is being
+  committed (`gitleaks git --pre-commit --staged`, honoring git's
+  `GIT_INDEX_FILE`); findings block the commit with rotate-first guidance,
+  gitleaks errors block as "scan error (not a finding)", and a missing
+  gitleaks binary warns and allows. `--status` shows the registration.
+  Opt a repo out with `git config hook.gitleaks.enabled false`.
+- `personal/gitleaks-audit.sh` (no alias) — daily gitleaks *history* audit of
+  the repos under `~/code` (depth ≤ 3). Dry-run by default; `--run` rescans
+  only repos whose refs/HEAD/stash, `.gitleaks.toml`/`.gitleaksignore`, or
+  gitleaks version changed (everything weekly); `--report` prints the reduced
+  findings (rule, file:line, commit — never the secret). Existing findings are
+  baselined on first scan; afterwards only new fingerprints or errors notify.
+  Private excludes live in `~/.config/gitleaks-audit/config`. LaunchAgent
+  runs `--run` daily at 11:00. Logs to `~/Library/Logs/gitleaks-audit.log`.
 
 ## Development
 
@@ -221,6 +239,25 @@ The hook is a no-op when no shell files are staged. It runs `shellcheck`
 (errors only — matches CI), `shfmt -d` (formatting drift), and
 `gitleaks protect --staged` (if installed). Bypass with
 `git commit --no-verify` for emergency commits.
+
+The global gitleaks config hook (`personal/gitleaks-hook.sh`, registered in
+the dotfiles `~/.gitconfig`) runs before this repo hook on every commit; both
+run. `git commit --no-verify` skips both.
+
+### LaunchAgents (macOS)
+
+```bash
+make install-agents   # <agent>.sh --install for every agent in AGENTS
+make uninstall-agents # <agent>.sh --uninstall for each
+make agents-status    # <agent>.sh --status for each (loaded / plist path)
+```
+
+`AGENTS` is an explicit list in the Makefile: `cache-prune` (monthly,
+day 1 10:00, `--apply`) and `gitleaks-audit` (daily 11:00, `--run`). Every
+agent is attempted even if an earlier one fails; the target then exits
+nonzero and names the failures. Agents are per-user (`gui/<uid>`), render
+their plist with absolute paths from the current `$HOME`, use
+`RunAtLoad false`, and are never kickstarted on install.
 
 ## Conventions
 

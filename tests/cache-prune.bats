@@ -953,3 +953,28 @@ STUB
   run mutating_calls
   assert_output ""
 }
+
+# --- status --------------------------------------------------------------------
+
+@test "cache-prune: --status reports loaded/not loaded and the plist path, mutating nothing" {
+  local uid
+  uid="$(id -u)"
+  run_prune --status
+  assert_success
+  assert_line "agent: not loaded (gui/$uid/com.skwid138.cache-prune)"
+  assert_line "plist: $(PLIST) (absent)"
+  echo 0 >"$FIX/launchctl_print_rc"
+  mkdir -p "$(dirname "$(PLIST)")"
+  echo '<plist/>' >"$(PLIST)"
+  run_prune --status
+  assert_success
+  assert_line "agent: loaded (gui/$uid/com.skwid138.cache-prune)"
+  assert_line "plist: $(PLIST) (present)"
+  run grep -E '^launchctl (bootstrap|bootout|enable|kickstart)|^(uv|pnpm|npm|docker) ' "$CALLS"
+  assert_output ""
+}
+
+@test "cache-prune: --status conflicts with other modes" {
+  run_prune --status --apply
+  assert_failure 2
+}

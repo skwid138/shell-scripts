@@ -37,7 +37,7 @@ SCRIPTS   := $(SH_FILES) $(ZSH_FILES)
 # Dialect (`-ln bash` / `-ln zsh`) is auto-detected from extension.
 SHFMT_FLAGS := -i 2 -ci
 
-.PHONY: help test test-parallel test-serial install-bats lint lint-sh lint-zsh lint-strict fmt fmt-check check check-serial clean install-hook uninstall-hook refresh-paths
+.PHONY: help test test-parallel test-serial install-bats lint lint-sh lint-zsh lint-strict fmt fmt-check check check-serial clean install-hook uninstall-hook install-agents uninstall-agents agents-status refresh-paths
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -139,6 +139,35 @@ install-hook: ## Enable .githooks/pre-commit (sets git core.hooksPath)
 uninstall-hook: ## Disable the pre-commit hook (unsets git core.hooksPath)
 	@git config --unset core.hooksPath 2>/dev/null || true
 	@echo "✓ pre-commit hook disabled (core.hooksPath unset; git falls back to .git/hooks/)"
+
+# --- launchd agents -------------------------------------------------------
+# Explicit list of per-user LaunchAgents managed by scripts in personal/.
+# Each <agent> is $(AGENTS_DIR)/<agent>.sh and supports --install,
+# --uninstall, and --status (rendering ~/Library/LaunchAgents/com.skwid138.<agent>.plist).
+# Every agent is attempted even if an earlier one fails; the target then exits
+# nonzero and names the failures. AGENTS_DIR is overridable for tests.
+AGENTS     := cache-prune gitleaks-audit
+AGENTS_DIR ?= personal
+
+# Shell loop shared by the agent targets; the recipe sets $$flag first.
+AGENTS_RUN = failed=""; \
+	for a in $(AGENTS); do \
+		echo "==> $$a $$flag"; \
+		"$(AGENTS_DIR)/$$a.sh" $$flag || failed="$$failed $$a"; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo "$@: failed:$$failed" >&2; \
+		exit 1; \
+	fi
+
+install-agents: ## Install every launchd agent (cache-prune, gitleaks-audit) via <agent>.sh --install
+	@flag=--install; $(AGENTS_RUN)
+
+uninstall-agents: ## Boot out and remove every launchd agent via <agent>.sh --uninstall
+	@flag=--uninstall; $(AGENTS_RUN)
+
+agents-status: ## Show each launchd agent's loaded state via <agent>.sh --status
+	@flag=--status; $(AGENTS_RUN)
 
 # --- refresh-paths --------------------------------------------------------
 # Regenerate the `_BREW_PREFIX=( … )` block in shell/env/paths.zsh from the

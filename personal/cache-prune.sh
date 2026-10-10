@@ -18,7 +18,7 @@ source "$SCRIPT_DIR/../lib/common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: cache-prune [--apply | --install | --uninstall] [--no-notify]
+Usage: cache-prune [--apply | --install | --uninstall | --status] [--no-notify]
 
 Conservative developer-cache pruning for macOS. Default mode is a dry-run
 that performs zero mutations and prints/logs what --apply would do.
@@ -36,6 +36,8 @@ Modes:
                 ~/Library/LaunchAgents/com.skwid138.cache-prune.plist and
                 bootstrap it (runs --apply on day 1 of each month at 10:00).
   --uninstall   Boot out the launchd agent (absent = OK) and remove the plist.
+  --status      Show whether the launchd agent is loaded and the plist path
+                (read-only; exits 0).
   -h, --help    Show this help.
 
 Options:
@@ -82,8 +84,8 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
-    --apply | --install | --uninstall)
-      [[ "$MODE" == "dry-run" ]] || die_usage "only one of --apply/--install/--uninstall may be given"
+    --apply | --install | --uninstall | --status)
+      [[ "$MODE" == "dry-run" ]] || die_usage "only one of --apply/--install/--uninstall/--status may be given"
       MODE="${1#--}"
       shift
       ;;
@@ -1420,6 +1422,23 @@ do_uninstall() {
   fi
 }
 
+# do_status: read-only launchd state for `make agents-status`.
+do_status() {
+  local service
+  service="gui/$(id -u)/$LABEL"
+  if launchctl print "$service" >/dev/null 2>&1; then
+    echo "agent: loaded ($service)"
+  else
+    echo "agent: not loaded ($service)"
+  fi
+  if [[ -f "$AGENT_PLIST" ]]; then
+    echo "plist: $AGENT_PLIST (present)"
+  else
+    echo "plist: $AGENT_PLIST (absent)"
+  fi
+  echo "log:   $LOG_FILE"
+}
+
 EXIT_CODE=0
 case "$MODE" in
   dry-run | apply)
@@ -1428,5 +1447,6 @@ case "$MODE" in
     ;;
   install) do_install ;;
   uninstall) do_uninstall ;;
+  status) do_status ;;
 esac
 exit 0
