@@ -773,6 +773,143 @@ stale_dead_lock() {
   assert_output --partial "reclaiming"
 }
 
+# --- lock: infrastructure failures are errors (exit 1), not contention (75) ----
+
+# run_prune_with [VAR=val...] -- [args...]: run_prune with extra environment.
+run_prune_with() {
+  local envs=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    envs+=("$1")
+    shift
+  done
+  shift
+  run env -i HOME="$FAKE_HOME" CALLS="$CALLS" FIX="$FIX" \
+    CACHE_PRUNE_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
+    CACHE_PRUNE_NOW="$NOW" CACHE_PRUNE_TIMEOUT="$TIMEOUT" "${envs[@]}" \
+    /bin/bash "$SCRIPT" "$@" </dev/null 3>&-
+}
+
+# hold_reclaim_mutex: hold an exclusive flock on the reclaim file from a test
+# process (as a concurrent reclaimer would); sets HOLDER_PID.
+hold_reclaim_mutex() {
+  /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; open(my $r, ">", $ARGV[1]) or die; close $r; sleep 30' \
+    "$(LOCK).reclaim" "$T/mutex.held" </dev/null >/dev/null 2>&1 3>&- &
+  HOLDER_PID=$!
+  wait_for test -e "$T/mutex.held"
+}
+
+@test "cache-prune: an unwritable or uncreatable lock parent exits 1 (notifying on --apply only), not 75" {
+  write_policy_fixture
+  local caches="$FAKE_HOME/Library/Caches"
+  mkdir -p "$caches"
+  chmod 555 "$caches"
+  run_prune --apply
+  chmod 755 "$caches"
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCK): $caches is not a writable directory"
+  refute_output --partial "skipping run"
+  run mutating_calls
+  assert_output ""
+  run grep '^osascript' "$CALLS"
+  assert_output --partial "cannot create"
+
+  # Dry run: same error and exit, but dry runs never notify.
+  chmod 555 "$caches"
+  : >"$CALLS"
+  run_prune
+  chmod 755 "$caches"
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCK): $caches is not a writable directory"
+  run grep -c '^osascript' "$CALLS"
+  assert_output "0"
+
+  # A parent that cannot be created (a file is in the way) is the same error.
+  rmdir "$caches"
+  : >"$caches"
+  run_prune --apply --no-notify
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCK): $caches is not a writable directory"
+
+  rm -f "$caches"
+  run_prune
+  assert_success
+}
+
+@test "cache-prune: a non-directory in the way of the lock dir exits 1, not 75" {
+  mkdir -p "$FAKE_HOME/Library/Caches"
+  : >"$(LOCK)"
+  run_prune --apply --no-notify
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCK) (mkdir failed and no lock exists"
+  refute_output --partial "skipping run"
+  run mutating_calls
+  assert_output ""
+}
+
+@test "cache-prune: a missing or failing reclaim helper (perl) exits 1 and leaves the stale lock alone" {
+  write_policy_fixture
+  stale_dead_lock
+  cp "$(LOCK)/owner" "$T/owner.before"
+  run_prune_with CACHE_PRUNE_PERL="$T/no-such-perl" -- --apply
+  assert_failure 1
+  assert_output --partial "ERROR: lock: reclaim mutex helper $T/no-such-perl failed"
+  refute_output --partial "skipping run"
+  cmp -s "$(LOCK)/owner" "$T/owner.before"
+  run mutating_calls
+  assert_output ""
+  run grep '^osascript' "$CALLS"
+  assert_output --partial "reclaim mutex"
+
+  cat >"$T/bad-perl" <<'EOF'
+#!/bin/bash
+case "$*" in *flock*) echo "perl: broken" >&2; exit 255 ;; esac
+exec /usr/bin/perl "$@"
+EOF
+  chmod +x "$T/bad-perl"
+  run_prune_with CACHE_PRUNE_PERL="$T/bad-perl" -- --apply --no-notify
+  assert_failure 1
+  assert_output --partial "ERROR: lock: reclaim mutex helper $T/bad-perl failed (exit 255)"
+  cmp -s "$(LOCK)/owner" "$T/owner.before"
+
+  # With a working helper the same stale lock is reclaimed.
+  run_prune
+  assert_success
+  assert_output --partial "reclaiming"
+}
+
+@test "cache-prune: an unopenable reclaim file exits 1, not 75" {
+  stale_dead_lock
+  mkdir -p "$(LOCK).reclaim"
+  run_prune --apply --no-notify
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot open reclaim mutex file $(LOCK).reclaim"
+  [[ -d "$(LOCK)" ]]
+}
+
+@test "cache-prune: genuine contention (live holder, reclaim mutex held) stays 75 and is not an error" {
+  sleep 60 &
+  local holder=$!
+  write_lock_owner "$holder" "$(/bin/hostname)"
+  run_prune --apply
+  kill "$holder" 2>/dev/null
+  assert_failure 75
+  assert_output --partial "skipping run"
+  refute_output --partial "ERROR"
+
+  rm -rf "$(LOCK)"
+  : >"$CALLS"
+  stale_dead_lock
+  hold_reclaim_mutex
+  run_prune_with CACHE_PRUNE_RECLAIM_WAIT=1 -- --apply
+  kill "$HOLDER_PID" 2>/dev/null
+  assert_failure 75
+  assert_output --partial "another run is reclaiming"
+  refute_output --partial "ERROR"
+  [[ -d "$(LOCK)" ]]
+  run grep -c '^osascript' "$CALLS"
+  assert_output "0"
+}
+
 @test "cache-prune: a normal run releases its own lock" {
   run_prune
   assert_success
