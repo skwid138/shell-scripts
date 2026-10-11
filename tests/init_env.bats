@@ -13,6 +13,11 @@
 # All `zsh` invocations use `--no-rcs` so the user's real ~/.zshenv/.zshrc
 # don't pollute the test shell with already-loaded state (spaceship, zplug,
 # brew shims, secret env vars, etc.).
+#
+# HOME and ZDOTDIR are exported as per-test temp dirs in setup(): the env-tier
+# resolves the ~/code/wpromote private layer and its HOME-relative PATH
+# entries (~/bin, ~/.local/bin, ~/go/bin, ...) from $HOME, so a sandbox HOME
+# keeps every test off the real ones (see the sandbox canary test).
 
 setup() {
   load 'test_helper/bats-support/load'
@@ -20,6 +25,41 @@ setup() {
   # Resolve the repo root via realpath so tests work whether $BATS_TEST_DIRNAME
   # is the /var or the /private/var symlink form on macOS.
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
+  REAL_HOME="$HOME"
+  ISO_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$ISO_HOME"
+  export HOME="$ISO_HOME"
+  export ZDOTDIR="$BATS_TEST_TMPDIR/zdot"
+  mkdir -p "$ZDOTDIR"
+}
+
+@test "init_env: resolves HOME-relative private layer and PATH entries inside the test sandbox" {
+  # Canary: plant a fake private-layer env barrel and a ~/.local/bin under
+  # the sandbox HOME (via $ISO_HOME, never $HOME, so a broken isolation
+  # can't write into the real home). The env-tier must pick up both, and
+  # the real ~/.local/bin must not reach PATH.
+  CANARY="$BATS_TEST_TMPDIR/canary.log"
+  : >"$CANARY"
+  priv="$ISO_HOME/code/wpromote/scripts/shell"
+  mkdir -p "$priv" "$ISO_HOME/.local/bin"
+  printf 'print -r -- wpromote-env >>%q\n' "$CANARY" >"$priv/init_env.zsh"
+
+  run zsh --no-rcs -c "
+    PATH='/usr/bin:/bin'
+    source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
+    print -r -- \"\$PATH\"
+  "
+  assert_success
+  [[ ":$output:" == *":$ISO_HOME/.local/bin:"* ]] || {
+    echo "sandbox ~/.local/bin missing from PATH=$output" >&3
+    false
+  }
+  [[ ":$output:" != *":$REAL_HOME/.local/bin:"* ]] || {
+    echo "real ~/.local/bin leaked into PATH=$output" >&3
+    false
+  }
+  run cat "$CANARY"
+  assert_output "wpromote-env"
 }
 
 # --- exports -----------------------------------------------------------------

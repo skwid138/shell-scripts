@@ -5,6 +5,7 @@
 #   - sentinel 1000 days old: nag MUST fire with plausible day count
 #   - sentinel with mtime in the future (clock skew): no crash, no false nag
 #   - missing $HOME/.cache directory: nag fires (matches "never refreshed")
+#     ($HOME is a per-test sandbox; see setup())
 #   - $XDG_CACHE_HOME respected when set
 #
 # Complements paths_hardcoded.bats (which covers presence/absence of the
@@ -23,6 +24,13 @@ setup() {
   # exactly this case — testing the threshold arithmetic and stderr output
   # of the nag itself.
   export _PATHS_NAG_FORCE=1
+  # Sandbox HOME (exported, so every spawned zsh starts with it): an empty
+  # per-test dir with no ~/.cache sentinel, no ~/.zshenv / ~/.zprofile and no
+  # private ~/code/wpromote layer. Tests that need "a fresh HOME with no
+  # sentinel" rely on it directly (see the sandbox canary test).
+  ISO_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$ISO_HOME"
+  export HOME="$ISO_HOME"
 }
 
 # Helper: emit a YYYYMMDDhhmm.SS stamp N days in the past.
@@ -49,6 +57,29 @@ _make_sandbox_with_aged_sentinel() {
     touch -t "$stamp" "$sentinel"
   fi
   printf '%s\n' "$sandbox"
+}
+
+# --- HOME sandbox canary ----------------------------------------------------
+
+@test "freshness: \$HOME/.cache fallback reads the sentinel inside the test sandbox" {
+  # Canary: plant a 100-day-old sentinel at the sandbox ~/.cache (via
+  # $ISO_HOME, never $HOME, so a broken isolation can't write into the real
+  # home) and leave XDG_CACHE_HOME unset. The nag must report that sentinel's
+  # age — a real-home sentinel (fresh or missing) would report something else.
+  mkdir -p "$ISO_HOME/.cache/zsh"
+  : >"$ISO_HOME/.cache/zsh/paths-refreshed"
+  touch -t "$(_n_days_ago_touch_stamp 100)" "$ISO_HOME/.cache/zsh/paths-refreshed"
+  run zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    unset XDG_CACHE_HOME
+    source '$REPO/shell/init_env.zsh' 2>&1 >/dev/null
+  "
+  assert_success
+  assert_output --partial "days ago"
+  reported="$(echo "$output" | grep -oE '[0-9]+ days ago' | head -1 | awk '{print $1}')"
+  assert [ -n "$reported" ]
+  assert [ "$reported" -ge 99 ]
+  assert [ "$reported" -le 101 ]
 }
 
 # --- threshold boundaries ---------------------------------------------------
@@ -152,15 +183,12 @@ _make_sandbox_with_aged_sentinel() {
 @test "freshness: falls back to \$HOME/.cache when \$XDG_CACHE_HOME is unset" {
   # Simulate a fresh-clone HOME with NO sentinel anywhere — expect the
   # 'never refreshed' nag (proves \$HOME/.cache is the fallback path).
-  SANDBOX="$(mktemp -d)"
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
-    HOME='$SANDBOX'
     unset XDG_CACHE_HOME
     source '$REPO/shell/init_env.zsh' 2>&1 >/dev/null
   "
   assert_output --partial "never refreshed"
-  rm -rf "$SANDBOX"
 }
 
 # --- nag never blocks shell startup ----------------------------------------
@@ -194,11 +222,9 @@ _make_sandbox_with_aged_sentinel() {
 @test "freshness gate: non-interactive zsh -c sourcing init_env.zsh produces no stderr (no sentinel)" {
   # Fresh-clone scenario (no sentinel) — without the gate, this prints
   # 'note: ~/code/scripts shell paths never refreshed; ...' to stderr.
-  SANDBOX="$(mktemp -d)"
   unset _PATHS_NAG_FORCE
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
-    HOME='$SANDBOX'
     unset XDG_CACHE_HOME
     source '$REPO/shell/init_env.zsh'
   "
@@ -211,7 +237,6 @@ _make_sandbox_with_aged_sentinel() {
     echo "expected no stderr output, got: $output" >&3
     false
   }
-  rm -rf "$SANDBOX"
   export _PATHS_NAG_FORCE=1
 }
 
@@ -240,11 +265,9 @@ _make_sandbox_with_aged_sentinel() {
   # Login-but-non-interactive shells (rare on macOS but used by some
   # launchd plists, ssh batch sessions, and `zsh -lc` opencode invocations)
   # must also be silent. -l (login) does NOT imply -i (interactive).
-  SANDBOX="$(mktemp -d)"
   unset _PATHS_NAG_FORCE
   run zsh -lc --no-rcs "
     PATH='$CLEAN_PATH'
-    HOME='$SANDBOX'
     unset XDG_CACHE_HOME
     source '$REPO/shell/init_env.zsh'
   " || true
@@ -252,14 +275,12 @@ _make_sandbox_with_aged_sentinel() {
   if [[ "$status" -ne 0 ]] && [[ "$output" == *"--no-rcs"* ]]; then
     run zsh --no-rcs -c "
       PATH='$CLEAN_PATH'
-      HOME='$SANDBOX'
       unset XDG_CACHE_HOME
       source '$REPO/shell/init_env.zsh'
     "
   fi
   refute_output --partial "never refreshed"
   refute_output --partial "days ago"
-  rm -rf "$SANDBOX"
   export _PATHS_NAG_FORCE=1
 }
 
@@ -268,17 +289,14 @@ _make_sandbox_with_aged_sentinel() {
   # on). If this test ever fails, the rest of the freshness suite will
   # also fail — but this test localizes the failure to the override
   # mechanism specifically.
-  SANDBOX="$(mktemp -d)"
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
-    HOME='$SANDBOX'
     unset XDG_CACHE_HOME
     _PATHS_NAG_FORCE=1
     source '$REPO/shell/init_env.zsh'
   "
   assert_success
   assert_output --partial "never refreshed"
-  rm -rf "$SANDBOX"
 }
 
 # --- once-per-shell guard (regression guard) -------------------------------
@@ -301,10 +319,8 @@ _make_sandbox_with_aged_sentinel() {
   # The exact scenario users hit on login: env-tier sources paths.zsh
   # from .zshenv, then init_profile.zsh re-sources init_env.zsh from
   # .zprofile to undo path_helper damage. Without the guard, two prints.
-  SANDBOX="$(mktemp -d)"
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
-    HOME='$SANDBOX'
     unset XDG_CACHE_HOME
     source '$REPO/shell/init_env.zsh'
     source '$REPO/shell/init_env.zsh'
@@ -315,7 +331,6 @@ _make_sandbox_with_aged_sentinel() {
     echo "expected exactly 1 'never refreshed' message, got $count: $output" >&3
     false
   }
-  rm -rf "$SANDBOX"
 }
 
 @test "once-per-shell: nag prints exactly once when init_env.zsh is sourced twice (stale sentinel)" {
@@ -337,24 +352,26 @@ _make_sandbox_with_aged_sentinel() {
   rm -rf "$SANDBOX"
 }
 
-@test "once-per-shell: end-to-end zsh -lc (with init_profile.zsh re-source) prints nag at most once" {
+@test "once-per-shell: end-to-end zsh -lc (with init_profile.zsh re-source) prints nag exactly once" {
   # The integration test for the exact user-visible bug: a real login
   # shell traversing .zshenv -> /etc/zprofile -> .zprofile (which sources
-  # init_profile.zsh, which re-sources init_env.zsh). Uses the user's
-  # actual ~/.zshenv / ~/.zprofile chain (not a sandboxed HOME) because
-  # we need init_profile.zsh's re-source path to fire.
+  # init_profile.zsh, which re-sources init_env.zsh). A sandboxed ZDOTDIR
+  # wires .zshenv/.zprofile to our barrels the same way the user's real
+  # dotfiles do, so init_profile.zsh's re-source path fires without
+  # depending on the operator's real ~/.zshenv / ~/.zprofile.
   #
-  # We accept 0 or 1 occurrences of the nag (depending on the user's
-  # current sentinel state — the test is robust either way) but reject 2+.
-  if [[ ! -f "$HOME/.zshenv" || ! -f "$HOME/.zprofile" ]]; then
-    skip "user .zshenv/.zprofile not present; integration test not meaningful"
-  fi
-  run env PATH="/usr/bin:/bin" zsh -lc 'true' 2>&1
-  # Don't assert success — user's login shell may have other unrelated
+  # The sandbox HOME has no sentinel and _PATHS_NAG_FORCE=1 is exported, so
+  # the first env-tier source must nag and the re-source must not: exactly 1.
+  zdot="$BATS_TEST_TMPDIR/zdot"
+  mkdir -p "$zdot"
+  printf 'unset XDG_CACHE_HOME\nsource %q\n' "$REPO/shell/init_env.zsh" >"$zdot/.zshenv"
+  printf 'source %q\n' "$REPO/shell/init_profile.zsh" >"$zdot/.zprofile"
+  run env PATH="/usr/bin:/bin" ZDOTDIR="$zdot" zsh -lc 'true' 2>&1
+  # Don't assert success — the host's /etc/zprofile may emit unrelated
   # warnings; we only care about the freshness nag count.
   nag_count="$(printf '%s' "$output" | grep -cE '(never refreshed|days ago)' || true)"
-  [[ "$nag_count" -le 1 ]] || {
-    echo "expected at most 1 freshness nag in zsh -lc output, got $nag_count: $output" >&3
+  [[ "$nag_count" -eq 1 ]] || {
+    echo "expected exactly 1 freshness nag in zsh -lc output, got $nag_count: $output" >&3
     false
   }
 }
@@ -364,10 +381,8 @@ _make_sandbox_with_aged_sentinel() {
   # that genuinely need the nag to re-fire within one shell can do so by
   # unsetting _PATHS_NAG_FIRED. If this test fails, the guard's
   # reset semantics broke.
-  SANDBOX="$(mktemp -d)"
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
-    HOME='$SANDBOX'
     unset XDG_CACHE_HOME
     _PATHS_NAG_FORCE=1
     source '$REPO/shell/init_env.zsh'
@@ -380,7 +395,6 @@ _make_sandbox_with_aged_sentinel() {
     echo "expected exactly 2 'never refreshed' messages after explicit reset, got $count: $output" >&3
     false
   }
-  rm -rf "$SANDBOX"
 }
 
 @test "once-per-shell: separate shells each get one nag (guard does not leak across shells)" {
@@ -388,17 +402,14 @@ _make_sandbox_with_aged_sentinel() {
   # must each fire their own nag — confirms we didn't accidentally
   # `export` _PATHS_NAG_FIRED, which would suppress every shell after
   # the first within a session.
-  SANDBOX="$(mktemp -d)"
   out1="$(zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
-    HOME='$SANDBOX'
     unset XDG_CACHE_HOME
     _PATHS_NAG_FORCE=1
     source '$REPO/shell/init_env.zsh'
   " 2>&1)"
   out2="$(zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
-    HOME='$SANDBOX'
     unset XDG_CACHE_HOME
     _PATHS_NAG_FORCE=1
     source '$REPO/shell/init_env.zsh'
@@ -411,5 +422,4 @@ _make_sandbox_with_aged_sentinel() {
     echo "shell 2 missed nag: $out2" >&3
     false
   }
-  rm -rf "$SANDBOX"
 }

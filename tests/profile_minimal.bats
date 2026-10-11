@@ -26,11 +26,47 @@
 #   - gcloud SDK init (login/gcloud.zsh)
 #   - lib/auto_nvm.zsh chpwd hook + immediate load_nvmrc
 #   - Wpromote login-tier passthrough
+#
+# HOME and ZDOTDIR are exported as per-test temp dirs in setup(), so no zsh
+# this file spawns sees the real ~/.nvm, ~/miniconda3, ~/code/wpromote
+# private layer or ~/.zcompdump (see the sandbox canary test below).
 
 setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
+  ISO_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$ISO_HOME"
+  export HOME="$ISO_HOME"
+  export ZDOTDIR="$BATS_TEST_TMPDIR/zdot"
+  mkdir -p "$ZDOTDIR"
+}
+
+@test "profile-minimal: barrels resolve HOME-relative nvm/private paths inside the test sandbox" {
+  # Canary: plant a fake ~/.nvm/nvm.sh and fake private-layer barrels under
+  # the sandbox HOME (via $ISO_HOME, never $HOME, so a broken isolation can't
+  # write into the real home). If env+profile source them, every
+  # HOME-relative lookup is confined to the sandbox.
+  CANARY="$BATS_TEST_TMPDIR/canary.log"
+  : >"$CANARY"
+  priv="$ISO_HOME/code/wpromote/scripts/shell"
+  mkdir -p "$priv" "$ISO_HOME/.nvm"
+  for tier in env profile; do
+    printf 'print -r -- wpromote-%s >>%q\n' "$tier" "$CANARY" >"$priv/init_$tier.zsh"
+  done
+  printf 'nvm() { print -r -- "nvm $*" >>%q; }\n' "$CANARY" >"$ISO_HOME/.nvm/nvm.sh"
+
+  run zsh --no-rcs -c "
+    source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
+    source '$REPO/shell/init_profile.zsh' >/dev/null 2>&1
+    print -r -- \"NVM_DIR=\$NVM_DIR\"
+  "
+  assert_success
+  assert_output "NVM_DIR=$ISO_HOME/.nvm"
+  run cat "$CANARY"
+  assert_line "wpromote-env"
+  assert_line "wpromote-profile"
+  assert_line "nvm use default --silent"
 }
 
 @test "profile-minimal: does NOT run compinit (rc-tier responsibility)" {

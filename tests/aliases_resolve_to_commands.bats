@@ -36,12 +36,39 @@
 # single-quoted `$HOME`). The behavioral check is what actually matters
 # to the highlighter; a textual rule would over-fit and miss
 # alternative ways the same bug could regress (e.g. `'~/code/...'`).
+#
+# HOME is exported as a per-test temp dir in setup(). aliases.zsh defines its
+# script-path aliases only when "$HOME/code/scripts/..." (and the private
+# "$HOME/code/wpromote/scripts/...") files exist, so the sandbox HOME links
+# ~/code/scripts to this checkout and plants a stub private script: the
+# aliases are defined on every host (including CI, whose checkout is not at
+# ~/code/scripts) without reading the real home (see the sandbox canary test).
 
 setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
   ALIASES="$REPO/shell/rc/aliases.zsh"
+  REAL_HOME="$HOME"
+  ISO_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$ISO_HOME/code/wpromote/scripts/agent"
+  ln -s "$REPO" "$ISO_HOME/code/scripts"
+  : >"$ISO_HOME/code/wpromote/scripts/agent/gcp-project-map.sh"
+  export HOME="$ISO_HOME"
+}
+
+@test "aliases.zsh: HOME-relative script aliases resolve inside the test sandbox" {
+  # Canary: the gated script-path aliases must point into the sandbox HOME
+  # set up above, never at the real home.
+  run zsh --no-rcs -c '
+    source "'"$ALIASES"'" 2>/dev/null
+    print -r -- "tms=${aliases[tms]-unset}"
+    print -r -- "gcp-map=${aliases[gcp-map]-unset}"
+  '
+  assert_success
+  assert_line "tms=$ISO_HOME/code/scripts/personal/tmux-sessionizer.sh"
+  assert_line "gcp-map=$ISO_HOME/code/wpromote/scripts/agent/gcp-project-map.sh"
+  refute_output --partial "$REAL_HOME/code/"
 }
 
 @test "aliases.zsh: file exists" {

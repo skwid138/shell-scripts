@@ -29,11 +29,21 @@
 # Strategy: every test pins PATH to a known-bad initial state (the
 # `path_helper`-style ordering with /usr/bin:/bin in front) and asserts
 # the env-tier moves /opt/homebrew/bin to the front.
+#
+# HOME is exported as a per-test temp dir in setup(), so every zsh this file
+# spawns (the direct paths.zsh unit tests AND the sandboxed login/non-login
+# shells) resolves paths.zsh's HOME-relative entries (~/bin, ~/.local/bin,
+# ~/go/bin, ...) inside the sandbox instead of the real home. REAL_HOME is
+# captured first so the canaries can assert the real entries never leak in.
 
 setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
+  REAL_HOME="$HOME"
+  ISO_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$ISO_HOME"
+  export HOME="$ISO_HOME"
 }
 
 # Helper: position of $1 in $PATH (1-indexed, 0 if absent).
@@ -83,7 +93,7 @@ _make_zdotdir_sandbox() {
 _run_login_shell() {
   local initial_path="$1" cmd="$2" out_tmp
   out_tmp="$(mktemp)"
-  env PATH="$initial_path" ZDOTDIR="$ZDOTDIR_SANDBOX" HOME="$ZDOTDIR_SANDBOX" zsh -lc "$cmd" >"$out_tmp" 2>/dev/null
+  env PATH="$initial_path" ZDOTDIR="$ZDOTDIR_SANDBOX" zsh -lc "$cmd" >"$out_tmp" 2>/dev/null
   status=$?
   output="$(cat "$out_tmp")"
   rm -f "$out_tmp"
@@ -93,10 +103,59 @@ _run_login_shell() {
 _run_nonlogin_shell() {
   local initial_path="$1" cmd="$2" out_tmp
   out_tmp="$(mktemp)"
-  env PATH="$initial_path" ZDOTDIR="$ZDOTDIR_SANDBOX" HOME="$ZDOTDIR_SANDBOX" zsh -c "$cmd" >"$out_tmp" 2>/dev/null
+  env PATH="$initial_path" ZDOTDIR="$ZDOTDIR_SANDBOX" zsh -c "$cmd" >"$out_tmp" 2>/dev/null
   status=$?
   output="$(cat "$out_tmp")"
   rm -f "$out_tmp"
+}
+
+# --- HOME sandbox canaries ---------------------------------------------------
+
+@test "paths.zsh (direct source): HOME-relative PATH entries resolve inside the test sandbox" {
+  # Canary for the direct `zsh --no-rcs` unit tests below: plant dirs that
+  # paths.zsh conditionally prepends (it gates on `-d`) under the sandbox
+  # HOME (via $ISO_HOME, never $HOME, so a broken isolation can't write into
+  # the real home). They must land on PATH; the real-home ones must not.
+  mkdir -p "$ISO_HOME/.local/bin" "$ISO_HOME/go/bin"
+  run zsh --no-rcs -c '
+    PATH="/usr/bin:/bin"
+    source "'"$REPO"'/shell/env/paths.zsh" >/dev/null 2>&1
+    print -r -- "$PATH"
+  '
+  assert_success
+  [[ ":$output:" == *":$ISO_HOME/.local/bin:"* ]] || {
+    echo "sandbox ~/.local/bin missing from PATH=$output" >&3
+    false
+  }
+  [[ ":$output:" == *":$ISO_HOME/go/bin:"* ]] || {
+    echo "sandbox ~/go/bin missing from PATH=$output" >&3
+    false
+  }
+  [[ ":$output:" != *":$REAL_HOME/.local/bin:"* && ":$output:" != *":$REAL_HOME/go/bin:"* ]] || {
+    echo "real-home entry leaked into PATH=$output" >&3
+    false
+  }
+}
+
+@test "login shell: HOME-relative PATH entries resolve inside the test sandbox" {
+  # Canary for the _run_login_shell helper: ~/bin is prepended last by
+  # paths.zsh, so a sandbox ~/bin must be on the login shell's PATH.
+  mkdir -p "$ISO_HOME/bin"
+  ZDOTDIR_SANDBOX="$(_make_zdotdir_sandbox)"
+  _run_login_shell "/usr/bin:/bin" 'print -r -- "$PATH"'
+  rm -rf "$ZDOTDIR_SANDBOX"
+  [[ "$status" -eq 0 ]] || {
+    echo "zsh -lc exited $status" >&3
+    false
+  }
+  [[ ":$output:" == *":$ISO_HOME/bin:"* ]] || {
+    echo "sandbox ~/bin missing from PATH=$output" >&3
+    false
+  }
+  [[ ":$output:" != *":$REAL_HOME/bin:"* && ":$output:" != *":$REAL_HOME/.local/bin:"* ]] || {
+    echo "real-home entry leaked into PATH=$output" >&3
+    false
+  }
 }
 
 # --- _path_prepend: promote-to-front semantics -------------------------------

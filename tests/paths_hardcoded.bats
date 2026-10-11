@@ -9,6 +9,11 @@
 # All tests use `zsh --no-rcs` so the user's interactive PATH (which already
 # has gnu-sed/gawk/findutils on it from a prior shell init) doesn't mask
 # regressions in the env-tier PATH-building logic itself.
+#
+# HOME is exported as a per-test temp dir in setup(), so paths.zsh's
+# HOME-relative entries (~/bin, ~/.local/bin, ~/go/bin, ...), the private
+# ~/code/wpromote layer and the ~/.cache freshness sentinel all resolve inside
+# the sandbox (see the sandbox canary test).
 
 setup() {
   load 'test_helper/bats-support/load'
@@ -18,6 +23,32 @@ setup() {
   # to land on PATH start from this minimal set so we observe what
   # paths.zsh _itself_ adds, not what was inherited.
   CLEAN_PATH="/usr/bin:/bin"
+  REAL_HOME="$HOME"
+  ISO_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$ISO_HOME"
+  export HOME="$ISO_HOME"
+}
+
+@test "paths: HOME-relative PATH entries resolve inside the test sandbox" {
+  # Canary: plant ~/go/bin and ~/.lmstudio/bin under the sandbox HOME (via
+  # $ISO_HOME, never $HOME, so a broken isolation can't write into the real
+  # home). paths.zsh prepends them only if they exist, so they must land on
+  # PATH, and the real-home ones must not.
+  mkdir -p "$ISO_HOME/go/bin" "$ISO_HOME/.lmstudio/bin"
+  run zsh --no-rcs -c "
+    PATH='$CLEAN_PATH'
+    source '$REPO/shell/init_env.zsh' >/dev/null 2>&1
+    print -r -- \"\$PATH\"
+  "
+  assert_success
+  [[ ":$output:" == *":$ISO_HOME/go/bin:"* && ":$output:" == *":$ISO_HOME/.lmstudio/bin:"* ]] || {
+    echo "sandbox ~/go/bin or ~/.lmstudio/bin missing from PATH=$output" >&3
+    false
+  }
+  [[ ":$output:" != *":$REAL_HOME/go/bin:"* && ":$output:" != *":$REAL_HOME/.lmstudio/bin:"* ]] || {
+    echo "real-home entry leaked into PATH=$output" >&3
+    false
+  }
 }
 
 # --- _BREW_PREFIX assoc-array population ------------------------------------
