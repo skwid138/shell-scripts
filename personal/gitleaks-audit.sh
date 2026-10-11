@@ -321,19 +321,45 @@ write_lock_owner() {
   return 1
 }
 
+# lock_path_type: classify LOCK_DIR from ONE filesystem observation that
+# does not follow symlinks (BSD stat without -L is an lstat; the absolute
+# path keeps GNU coreutils on PATH out): prints "absent" (stat failed),
+# "dir", or "other" (regular file, symlink - dangling or not -, fifo, ...).
+# Callers use the printed type and never stat the path again: a holder can
+# release its dir between two separate tests (-e then -d), which would make a
+# normal release look like a non-directory in the way.
+lock_path_type() {
+  local t
+  if ! t="$(/usr/bin/stat -f %HT "$LOCK_DIR" 2>/dev/null)"; then
+    echo absent
+    return
+  fi
+  case "$t" in
+    Directory) echo dir ;;
+    *) echo other ;;
+  esac
+}
+
 # lock_path_blocked: set LOCK_ERR and return 0 when a failed mkdir of the
 # lock dir is an infrastructure failure, judged only from conditions that
-# contention cannot produce: the parent is not a writable directory, or a
-# non-directory (file, symlink) sits at the lock path. Runs only ever create
-# and remove the lock as a plain directory, so neither state is a holder's.
+# contention cannot produce: the parent is not a writable, searchable
+# directory, or a non-directory (file, symlink) sits at the lock path. Runs
+# only ever create and remove the lock as a plain directory, so neither
+# state is a holder's. Sets LOCK_PATH_TYPE (lock_path_type's single
+# observation) for the caller; the lock-classify test hook runs right after
+# that observation.
+LOCK_PATH_TYPE=""
 lock_path_blocked() {
   local parent
+  LOCK_PATH_TYPE=""
   parent="$(dirname "$LOCK_DIR")"
-  if [[ ! -d "$parent" || ! -w "$parent" ]]; then
+  if [[ ! -d "$parent" || ! -w "$parent" || ! -x "$parent" ]]; then
     LOCK_ERR="lock: cannot create $LOCK_DIR: $parent is not a writable directory (fix its permissions or remove what is in the way)"
     return 0
   fi
-  if [[ -L "$LOCK_DIR" || (-e "$LOCK_DIR" && ! -d "$LOCK_DIR") ]]; then
+  LOCK_PATH_TYPE="$(lock_path_type)"
+  test_hook lock-classify
+  if [[ "$LOCK_PATH_TYPE" == other ]]; then
     LOCK_ERR="lock: cannot create $LOCK_DIR: a non-directory is in the way (remove it)"
     return 0
   fi
@@ -356,7 +382,7 @@ take_lock() {
     mkdir "$LOCK_DIR" 2>/dev/null && break
     test_hook lock-mkdir-failed
     lock_path_blocked && return 2
-    [[ -d "$LOCK_DIR" ]] && return 1
+    [[ "$LOCK_PATH_TYPE" == dir ]] && return 1
     try=$((try + 1))
     [[ $try -lt $LOCK_MKDIR_TRIES ]] || return 1
   done
@@ -497,7 +523,7 @@ reclaim_lock() {
       # Under the mutex nobody else may touch a stale lock (its owner is
       # dead and contenders only mkdir), so a failed rmdir of a lock that is
       # still there is an infrastructure problem, not contention.
-      if ! rmdir "$LOCK_DIR" 2>/dev/null && [[ -e "$LOCK_DIR" || -L "$LOCK_DIR" ]]; then
+      if ! rmdir "$LOCK_DIR" 2>/dev/null && [[ "$(lock_path_type)" != absent ]]; then
         reclaim_mutex_release
         LOCK_ERR="lock: cannot remove stale lock $LOCK_DIR ($LK_WHY): rmdir failed (unexpected contents or permissions; inspect and remove it by hand)"
         return 2
