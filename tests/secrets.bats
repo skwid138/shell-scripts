@@ -83,19 +83,26 @@ count_calls() {
 # ----------------------------------------------------------------------------
 
 @test "isolation: test shells read no startup files from HOME or the real home" {
-  # Plant a .zshenv in the sandbox HOME (via $ISO_HOME, never $HOME). The
-  # test zsh must not read it (ZDOTDIR is an empty temp dir), and must not
-  # read the real ~/.zshenv either: that one sources init_env.zsh, which
-  # defines _path_prepend (functions are never inherited through the env).
+  # What this proves: the test zsh runs with the sandbox HOME and the
+  # sandbox ZDOTDIR, so the user startup file zsh reads,
+  # ${ZDOTDIR:-$HOME}/.zshenv, resolves inside the empty sandbox ZDOTDIR,
+  # never to the operator's ~/.zshenv. A marker .zshenv planted in the
+  # sandbox HOME (via $ISO_HOME, never $HOME) is not read either, which
+  # shows ZDOTDIR, not HOME, decides the startup file. The _path_prepend
+  # check only confirms that no init_env.zsh was loaded from anywhere; on
+  # its own it would not catch the real ~/.zshenv being read, since that
+  # file sources init_env.zsh through $HOME-relative paths.
   printf 'SECRETS_HOME_ZSHENV=leaked\n' >"$ISO_HOME/.zshenv"
   run run_in zsh '
     print -r -- "home=$HOME"
+    print -r -- "zshenv-path=${ZDOTDIR:-$HOME}/.zshenv"
     print -r -- "zshenv=${SECRETS_HOME_ZSHENV-unset}"
-    typeset -f _path_prepend >/dev/null && print -r -- "real-init_env=leaked"
+    typeset -f _path_prepend >/dev/null && print -r -- "init_env=leaked"
     print -r -- done
   '
   assert_success
   assert_line "home=$ISO_HOME"
+  assert_line "zshenv-path=$ISO_ZDOTDIR/.zshenv"
   assert_line "zshenv=unset"
   refute_output --partial "leaked"
   assert_line "done"
