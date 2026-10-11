@@ -21,6 +21,19 @@ setup() {
 
   SECRETS_SH="$BATS_TEST_DIRNAME/../shell/lib/secrets.sh"
   export SECRETS_SH
+
+  # Sandbox the shells this file spawns. `zsh -c` reads $ZDOTDIR/.zshenv
+  # (default $HOME/.zshenv), and the operator's real ~/.zshenv sources
+  # ~/.cargo/env, init_env.zsh and the private barrel. ZDOTDIR points at an
+  # empty temp dir so no user startup file is read; HOME is a temp dir so
+  # nothing HOME-relative resolves to the real home; BASH_ENV is cleared so
+  # `bash -c` reads no startup file either. See the isolation canary below.
+  ISO_HOME="$BATS_TEST_TMPDIR/home"
+  ISO_ZDOTDIR="$BATS_TEST_TMPDIR/zdot"
+  mkdir -p "$ISO_HOME" "$ISO_ZDOTDIR"
+  export HOME="$ISO_HOME"
+  export ZDOTDIR="$ISO_ZDOTDIR"
+  unset BASH_ENV
 }
 
 teardown() {
@@ -63,6 +76,29 @@ count_calls() {
   local n
   n="$(wc -l <"$COUNTER_FILE")"
   printf '%s\n' "${n// /}"
+}
+
+# ----------------------------------------------------------------------------
+# Startup-file isolation canary
+# ----------------------------------------------------------------------------
+
+@test "isolation: test shells read no startup files from HOME or the real home" {
+  # Plant a .zshenv in the sandbox HOME (via $ISO_HOME, never $HOME). The
+  # test zsh must not read it (ZDOTDIR is an empty temp dir), and must not
+  # read the real ~/.zshenv either: that one sources init_env.zsh, which
+  # defines _path_prepend (functions are never inherited through the env).
+  printf 'SECRETS_HOME_ZSHENV=leaked\n' >"$ISO_HOME/.zshenv"
+  run run_in zsh '
+    print -r -- "home=$HOME"
+    print -r -- "zshenv=${SECRETS_HOME_ZSHENV-unset}"
+    typeset -f _path_prepend >/dev/null && print -r -- "real-init_env=leaked"
+    print -r -- done
+  '
+  assert_success
+  assert_line "home=$ISO_HOME"
+  assert_line "zshenv=unset"
+  refute_output --partial "leaked"
+  assert_line "done"
 }
 
 # ----------------------------------------------------------------------------

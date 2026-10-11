@@ -59,27 +59,34 @@ _make_sandbox_with_aged_sentinel() {
   printf '%s\n' "$sandbox"
 }
 
+# _touch_epoch <file> <epoch>: set mtime to an exact epoch (UTC ISO 8601,
+# accepted by both BSD and GNU touch -d), immune to local DST offsets.
+_touch_epoch() {
+  local iso
+  iso="$(/bin/date -u -r "$2" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" ||
+    iso="$(date -u -d "@$2" +%Y-%m-%dT%H:%M:%SZ)"
+  touch -d "$iso" "$1"
+}
+
 # --- HOME sandbox canary ----------------------------------------------------
 
 @test "freshness: \$HOME/.cache fallback reads the sentinel inside the test sandbox" {
-  # Canary: plant a 100-day-old sentinel at the sandbox ~/.cache (via
-  # $ISO_HOME, never $HOME, so a broken isolation can't write into the real
-  # home) and leave XDG_CACHE_HOME unset. The nag must report that sentinel's
-  # age — a real-home sentinel (fresh or missing) would report something else.
+  # Canary: plant a sentinel aged a distinctive 4321 days at the sandbox
+  # ~/.cache (via $ISO_HOME, never $HOME, so a broken isolation can't write
+  # into the real home) and leave XDG_CACHE_HOME unset. The nag must report
+  # exactly that age; a real-home sentinel (fresh, missing, or any plausible
+  # real age) reports something else. The 10-minute margin keeps the floor
+  # at 4321 while the test runs.
   mkdir -p "$ISO_HOME/.cache/zsh"
   : >"$ISO_HOME/.cache/zsh/paths-refreshed"
-  touch -t "$(_n_days_ago_touch_stamp 100)" "$ISO_HOME/.cache/zsh/paths-refreshed"
+  _touch_epoch "$ISO_HOME/.cache/zsh/paths-refreshed" "$(($(date -u +%s) - 4321 * 86400 - 600))"
   run zsh --no-rcs -c "
     PATH='$CLEAN_PATH'
     unset XDG_CACHE_HOME
     source '$REPO/shell/init_env.zsh' 2>&1 >/dev/null
   "
   assert_success
-  assert_output --partial "days ago"
-  reported="$(echo "$output" | grep -oE '[0-9]+ days ago' | head -1 | awk '{print $1}')"
-  assert [ -n "$reported" ]
-  assert [ "$reported" -ge 99 ]
-  assert [ "$reported" -le 101 ]
+  assert_output --partial "last refreshed 4321 days ago"
 }
 
 # --- threshold boundaries ---------------------------------------------------
@@ -362,13 +369,29 @@ _make_sandbox_with_aged_sentinel() {
   #
   # The sandbox HOME has no sentinel and _PATHS_NAG_FORCE=1 is exported, so
   # the first env-tier source must nag and the re-source must not: exactly 1.
+  #
+  # Proof that the profile tier ran and re-sourced the env tier (otherwise a
+  # broken .zprofile wiring would pass the count): the fixture .zprofile
+  # strips the sandbox ~/bin from PATH before sourcing init_profile.zsh,
+  # simulating path_helper damage. Only the env-tier re-source restores it.
+  # load_nvmrc is defined only by the profile tier (lib/auto_nvm.zsh) here.
+  mkdir -p "$ISO_HOME/bin"
   zdot="$BATS_TEST_TMPDIR/zdot"
   mkdir -p "$zdot"
   printf 'unset XDG_CACHE_HOME\nsource %q\n' "$REPO/shell/init_env.zsh" >"$zdot/.zshenv"
-  printf 'source %q\n' "$REPO/shell/init_profile.zsh" >"$zdot/.zprofile"
-  run env PATH="/usr/bin:/bin" ZDOTDIR="$zdot" zsh -lc 'true' 2>&1
-  # Don't assert success — the host's /etc/zprofile may emit unrelated
-  # warnings; we only care about the freshness nag count.
+  {
+    printf 'path=(${path:#$HOME/bin})\n'
+    printf 'print -r -- "zprofile-stripped=${path[(Ie)$HOME/bin]}"\n'
+    printf 'source %q\n' "$REPO/shell/init_profile.zsh"
+  } >"$zdot/.zprofile"
+  run env PATH="/usr/bin:/bin" ZDOTDIR="$zdot" zsh -lc '
+    print -r -- "home-bin-index=${path[(Ie)$HOME/bin]}"
+    print -r -- "load_nvmrc=${+functions[load_nvmrc]}"
+  ' 2>&1
+  assert_success
+  assert_line "zprofile-stripped=0"
+  assert_line --regexp '^home-bin-index=[1-9][0-9]*$'
+  assert_line "load_nvmrc=1"
   nag_count="$(printf '%s' "$output" | grep -cE '(never refreshed|days ago)' || true)"
   [[ "$nag_count" -eq 1 ]] || {
     echo "expected exactly 1 freshness nag in zsh -lc output, got $nag_count: $output" >&3
