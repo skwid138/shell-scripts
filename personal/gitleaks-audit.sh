@@ -59,7 +59,9 @@ Change detection: before each scan the script snapshots every ref
 (`git for-each-ref`, including refs/stash), HEAD, every worktree's HEAD
 (`git worktree list --porcelain`), the sha256 of the worktree .gitleaks.toml
 and .gitleaksignore (or "absent") and of each file in its [extend] path chain
-(depth <= 5; relative paths resolve against the repo; "missing" recorded),
+(depth <= 5; relative paths resolve against the repo; "missing" recorded; a
+path that is not a simple one-line string without backslashes is never
+decoded: the repo is logged with a WARNING and rescanned every run),
 and the gitleaks version. The snapshot is persisted only after a complete scan (rc 0 or 10,
 report parsed and reduced, state written) whose refs did not move mid-scan.
 
@@ -77,13 +79,18 @@ the notification says "N existing findings in M repos baselined — run
 notify; clean or known-only runs are silent. A baseline/NEW announcement
 whose notification is not delivered (osascript missing or failing, or
 --no-notify) is kept in the state dir (counts and repo names only) and
-retried by every later --run until delivered.
+retried by every later --run until delivered. Dry runs never read or write
+it (or any other state), even when they fail.
 
 Files:
   State:  ~/Library/Application Support/gitleaks-audit (700; files 600)
   Log:    ~/Library/Logs/gitleaks-audit.log (rc and counts only; rotated
           to .1 above 1 MiB)
-  Lock:   ~/Library/Caches/gitleaks-audit.lock
+  Lock:   ~/Library/Caches/gitleaks-audit.lock (mkdir lock + owner pid). A
+          live owner pid is busy whatever its hostname or age (exit 75; a
+          notification after a day); a dead one is reclaimed. Reclaiming is
+          serialized by an flock on gitleaks-audit.lock.reclaim and
+          revalidated against the lock's current contents.
 
 Requires: git, gitleaks, jq (macOS ships /usr/bin/jq), /usr/bin/perl, shasum.
 
@@ -102,8 +109,10 @@ Environment overrides (tests/advanced use):
   GITLEAKS_AUDIT_KILL_GRACE  seconds between TERM and KILL (default 5)
   GITLEAKS_AUDIT_NOW         epoch seconds to use as "now"
   GITLEAKS_AUDIT_NOTIFIER    notification command (default osascript)
-  GITLEAKS_AUDIT_LOCK_STALE_SECS  age after which an ambiguous lock is
-                             reclaimed (default 21600 = 6h)
+  GITLEAKS_AUDIT_LOCK_STALE_SECS  age after which a lock with no parseable
+                             owner pid is reclaimed (default 21600 = 6h)
+  GITLEAKS_AUDIT_RECLAIM_WAIT  seconds to wait for the reclaim mutex (default 10)
+  GITLEAKS_AUDIT_TEST_HOOK   test-only: command run at lock decision points
 EOF
 }
 
@@ -273,10 +282,11 @@ log() {
 # --- lock ----------------------------------------------------------------------
 
 LOCK_BUSY_EXIT=75
-# An ambiguous lock (no/unparseable owner, or another hostname — macOS
-# hostnames change with networks) is reclaimed once the lock dir has been
-# untouched this long. A healthy run publishes its owner within milliseconds
-# of mkdir, so 6h (far beyond any run plus watchdogs) is conservative.
+# A lock whose owner pid is alive is busy whatever its hostname or age; a
+# dead owner pid is reclaimed at once. A lock with no parseable owner pid is
+# reclaimed once its dir has been untouched this long: a healthy run
+# publishes its owner within milliseconds of mkdir, so 6h is conservative.
+# Reclamation is serialized and revalidated (see reclaim_lock).
 LOCK_STALE_SECS="${GITLEAKS_AUDIT_LOCK_STALE_SECS:-21600}"
 # A live holder older than this is reported by notification (hung run or a
 # recycled pid), so a stuck lock never silently stops the daily audit.
@@ -284,6 +294,13 @@ LOCK_NOTIFY_SECS=86400
 THIS_HOST="$(/bin/hostname 2>/dev/null || echo unknown)"
 LOCK_ERR=""
 LOCK_BUSY_NOTE=""
+RECLAIM_FILE="$LOCK_DIR.reclaim"
+RECLAIM_WAIT="${GITLEAKS_AUDIT_RECLAIM_WAIT:-10}"
+TEST_HOOK="${GITLEAKS_AUDIT_TEST_HOOK:-}"
+LK_STATE=""
+LK_WHY=""
+LK_PID=""
+LK_AGE=""
 
 # write_lock_owner: publish owner metadata atomically (tmp + rename). On
 # failure the tmp file is removed and 1 is returned.
@@ -312,15 +329,122 @@ take_lock() {
   return 2
 }
 
-# reclaim_lock <why>: remove a stale lock (owner and any owner.tmp.* left by
-# a crash mid-publish) and take it. Same return codes as take_lock.
+# seconds_since <epoch>: real-clock age (never GITLEAKS_AUDIT_NOW); empty if
+# the argument is not an epoch.
+seconds_since() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 0
+  echo $(($(/bin/date -u +%s) - $1))
+}
+
+# inspect_lock: classify the CURRENT lock contents into LK_STATE:
+#   absent  no lock dir
+#   live    owner pid parses (any hostname: macOS hostnames change with
+#           networks, and the lock lives on this machine's disk) and is alive;
+#           a recycled pid also reads as live, which is the conservative side
+#   stale   owner pid parses and is dead, or there is no parseable owner pid
+#           and the lock dir is untouched for >= LOCK_STALE_SECS
+#   fresh   no parseable owner pid, but the lock dir is younger than that
+#           (a run publishes its owner within milliseconds of mkdir)
+# LK_WHY describes the decision; LK_PID/LK_AGE are set for live locks.
+inspect_lock() {
+  local line pid="" host="" started="" age
+  LK_STATE=""
+  LK_WHY=""
+  LK_PID=""
+  LK_AGE=""
+  if [[ ! -d "$LOCK_DIR" ]]; then
+    LK_STATE=absent
+    return
+  fi
+  if [[ -f "$LOCK_DIR/owner" ]]; then
+    {
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+          pid=*) pid="${line#pid=}" ;;
+          host=*) host="${line#host=}" ;;
+          started=*) started="${line#started=}" ;;
+        esac
+      done <"$LOCK_DIR/owner"
+    } 2>/dev/null
+  fi
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
+      age="$(seconds_since "$started")"
+      [[ -n "$age" ]] || age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
+      LK_STATE=live
+      LK_PID="$pid"
+      LK_AGE="$age"
+      LK_WHY="held by live pid $pid (host '$host') for ${age:-?}s"
+      return
+    fi
+    LK_STATE=stale
+    LK_WHY="dead pid $pid (host '$host')"
+    return
+  fi
+  age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
+  if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_STALE_SECS" ]]; then
+    LK_STATE=stale
+    LK_WHY="no parseable owner pid (pid='${pid}' host='${host}'), untouched for ${age}s >= ${LOCK_STALE_SECS}s"
+    return
+  fi
+  LK_STATE=fresh
+  LK_WHY="no parseable owner pid (pid='${pid}' host='${host}'), untouched ${age:-?}s < ${LOCK_STALE_SECS}s"
+}
+
+# Reclaim mutex: an exclusive flock on RECLAIM_FILE held through fd 9 of this
+# shell (perl takes it on the inherited descriptor and exits; the lock lives
+# as long as fd 9 is open). The kernel drops it when this process dies, so a
+# crashed reclaimer never wedges later runs and no stale timeout is needed.
+# RECLAIM_FILE is never deleted (unlinking a flocked file breaks exclusion).
+reclaim_mutex_take() {
+  { exec 9>>"$RECLAIM_FILE"; } 2>/dev/null || return 1
+  if /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, ">&=", 9) or exit 2; my $end = time + $ARGV[0]; until (flock($f, LOCK_EX | LOCK_NB)) { exit 3 if time >= $end; select(undef, undef, undef, 0.05) } exit 0' "$RECLAIM_WAIT"; then
+    return 0
+  fi
+  exec 9>&-
+  return 1
+}
+
+reclaim_mutex_release() { exec 9>&-; }
+
+# test_hook <phase>: test-only seam to pause at a decision point (runs with
+# fd 9 closed so a paused hook never holds the reclaim mutex itself).
+test_hook() {
+  [[ -n "$TEST_HOOK" ]] || return 0
+  "$TEST_HOOK" "$1" </dev/null >/dev/null 2>&1 9>&-
+  return 0
+}
+
+# reclaim_lock: serialized reclamation. Under the reclaim mutex, re-inspect
+# the CURRENT lock and remove it only if it is still stale (a contender may
+# have reclaimed and re-taken it since our first look). Release the mutex,
+# then take the lock by plain mkdir: whoever loses that is busy.
+# Return codes as take_lock (0 held, 1 busy, 2 owner publish failed).
 reclaim_lock() {
-  log "lock: reclaiming $LOCK_DIR ($1)"
-  rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
-  if ! rmdir "$LOCK_DIR" 2>/dev/null; then
-    log "lock: could not reclaim $LOCK_DIR (unexpected contents); skipping run"
+  if ! reclaim_mutex_take; then
+    log "lock: another run is reclaiming $LOCK_DIR; skipping run"
     return 1
   fi
+  test_hook reclaim-locked
+  inspect_lock
+  case "$LK_STATE" in
+    stale)
+      log "lock: reclaiming stale lock $LOCK_DIR ($LK_WHY)"
+      rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
+      if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+        reclaim_mutex_release
+        log "lock: could not reclaim $LOCK_DIR (unexpected contents); skipping run"
+        return 1
+      fi
+      ;;
+    absent) ;;
+    *)
+      reclaim_mutex_release
+      log "lock: $LOCK_DIR is no longer stale ($LK_WHY); skipping run"
+      return 1
+      ;;
+  esac
+  reclaim_mutex_release
   take_lock
   case $? in
     0) return 0 ;;
@@ -332,46 +456,40 @@ reclaim_lock() {
   esac
 }
 
-# seconds_since <epoch>: real-clock age (never GITLEAKS_AUDIT_NOW); empty if
-# the argument is not an epoch.
-seconds_since() {
-  [[ "$1" =~ ^[0-9]+$ ]] || return 0
-  echo $(($(/bin/date -u +%s) - $1))
-}
-
 # acquire_lock: 0 = held; 1 = busy (exit 75; LOCK_BUSY_NOTE set when a live
 # holder is older than LOCK_NOTIFY_SECS); 2 = owner publish failed (error).
 acquire_lock() {
-  local rc pid="" host="" started="" age
+  local rc
   mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
   take_lock
   rc=$?
   [[ $rc -eq 1 ]] || return $rc
-  if [[ -f "$LOCK_DIR/owner" ]]; then
-    pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
-    host="$(sed -n 's/^host=//p' "$LOCK_DIR/owner" 2>/dev/null)"
-    started="$(sed -n 's/^started=//p' "$LOCK_DIR/owner" 2>/dev/null)"
-  fi
-  if [[ "$pid" =~ ^[0-9]+$ && "$host" == "$THIS_HOST" ]]; then
-    if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
-      age="$(seconds_since "$started")"
-      [[ -n "$age" ]] || age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
-      log "lock: held by live pid $pid for ${age:-?}s; skipping run"
-      if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_NOTIFY_SECS" ]]; then
-        LOCK_BUSY_NOTE="lock held by pid $pid for $((age / 3600))h; audit not running - see ~/Library/Logs/gitleaks-audit.log"
+  inspect_lock
+  case "$LK_STATE" in
+    absent)
+      # Released between our mkdir and the inspection: one more plain try.
+      take_lock
+      rc=$?
+      [[ $rc -eq 1 ]] && log "lock: $LOCK_DIR was re-taken by a concurrent run; skipping run"
+      return $rc
+      ;;
+    live)
+      log "lock: $LK_WHY; skipping run"
+      if [[ "$LK_AGE" =~ ^[0-9]+$ && "$LK_AGE" -ge "$LOCK_NOTIFY_SECS" ]]; then
+        LOCK_BUSY_NOTE="lock held by pid $LK_PID for $((LK_AGE / 3600))h; audit not running - see ~/Library/Logs/gitleaks-audit.log"
       fi
       return 1
-    fi
-    reclaim_lock "dead pid $pid"
-    return $?
-  fi
-  age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
-  if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_STALE_SECS" ]]; then
-    reclaim_lock "ambiguous ownership (pid='${pid}' host='${host}') untouched for ${age}s >= ${LOCK_STALE_SECS}s"
-    return $?
-  fi
-  log "lock: $LOCK_DIR exists with ambiguous ownership (pid='${pid}' host='${host}', untouched ${age:-?}s < ${LOCK_STALE_SECS}s); skipping run"
-  return 1
+      ;;
+    stale)
+      test_hook reclaim-decided
+      reclaim_lock
+      return $?
+      ;;
+    *)
+      log "lock: $LOCK_DIR exists with $LK_WHY; skipping run"
+      return 1
+      ;;
+  esac
 }
 
 # --- process-group runner ----------------------------------------------------
@@ -512,9 +630,16 @@ classify() {
 
 GITLEAKS_VERSION=""
 EXTEND_MAX_DEPTH=5
+# Fixed for the whole run (pre- and post-scan snapshots agree), different
+# for every run.
+RUN_NONCE="$NOW.$$.$RANDOM"
 
-# toml_extend_path <file>: the value of [extend] path (or a top-level dotted
-# extend.path) in a gitleaks TOML config; prints nothing if absent.
+# toml_extend_path <file>: the [extend] path (or top-level dotted extend.path)
+# of a gitleaks TOML config. Prints "path<TAB><value>" for a simple one-line
+# basic ("...") or literal ('...') string without backslashes, "unparseable"
+# when the key is present but its value is anything else (escapes,
+# multi-line strings, bare values, no closing quote): those are never
+# guessed at. Prints nothing if there is no extend path.
 toml_extend_path() {
   awk '
     /^[[:space:]]*#/ { next }
@@ -526,11 +651,12 @@ toml_extend_path() {
       else next
       sub(/^[^=]*=[[:space:]]*/, "", line)
       q = substr(line, 1, 1)
-      if (q != "\"" && q != "\047") next
+      if ((q != "\"" && q != "\047") || substr(line, 1, 3) == q q q) { print "unparseable"; exit }
       line = substr(line, 2)
       i = index(line, q)
-      if (i == 0) next
-      print substr(line, 1, i - 1)
+      v = substr(line, 1, i - 1)
+      if (i == 0 || index(v, "\\") > 0) { print "unparseable"; exit }
+      print "path\t" v
       exit
     }' "$1" 2>/dev/null
 }
@@ -544,6 +670,13 @@ snapshot_extends() {
     [[ -f "$cur" ]] || return 0
     p="$(toml_extend_path "$cur")"
     [[ -n "$p" ]] || return 0
+    if [[ "$p" != path$'\t'* ]]; then
+      # Not decoded on purpose: a per-run nonce makes the fingerprint differ
+      # every run, so this repo is always rescanned and no change is missed.
+      printf 'extend %s unparseable rescan-every-run %s\n' "$depth" "$RUN_NONCE"
+      return 0
+    fi
+    p="${p#path$'\t'}"
     case "$p" in
       /*) resolved="$p" ;;
       *) resolved="$abs/$p" ;;
@@ -791,9 +924,13 @@ announce_counts() {
 # suppressed notification never loses a baseline or NEW announcement.
 # Errors are not persisted: they are re-detected by the next run.
 notify() {
-  local all="$WORK/announce.all" msg="" part nn rn nb rb
+  local all="$WORK/announce.all" msg="" part nn rn nb rb persist=0
+  # Pending announcements are read, merged, rewritten, or cleared only by a
+  # --run/--full that holds the lock. Dry runs (including their fatal paths)
+  # and runs that never got the lock never touch state.
+  [[ "$LOCK_HELD" -eq 1 ]] && persist=1
   : >"$all"
-  [[ -s "$PENDING_FILE" ]] && cat "$PENDING_FILE" >>"$all" 2>/dev/null
+  [[ $persist -eq 1 && -s "$PENDING_FILE" ]] && cat "$PENDING_FILE" >>"$all" 2>/dev/null
   [[ -s "$WORK/announce" ]] && cat "$WORK/announce" >>"$all"
   read -r nn rn <<<"$(announce_counts new "$all")"
   read -r nb rb <<<"$(announce_counts baselined "$all")"
@@ -810,12 +947,12 @@ notify() {
   fi
   [[ -n "$msg" ]] || return 0
   if send_notify "$msg"; then
-    if [[ -e "$PENDING_FILE" ]] && ! rm -f "$PENDING_FILE" 2>/dev/null; then
+    if [[ $persist -eq 1 && -e "$PENDING_FILE" ]] && ! rm -f "$PENDING_FILE" 2>/dev/null; then
       log "  ERROR: notification delivered but $PENDING_FILE could not be removed (it will be re-announced)"
     fi
     return 0
   fi
-  [[ -s "$all" ]] || return 0
+  [[ $persist -eq 1 && -s "$all" ]] || return 0
   if [[ -d "$STATE_DIR" ]] && { cp "$all" "$PENDING_FILE.tmp" && mv -f "$PENDING_FILE.tmp" "$PENDING_FILE"; } 2>/dev/null; then
     log "  notification not delivered; announcement pending, retried next run ($nn new in $rn repos, $nb baselined in $rb repos)"
   else
@@ -957,6 +1094,9 @@ do_scan_mode() { # dry-run | run | full
         record_error "$rel" "cannot snapshot refs/HEAD/config"
       fi
       continue
+    fi
+    if grep -q '^extend [0-9]* unparseable ' "$pre"; then
+      log "  WARNING $rel: .gitleaks.toml [extend] path is not a simple one-line string (escapes, multi-line, or bare value); the extended config cannot be fingerprinted, so this repo is rescanned every run"
     fi
     old="$REPOS_DIR/$(repo_id "$rel")/snapshot"
     reason="$(change_reason "$old" "$pre")"

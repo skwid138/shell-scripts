@@ -48,6 +48,7 @@ setup() {
 
 teardown() {
   local f
+  touch "$FIX/b.go" 2>/dev/null
   for f in "$FIX/gc.pid" "$FIX/leader.pid"; do
     [[ -s "$f" ]] && kill -KILL "$(cat "$f")" 2>/dev/null
   done
@@ -110,6 +111,15 @@ esac
 exit 0
 EOF
   chmod +x "$STUBS/launchctl"
+}
+
+# run_audit_env [args...]: run_audit, passing through GITLEAKS_AUDIT_RECLAIM_WAIT.
+run_audit_env() {
+  run --separate-stderr env -i HOME="$FAKE_HOME" TMPDIR="$TMPD" CALLS="$CALLS" FIX="$FIX" \
+    MARKER="$MARKER" GITLEAKS_AUDIT_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
+    GITLEAKS_AUDIT_NOW="$NOW" GITLEAKS_AUDIT_TIMEOUT="$TIMEOUT" GITLEAKS_AUDIT_KILL_GRACE="$GRACE" \
+    GITLEAKS_AUDIT_RECLAIM_WAIT="${GITLEAKS_AUDIT_RECLAIM_WAIT:-10}" \
+    /bin/bash "$SCRIPT" "$@" </dev/null 3>&-
 }
 
 # run_audit [args...]: hermetic env, /bin/bash, no stdin. stderr separate.
@@ -932,6 +942,210 @@ PENDING() { printf '%s' "$STATE/pending-announce"; }
   run notifies
   assert_output --partial "1 NEW"
   [[ ! -e "$(PENDING)" ]]
+}
+
+# --- lock: liveness across hostname changes, serialized reclamation ----------
+
+# bg_audit <outfile-prefix> [VAR=val...] -- [args...]: start a hermetic audit
+# in the background; sets BG_PID.
+bg_audit() {
+  local pfx="$1"
+  shift
+  local envs=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    envs+=("$1")
+    shift
+  done
+  shift
+  env -i HOME="$FAKE_HOME" TMPDIR="$TMPD" CALLS="$CALLS" FIX="$FIX" MARKER="$MARKER" \
+    GITLEAKS_AUDIT_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" GITLEAKS_AUDIT_NOW="$NOW" \
+    GITLEAKS_AUDIT_KILL_GRACE=1 "${envs[@]}" \
+    /bin/bash "$SCRIPT" "$@" </dev/null >"$pfx.out" 2>"$pfx.err" 3>&- &
+  BG_PID=$!
+}
+
+wait_for() { # <command...>: poll up to ~10s
+  local i
+  for i in $(seq 1 100); do
+    "$@" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+owner_pid_is() { [[ "$(sed -n 's/^pid=//p' "$(LOCKD)/owner" 2>/dev/null)" == "$1" ]]; }
+
+# write_pause_hook <path> <phase> <name>: test hook that, on <phase>, touches
+# $FIX/<name>.paused and waits for $FIX/<name>.go. Other phases pass through.
+write_pause_hook() {
+  cat >"$1" <<HOOK
+#!/bin/bash
+[[ "\$1" == "$2" ]] || exit 0
+touch "$FIX/$3.paused"
+while [[ ! -e "$FIX/$3.go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$1"
+}
+
+stale_dead_lock() {
+  sleep 0 &
+  local dead=$!
+  wait "$dead"
+  mkdir -p "$(LOCKD)"
+  printf 'pid=%s\nhost=%s\nstarted=1\n' "$dead" "$(/bin/hostname)" >"$(LOCKD)/owner"
+}
+
+@test "gitleaks-audit: a live owner pid recorded under a different hostname is busy however old the lock (never reclaimed)" {
+  mkrepo alpha
+  sleep 60 &
+  local holder=$!
+  mkdir -p "$(LOCKD)"
+  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$holder" "old-network-name.local" "$(($(/bin/date -u +%s) - 30 * 3600))" >"$(LOCKD)/owner"
+  cp "$(LOCKD)/owner" "$T/owner.before"
+  age_path "$(LOCKD)" 30
+  run_audit --run
+  kill "$holder" 2>/dev/null
+  assert_failure 75
+  refute_output --partial "reclaiming"
+  cmp -s "$(LOCKD)/owner" "$T/owner.before"
+  [[ "$(scans)" -eq 0 ]]
+  # Held for more than a day: the long-busy notification still fires.
+  run notifies
+  assert_output --partial "lock held"
+}
+
+@test "gitleaks-audit: a dead owner pid under a different hostname is reclaimed" {
+  mkrepo alpha
+  sleep 0 &
+  local dead=$!
+  wait "$dead"
+  mkdir -p "$(LOCKD)"
+  printf 'pid=%s\nhost=other.local\nstarted=1\n' "$dead" >"$(LOCKD)/owner"
+  run_audit --run
+  assert_success
+  assert_output --partial "reclaiming"
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: two stale-lock contenders: the earlier decider revalidates and cannot delete the winner's lock" {
+  mkrepo alpha
+  stale_dead_lock
+  touch "$FIX/hang.alpha"
+  write_pause_hook "$T/hook-b" reclaim-decided b
+  # B judges the lock stale, then pauses before reclaiming.
+  bg_audit "$T/b" GITLEAKS_AUDIT_TEST_HOOK="$T/hook-b" GITLEAKS_AUDIT_TIMEOUT=2 -- --run
+  local b=$BG_PID
+  wait_for test -e "$FIX/b.paused"
+  # A reclaims, publishes its owner, and holds the lock while scanning.
+  bg_audit "$T/a" GITLEAKS_AUDIT_TIMEOUT=60 -- --run
+  local a=$BG_PID
+  wait_for owner_pid_is "$a"
+  wait_for test -s "$FIX/leader.pid"
+  touch "$FIX/b.go"
+  local brc=0
+  wait "$b" || brc=$?
+  # A's lock survives B, and B is busy.
+  local survived=0
+  owner_pid_is "$a" && kill -0 "$a" && survived=1
+  kill -TERM "$a"
+  wait "$a" || true
+  [[ "$survived" -eq 1 ]]
+  [[ "$brc" -eq 75 ]]
+  ! grep -q 'reclaiming' "$T/b.out"
+}
+
+@test "gitleaks-audit: reclamation is serialized: a contender is busy while another holds the reclaim critical section" {
+  mkrepo alpha
+  stale_dead_lock
+  write_pause_hook "$T/hook-b" reclaim-locked b
+  bg_audit "$T/b" GITLEAKS_AUDIT_TEST_HOOK="$T/hook-b" -- --run
+  local b=$BG_PID
+  wait_for test -e "$FIX/b.paused"
+  # A also judges the dead-pid lock stale but cannot enter the critical section.
+  GITLEAKS_AUDIT_RECLAIM_WAIT=1 run_audit_env --run
+  local arc=$status aout=$output
+  [[ -d "$(LOCKD)" ]]
+  touch "$FIX/b.go"
+  local brc=0
+  wait "$b" || brc=$?
+  [[ "$arc" -eq 75 ]]
+  [[ "$aout" == *"another run is reclaiming"* ]]
+  [[ "$brc" -eq 0 ]]
+  grep -q 'reclaiming' "$T/b.out"
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: a reclaimer killed inside the critical section does not wedge later runs" {
+  mkrepo alpha
+  stale_dead_lock
+  write_pause_hook "$T/hook-b" reclaim-locked b
+  bg_audit "$T/b" GITLEAKS_AUDIT_TEST_HOOK="$T/hook-b" -- --run
+  local b=$BG_PID
+  wait_for test -e "$FIX/b.paused"
+  kill -KILL "$b"
+  wait "$b" 2>/dev/null || true
+  GITLEAKS_AUDIT_RECLAIM_WAIT=1 run_audit_env --run
+  touch "$FIX/b.go"
+  assert_success
+  assert_output --partial "reclaiming"
+}
+
+# --- dry runs never write state, even on fatal paths ---------------------------
+
+state_listing() { find "$STATE" -print0 | xargs -0 /usr/bin/stat -f '%N %i %Fm %z' | LC_ALL=C sort; }
+
+@test "gitleaks-audit: a dry run that fails fatally leaves pending-announce and the state dir untouched" {
+  mkrepo alpha
+  findings alpha 1
+  echo 1 >"$FIX/osascript_rc"
+  run_audit --run
+  [[ -s "$STATE/pending-announce" ]]
+  rm "$FIX/osascript_rc"
+  local before h
+  before="$(state_listing)"
+  h="$(shasum "$STATE/pending-announce")"
+  # Fatal 1: unreadable exclude config.
+  mkdir -p "$(dirname "$CONFIG")"
+  echo alpha >"$CONFIG"
+  chmod 000 "$CONFIG"
+  run_audit
+  chmod 600 "$CONFIG"
+  assert_failure 1
+  [[ "$(state_listing)" == "$before" ]]
+  [[ "$(shasum "$STATE/pending-announce")" == "$h" ]]
+  # Fatal 2: missing required tool.
+  rm "$CONFIG"
+  mv "$STUBS/gitleaks" "$T/gitleaks.off"
+  run_audit
+  mv "$T/gitleaks.off" "$STUBS/gitleaks"
+  assert_failure 1
+  [[ "$(state_listing)" == "$before" ]]
+  [[ "$(shasum "$STATE/pending-announce")" == "$h" ]]
+}
+
+# --- unparseable [extend] path ---------------------------------------------------
+
+@test "gitleaks-audit: an [extend] path with escapes or a non-simple string warns and forces a rescan every run" {
+  mkrepo alpha
+  mkrepo beta
+  mkrepo gamma
+  mkrepo delta
+  printf '[extend]\npath = "base\\u002etoml"\n' >"$CODE/alpha/.gitleaks.toml"
+  printf "[extend]\npath = '''multi.toml'''\n" >"$CODE/gamma/.gitleaks.toml"
+  printf '[extend]\npath = bare.toml\n' >"$CODE/delta/.gitleaks.toml"
+  printf '[extend]\npath = "plain.toml"\n' >"$CODE/beta/.gitleaks.toml"
+  grep -qF '\u002e' "$CODE/alpha/.gitleaks.toml"
+  run_audit --run
+  assert_success
+  assert_output --partial "WARNING alpha"
+  assert_output --partial "WARNING gamma"
+  assert_output --partial "WARNING delta"
+  refute_output --partial "WARNING beta"
+  grep -q 'WARNING alpha' "$LOGF"
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  run scanned_repos
+  assert_output "$(printf '%s\n' alpha delta gamma)"
 }
 
 @test "gitleaks-audit: --no-notify suppresses notifications" {
