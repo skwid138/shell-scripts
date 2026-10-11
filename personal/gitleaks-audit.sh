@@ -79,8 +79,9 @@ the notification says "N existing findings in M repos baselined — run
 notify; clean or known-only runs are silent. A baseline/NEW announcement
 whose notification is not delivered (osascript missing or failing, or
 --no-notify) is kept in the state dir (counts and repo names only) and
-retried by every later --run until delivered. Dry runs never read or write
-it (or any other state), even when they fail.
+retried by every later --run until delivered. Dry runs read state (pending
+announcement counts, the last full scan time, repo snapshots) to show what
+--run would do, but never write, merge, or clear it, even when they fail.
 
 Files:
   State:  ~/Library/Application Support/gitleaks-audit (700; files 600)

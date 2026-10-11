@@ -200,6 +200,15 @@ assert_no_marker() {
   done
 }
 
+@test "gitleaks-audit: --help says dry runs read state but never write it" {
+  # Dry runs read pending counts, last_full and snapshots to report what
+  # --run would do; the help must not claim they never read state.
+  run_audit --help
+  assert_success
+  refute_output --partial "never read"
+  assert_output --partial "never write, merge, or clear it"
+}
+
 @test "gitleaks-audit: conflicting modes are a usage error" {
   run_audit --run --report
   assert_failure 2
