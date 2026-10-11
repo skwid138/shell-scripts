@@ -853,6 +853,63 @@ hold_reclaim_mutex() {
   assert_output --partial "ERROR: lock: cannot create $(LOCK): a non-directory is in the way"
 }
 
+# fn_src <name>: the source of one top-level function of the script.
+fn_src() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
+
+@test "cache-prune: lock_path_type classifies the lock path with one lstat (absent/dir/other)" {
+  local d="$T/cls" f got
+  mkdir -p "$d/dir"
+  : >"$d/file"
+  ln -s "$d/dir" "$d/link-dir"
+  ln -s "$d/nowhere" "$d/dangling"
+  mkfifo "$d/fifo"
+  fn_src lock_path_type >"$T/fn.sh"
+  [[ -s "$T/fn.sh" ]]
+  for f in absent:absent dir:dir file:other link-dir:other dangling:other fifo:other; do
+    got="$(LOCK_DIR="$d/${f%%:*}" PATH=/opt/homebrew/opt/coreutils/libexec/gnubin:/usr/bin:/bin \
+      /bin/bash -c '. "$1"; lock_path_type' _ "$T/fn.sh")"
+    [[ "$got" == "${f#*:}" ]] || {
+      echo "${f%%:*}: expected ${f#*:}, got '$got'" >&3
+      false
+    }
+  done
+}
+
+@test "cache-prune: lock-path classification never re-observes the path (structural guard)" {
+  # One observation only: a holder releasing between two stat calls (-e then
+  # -d) would turn a normal release into "a non-directory is in the way".
+  local fn
+  run fn_src lock_path_type
+  assert_output --partial '/usr/bin/stat -f %HT "$LOCK_DIR"'
+  [[ "$(grep -c '/usr/bin/stat' <<<"$output")" -eq 1 ]]
+  refute_output --regexp 'stat +-L|stat .* -L '
+  for fn in lock_path_blocked take_lock reclaim_lock; do
+    run fn_src "$fn"
+    [[ -n "$output" ]]
+    refute_output --regexp '\[\[[^]]*-[edLhfp] +"\$LOCK_DIR"'
+  done
+}
+
+@test "cache-prune: the lock path is classified from one observation even if a holder releases right after it" {
+  # A bare (fresh) lock dir exists. The lock-classify hook runs right after
+  # the classifier's single observation and removes the dir once, as a
+  # holder releasing would. The decision must follow that observation (a
+  # directory: contention), so the run proceeds; a second stat after the
+  # hook would see the path gone and misreport it.
+  mkdir -p "$(LOCK)"
+  cat >"$T/hook-classify" <<HOOK
+#!/bin/bash
+[[ "\$1" == lock-classify && ! -e "$T/released" ]] || exit 0
+rmdir "$(LOCK)" && touch "$T/released"
+HOOK
+  chmod +x "$T/hook-classify"
+  run_prune_with CACHE_PRUNE_TEST_HOOK="$T/hook-classify" --
+  [[ -e "$T/released" ]]
+  assert_success
+  refute_output --partial "ERROR"
+  [[ ! -e "$(LOCK)" ]]
+}
+
 @test "cache-prune: a holder releasing between every failed mkdir and its check is contention (75), never an error" {
   # Deterministic interleaving via the test hook: before each mkdir another
   # run takes the lock; after our mkdir fails it releases it again, so every
