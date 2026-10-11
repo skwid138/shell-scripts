@@ -38,6 +38,11 @@ setup() {
   set_nvm_default "$NODE_VER"
 }
 
+teardown() {
+  touch "$FIX/b.go" 2>/dev/null
+  return 0
+}
+
 # --- stub plumbing -----------------------------------------------------------
 
 # make_stub <path> <body...>: executable bash stub that records argv first.
@@ -542,19 +547,23 @@ write_lock_owner() { # <pid> <host>
   [[ -f "$(LOCK)/owner" ]]
 }
 
-@test "cache-prune: ambiguous lock ownership (no owner file, other host) is not reclaimed" {
+@test "cache-prune: a fresh lock with no owner is not reclaimed; a dead owner pid under another hostname is" {
   mkdir -p "$(LOCK)"
   run_prune --apply --no-notify
   assert_failure 75
   [[ -d "$(LOCK)" ]]
 
+  # Hostnames change with networks; the lock lives on this disk, so a dead
+  # pid is dead whatever host it was recorded under.
   rm -rf "$(LOCK)"
-  write_lock_owner 999999 "some-other-host"
-  : >"$CALLS"
-  run_prune --apply --no-notify
-  assert_failure 75
-  run mutating_calls
-  assert_output ""
+  sleep 0 &
+  local dead=$!
+  wait "$dead"
+  write_lock_owner "$dead" "some-other-host"
+  run_prune
+  assert_success
+  assert_output --partial "reclaiming"
+  [[ ! -e "$(LOCK)" ]]
 }
 
 @test "cache-prune: a clearly stale lock (same host, dead pid) is reclaimed and released on exit" {
@@ -639,6 +648,129 @@ EOF
   assert_output --partial "lock held"
   run mutating_calls
   assert_output ""
+}
+
+# --- lock: liveness across hostname changes, serialized reclamation ----------
+
+# bg_prune <outfile-prefix> [VAR=val...] -- [args...]: background run; BG_PID.
+bg_prune() {
+  local pfx="$1"
+  shift
+  local envs=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    envs+=("$1")
+    shift
+  done
+  shift
+  env -i HOME="$FAKE_HOME" CALLS="$CALLS" FIX="$FIX" \
+    CACHE_PRUNE_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
+    CACHE_PRUNE_NOW="$NOW" "${envs[@]}" \
+    /bin/bash "$SCRIPT" "$@" </dev/null >"$pfx.out" 2>"$pfx.err" 3>&- &
+  BG_PID=$!
+}
+
+wait_for() { # <command...>: poll up to ~10s
+  local i
+  for i in $(seq 1 100); do
+    "$@" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+owner_pid_is() { [[ "$(sed -n 's/^pid=//p' "$(LOCK)/owner" 2>/dev/null)" == "$1" ]]; }
+
+write_pause_hook() { # <path> <phase> <name>
+  cat >"$1" <<HOOK
+#!/bin/bash
+[[ "\$1" == "$2" ]] || exit 0
+touch "$FIX/$3.paused"
+while [[ ! -e "$FIX/$3.go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$1"
+}
+
+stale_dead_lock() {
+  sleep 0 &
+  local dead=$!
+  wait "$dead"
+  write_lock_owner "$dead" "$(/bin/hostname)"
+}
+
+@test "cache-prune: a live owner pid recorded under a different hostname is busy however old the lock (never reclaimed)" {
+  sleep 60 &
+  local holder=$!
+  mkdir -p "$(LOCK)"
+  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$holder" "old-network-name.local" "$(($(/bin/date -u +%s) - 30 * 3600))" >"$(LOCK)/owner"
+  cp "$(LOCK)/owner" "$T/owner.before"
+  age_path "$(LOCK)" 30
+  run_prune --apply
+  kill "$holder" 2>/dev/null
+  assert_failure 75
+  refute_output --partial "reclaiming"
+  cmp -s "$(LOCK)/owner" "$T/owner.before"
+  run mutating_calls
+  assert_output ""
+  run grep '^osascript' "$CALLS"
+  assert_output --partial "lock held"
+}
+
+@test "cache-prune: two stale-lock contenders: the earlier decider revalidates and cannot delete the winner's lock" {
+  stale_dead_lock
+  echo 30 >"$FIX/rustup_sleep"
+  write_pause_hook "$T/hook-b" reclaim-decided b
+  bg_prune "$T/b" CACHE_PRUNE_TEST_HOOK="$T/hook-b" CACHE_PRUNE_TIMEOUT=2 --
+  local b=$BG_PID
+  wait_for test -e "$FIX/b.paused"
+  bg_prune "$T/a" CACHE_PRUNE_TIMEOUT=60 --
+  local a=$BG_PID
+  wait_for owner_pid_is "$a"
+  touch "$FIX/b.go"
+  local brc=0
+  wait "$b" || brc=$?
+  local survived=0
+  owner_pid_is "$a" && kill -0 "$a" && survived=1
+  kill -TERM "$a"
+  wait "$a" || true
+  [[ "$survived" -eq 1 ]]
+  [[ "$brc" -eq 75 ]]
+  ! grep -q 'reclaiming' "$T/b.out"
+}
+
+@test "cache-prune: reclamation is serialized: a contender is busy while another holds the reclaim critical section" {
+  stale_dead_lock
+  write_pause_hook "$T/hook-b" reclaim-locked b
+  bg_prune "$T/b" CACHE_PRUNE_TEST_HOOK="$T/hook-b" CACHE_PRUNE_TIMEOUT=30 --
+  local b=$BG_PID
+  wait_for test -e "$FIX/b.paused"
+  run env -i HOME="$FAKE_HOME" CALLS="$CALLS" FIX="$FIX" \
+    CACHE_PRUNE_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" CACHE_PRUNE_NOW="$NOW" \
+    CACHE_PRUNE_TIMEOUT=30 CACHE_PRUNE_RECLAIM_WAIT=1 /bin/bash "$SCRIPT" </dev/null 3>&-
+  local arc=$status aout=$output
+  [[ -d "$(LOCK)" ]]
+  touch "$FIX/b.go"
+  local brc=0
+  wait "$b" || brc=$?
+  [[ "$arc" -eq 75 ]]
+  [[ "$aout" == *"another run is reclaiming"* ]]
+  [[ "$brc" -eq 0 ]]
+  grep -q 'reclaiming' "$T/b.out"
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: a reclaimer killed inside the critical section does not wedge later runs" {
+  stale_dead_lock
+  write_pause_hook "$T/hook-b" reclaim-locked b
+  bg_prune "$T/b" CACHE_PRUNE_TEST_HOOK="$T/hook-b" --
+  local b=$BG_PID
+  wait_for test -e "$FIX/b.paused"
+  kill -KILL "$b"
+  wait "$b" 2>/dev/null || true
+  run env -i HOME="$FAKE_HOME" CALLS="$CALLS" FIX="$FIX" \
+    CACHE_PRUNE_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" CACHE_PRUNE_NOW="$NOW" \
+    CACHE_PRUNE_TIMEOUT=30 CACHE_PRUNE_RECLAIM_WAIT=1 /bin/bash "$SCRIPT" </dev/null 3>&-
+  touch "$FIX/b.go"
+  assert_success
+  assert_output --partial "reclaiming"
 }
 
 @test "cache-prune: a normal run releases its own lock" {

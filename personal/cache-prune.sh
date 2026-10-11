@@ -60,9 +60,11 @@ line (# comments allowed). Listing any tag protects the whole image ID.
 Files:
   Log:   ~/Library/Logs/cache-prune.log (rotated to .1 above 1 MiB; authoritative)
   Lock:  ~/Library/Caches/cache-prune.lock (mkdir lock with owner pid/host/start).
-         A dead owner pid is reclaimed at once; an ambiguous lock (no or
-         unparseable owner, other hostname) once untouched for 6h. --apply
-         notifies when a live holder has kept it for over a day.
+         A live owner pid is busy whatever its hostname or age (--apply
+         notifies after a day); a dead one is reclaimed at once; a lock with
+         no parseable owner pid once untouched for 6h. Reclaiming is
+         serialized by an flock on cache-prune.lock.reclaim and revalidated
+         against the lock's current contents.
 
 Exit codes:
   0   every step succeeded or was skipped
@@ -70,16 +72,18 @@ Exit codes:
       install/uninstall failed, or run as root, or the lock's owner
       metadata could not be written (lock released; nothing done)
   2   usage error
-  75  another run holds the lock (or ambiguous ownership younger than 6h);
-      nothing done
+  75  another run holds the lock (live owner pid, a lock with no parseable
+      owner younger than 6h, or another run is reclaiming); nothing done
 
 Environment overrides (tests/advanced use):
   CACHE_PRUNE_BASE_PATH  PATH used instead of the built-in base PATH
                          (nvm default node bin is still prepended)
   CACHE_PRUNE_NOW        epoch seconds to use as "now" for age checks
   CACHE_PRUNE_TIMEOUT    watchdog seconds for inventory/report commands (default 120)
-  CACHE_PRUNE_LOCK_STALE_SECS  age after which an ambiguous lock is reclaimed
-                         (default 21600 = 6h)
+  CACHE_PRUNE_LOCK_STALE_SECS  age after which a lock with no parseable owner
+                         pid is reclaimed (default 21600 = 6h)
+  CACHE_PRUNE_RECLAIM_WAIT  seconds to wait for the reclaim mutex (default 10)
+  CACHE_PRUNE_TEST_HOOK  test-only: command run at lock decision points
 EOF
 }
 
@@ -367,15 +371,23 @@ log_file() {
 # --- lock ----------------------------------------------------------------------
 
 LOCK_BUSY_EXIT=75
-# Ambiguous lock (no/unparseable owner, or another hostname — macOS hostnames
-# change with networks): reclaimed once the lock dir is untouched this long.
-# A healthy run publishes its owner within milliseconds of mkdir.
+# A live owner pid is busy whatever its hostname or age; a dead owner pid is
+# reclaimed at once. A lock with no parseable owner pid is reclaimed once its
+# dir is untouched this long (a run publishes its owner within milliseconds
+# of mkdir). Reclamation is serialized and revalidated (see reclaim_lock).
 LOCK_STALE_SECS="${CACHE_PRUNE_LOCK_STALE_SECS:-21600}"
 # A live holder older than this is reported (hung run or recycled pid).
 LOCK_NOTIFY_SECS=86400
 THIS_HOST="$(/bin/hostname 2>/dev/null || echo unknown)"
 LOCK_ERR=""
 LOCK_BUSY_NOTE=""
+RECLAIM_FILE="$LOCK_DIR.reclaim"
+RECLAIM_WAIT="${CACHE_PRUNE_RECLAIM_WAIT:-10}"
+TEST_HOOK="${CACHE_PRUNE_TEST_HOOK:-}"
+LK_STATE=""
+LK_WHY=""
+LK_PID=""
+LK_AGE=""
 
 # write_lock_owner: publish owner metadata atomically (tmp + rename). On
 # failure the tmp file is removed and 1 is returned.
@@ -403,15 +415,121 @@ take_lock() {
   return 2
 }
 
-# reclaim_lock <why>: remove a stale lock (owner plus any owner.tmp.* left by
-# a crash mid-publish) and take it. Same return codes as take_lock.
+# seconds_since <epoch>: real-clock age (never CACHE_PRUNE_NOW).
+seconds_since() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 0
+  echo $(($(/bin/date -u +%s) - $1))
+}
+
+# inspect_lock: classify the CURRENT lock contents into LK_STATE:
+#   absent  no lock dir
+#   live    owner pid parses (any hostname: macOS hostnames change with
+#           networks, and the lock lives on this machine's disk) and is alive;
+#           a recycled pid also reads as live, which is the conservative side
+#   stale   owner pid parses and is dead, or there is no parseable owner pid
+#           and the lock dir is untouched for >= LOCK_STALE_SECS
+#   fresh   no parseable owner pid, but the lock dir is younger than that
+#           (a run publishes its owner within milliseconds of mkdir)
+# LK_WHY describes the decision; LK_PID/LK_AGE are set for live locks.
+inspect_lock() {
+  local line pid="" host="" started="" age
+  LK_STATE=""
+  LK_WHY=""
+  LK_PID=""
+  LK_AGE=""
+  if [[ ! -d "$LOCK_DIR" ]]; then
+    LK_STATE=absent
+    return
+  fi
+  if [[ -f "$LOCK_DIR/owner" ]]; then
+    {
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+          pid=*) pid="${line#pid=}" ;;
+          host=*) host="${line#host=}" ;;
+          started=*) started="${line#started=}" ;;
+        esac
+      done <"$LOCK_DIR/owner"
+    } 2>/dev/null
+  fi
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
+      age="$(seconds_since "$started")"
+      [[ -n "$age" ]] || age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
+      LK_STATE=live
+      LK_PID="$pid"
+      LK_AGE="$age"
+      LK_WHY="held by live pid $pid (host '$host') for ${age:-?}s"
+      return
+    fi
+    LK_STATE=stale
+    LK_WHY="dead pid $pid (host '$host')"
+    return
+  fi
+  age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
+  if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_STALE_SECS" ]]; then
+    LK_STATE=stale
+    LK_WHY="no parseable owner pid (pid='${pid}' host='${host}'), untouched for ${age}s >= ${LOCK_STALE_SECS}s"
+    return
+  fi
+  LK_STATE=fresh
+  LK_WHY="no parseable owner pid (pid='${pid}' host='${host}'), untouched ${age:-?}s < ${LOCK_STALE_SECS}s"
+}
+
+# Reclaim mutex: an exclusive flock on RECLAIM_FILE held through fd 9 of this
+# shell (perl takes it on the inherited descriptor and exits; the lock lives
+# as long as fd 9 is open). The kernel drops it when this process dies, so a
+# crashed reclaimer never wedges later runs and no stale timeout is needed.
+# RECLAIM_FILE is never deleted (unlinking a flocked file breaks exclusion).
+reclaim_mutex_take() {
+  { exec 9>>"$RECLAIM_FILE"; } 2>/dev/null || return 1
+  if /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, ">&=", 9) or exit 2; my $end = time + $ARGV[0]; until (flock($f, LOCK_EX | LOCK_NB)) { exit 3 if time >= $end; select(undef, undef, undef, 0.05) } exit 0' "$RECLAIM_WAIT"; then
+    return 0
+  fi
+  exec 9>&-
+  return 1
+}
+
+reclaim_mutex_release() { exec 9>&-; }
+
+# test_hook <phase>: test-only seam to pause at a decision point (runs with
+# fd 9 closed so a paused hook never holds the reclaim mutex itself).
+test_hook() {
+  [[ -n "$TEST_HOOK" ]] || return 0
+  "$TEST_HOOK" "$1" </dev/null >/dev/null 2>&1 9>&-
+  return 0
+}
+
+# reclaim_lock: serialized reclamation. Under the reclaim mutex, re-inspect
+# the CURRENT lock and remove it only if it is still stale (a contender may
+# have reclaimed and re-taken it since our first look). Release the mutex,
+# then take the lock by plain mkdir: whoever loses that is busy.
+# Return codes as take_lock (0 held, 1 busy, 2 owner publish failed).
 reclaim_lock() {
-  log "lock: reclaiming $LOCK_DIR ($1)"
-  rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
-  if ! rmdir "$LOCK_DIR" 2>/dev/null; then
-    log "lock: could not reclaim $LOCK_DIR (unexpected contents); skipping run"
+  if ! reclaim_mutex_take; then
+    log "lock: another run is reclaiming $LOCK_DIR; skipping run"
     return 1
   fi
+  test_hook reclaim-locked
+  inspect_lock
+  case "$LK_STATE" in
+    stale)
+      log "lock: reclaiming stale lock $LOCK_DIR ($LK_WHY)"
+      rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
+      if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+        reclaim_mutex_release
+        log "lock: could not reclaim $LOCK_DIR (unexpected contents); skipping run"
+        return 1
+      fi
+      ;;
+    absent) ;;
+    *)
+      reclaim_mutex_release
+      log "lock: $LOCK_DIR is no longer stale ($LK_WHY); skipping run"
+      return 1
+      ;;
+  esac
+  reclaim_mutex_release
   take_lock
   case $? in
     0) return 0 ;;
@@ -423,46 +541,40 @@ reclaim_lock() {
   esac
 }
 
-# seconds_since <epoch>: real-clock age (never CACHE_PRUNE_NOW).
-seconds_since() {
-  [[ "$1" =~ ^[0-9]+$ ]] || return 0
-  echo $(($(/bin/date -u +%s) - $1))
-}
-
-# acquire_lock: 0 = held; 1 = busy/ambiguous (caller exits LOCK_BUSY_EXIT;
-# LOCK_BUSY_NOTE set for a live holder older than a day); 2 = owner metadata
-# could not be written (LOCK_ERR; caller exits 1).
+# acquire_lock: 0 = held; 1 = busy (exit 75; LOCK_BUSY_NOTE set when a live
+# holder is older than LOCK_NOTIFY_SECS); 2 = owner publish failed (error).
 acquire_lock() {
-  local rc pid="" host="" started="" age
+  local rc
   mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
   take_lock
   rc=$?
   [[ $rc -eq 1 ]] || return $rc
-  if [[ -f "$LOCK_DIR/owner" ]]; then
-    pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
-    host="$(sed -n 's/^host=//p' "$LOCK_DIR/owner" 2>/dev/null)"
-    started="$(sed -n 's/^started=//p' "$LOCK_DIR/owner" 2>/dev/null)"
-  fi
-  if [[ "$pid" =~ ^[0-9]+$ && "$host" == "$THIS_HOST" ]]; then
-    if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
-      age="$(seconds_since "$started")"
-      [[ -n "$age" ]] || age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
-      log "lock: held by live pid $pid on $host (started $started, ${age:-?}s ago); skipping run"
-      if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_NOTIFY_SECS" ]]; then
-        LOCK_BUSY_NOTE="lock held by pid $pid for $((age / 3600))h; cache prune not running - see log"
+  inspect_lock
+  case "$LK_STATE" in
+    absent)
+      # Released between our mkdir and the inspection: one more plain try.
+      take_lock
+      rc=$?
+      [[ $rc -eq 1 ]] && log "lock: $LOCK_DIR was re-taken by a concurrent run; skipping run"
+      return $rc
+      ;;
+    live)
+      log "lock: $LK_WHY; skipping run"
+      if [[ "$LK_AGE" =~ ^[0-9]+$ && "$LK_AGE" -ge "$LOCK_NOTIFY_SECS" ]]; then
+        LOCK_BUSY_NOTE="lock held by pid $LK_PID for $((LK_AGE / 3600))h; cache prune not running - see log"
       fi
       return 1
-    fi
-    reclaim_lock "stale lock from dead pid $pid on $host (started $started)"
-    return $?
-  fi
-  age="$(seconds_since "$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null)")"
-  if [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$LOCK_STALE_SECS" ]]; then
-    reclaim_lock "ambiguous ownership (pid='${pid}' host='${host}') untouched for ${age}s >= ${LOCK_STALE_SECS}s"
-    return $?
-  fi
-  log "lock: $LOCK_DIR exists with ambiguous ownership (pid='${pid}' host='${host}', untouched ${age:-?}s < ${LOCK_STALE_SECS}s); skipping run"
-  return 1
+      ;;
+    stale)
+      test_hook reclaim-decided
+      reclaim_lock
+      return $?
+      ;;
+    *)
+      log "lock: $LOCK_DIR exists with $LK_WHY; skipping run"
+      return 1
+      ;;
+  esac
 }
 
 # --- step bookkeeping --------------------------------------------------------
