@@ -113,12 +113,14 @@ EOF
   chmod +x "$STUBS/launchctl"
 }
 
-# run_audit_env [args...]: run_audit, passing through GITLEAKS_AUDIT_RECLAIM_WAIT.
+# run_audit_env [args...]: run_audit, passing through GITLEAKS_AUDIT_RECLAIM_WAIT
+# and GITLEAKS_AUDIT_PERL.
 run_audit_env() {
   run --separate-stderr env -i HOME="$FAKE_HOME" TMPDIR="$TMPD" CALLS="$CALLS" FIX="$FIX" \
     MARKER="$MARKER" GITLEAKS_AUDIT_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
     GITLEAKS_AUDIT_NOW="$NOW" GITLEAKS_AUDIT_TIMEOUT="$TIMEOUT" GITLEAKS_AUDIT_KILL_GRACE="$GRACE" \
     GITLEAKS_AUDIT_RECLAIM_WAIT="${GITLEAKS_AUDIT_RECLAIM_WAIT:-10}" \
+    GITLEAKS_AUDIT_PERL="${GITLEAKS_AUDIT_PERL:-/usr/bin/perl}" \
     /bin/bash "$SCRIPT" "$@" </dev/null 3>&-
 }
 
@@ -1096,6 +1098,133 @@ stale_dead_lock() {
   touch "$FIX/b.go"
   assert_success
   assert_output --partial "reclaiming"
+}
+
+# --- lock: infrastructure failures are errors (exit 1), not contention (75) ----
+
+# hold_reclaim_mutex: hold an exclusive flock on the reclaim file from a test
+# process (as a concurrent reclaimer would); sets HOLDER_PID.
+hold_reclaim_mutex() {
+  /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; open(my $r, ">", $ARGV[1]) or die; close $r; sleep 30' \
+    "$(LOCKD).reclaim" "$T/mutex.held" </dev/null >/dev/null 2>&1 3>&- &
+  HOLDER_PID=$!
+  wait_for test -e "$T/mutex.held"
+}
+
+@test "gitleaks-audit: an unwritable or uncreatable lock parent exits 1 with an error notification, not 75" {
+  mkrepo alpha
+  local caches="$FAKE_HOME/Library/Caches"
+  mkdir -p "$caches"
+  chmod 555 "$caches"
+  run_audit --run
+  chmod 755 "$caches"
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCKD): $caches is not a writable directory"
+  refute_output --partial "skipping run"
+  [[ "$(scans)" -eq 0 ]]
+  run notifies
+  assert_output --partial "error"
+
+  # A parent that cannot be created (a file is in the way) is the same error.
+  rmdir "$caches"
+  : >"$caches"
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCKD): $caches is not a writable directory"
+  run notifies
+  assert_output --partial "error"
+
+  rm -f "$caches"
+  run_audit --run
+  assert_success
+}
+
+@test "gitleaks-audit: a non-directory in the way of the lock dir exits 1, not 75" {
+  # The parent is writable, but mkdir of the lock dir fails and no lock dir
+  # exists: nobody can ever hold this lock, so it is an error, not contention.
+  mkrepo alpha
+  mkdir -p "$FAKE_HOME/Library/Caches"
+  : >"$(LOCKD)"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCKD) (mkdir failed and no lock exists"
+  refute_output --partial "skipping run"
+  [[ "$(scans)" -eq 0 ]]
+  run notifies
+  assert_output --partial "error"
+}
+
+@test "gitleaks-audit: a missing or failing reclaim helper (perl) exits 1 and leaves the stale lock alone" {
+  mkrepo alpha
+  stale_dead_lock
+  cp "$(LOCKD)/owner" "$T/owner.before"
+  # Missing perl: an error, never contention. (No notification can be
+  # delivered either: the notifier also runs through perl's setpgrp.)
+  GITLEAKS_AUDIT_PERL="$T/no-such-perl" run_audit_env --run
+  assert_failure 1
+  assert_output --partial "ERROR: lock: reclaim mutex helper $T/no-such-perl failed"
+  refute_output --partial "skipping run"
+  grep -q "ERROR: lock: reclaim mutex helper" "$LOGF"
+  cmp -s "$(LOCKD)/owner" "$T/owner.before"
+  [[ "$(scans)" -eq 0 ]]
+
+  # perl present but failing at the reclaim mutex: error with notification.
+  cat >"$T/bad-perl" <<'EOF'
+#!/bin/bash
+case "$*" in *flock*) echo "perl: broken" >&2; exit 255 ;; esac
+exec /usr/bin/perl "$@"
+EOF
+  chmod +x "$T/bad-perl"
+  GITLEAKS_AUDIT_PERL="$T/bad-perl" run_audit_env --run
+  assert_failure 1
+  assert_output --partial "ERROR: lock: reclaim mutex helper $T/bad-perl failed (exit 255)"
+  cmp -s "$(LOCKD)/owner" "$T/owner.before"
+  [[ "$(scans)" -eq 0 ]]
+  run notifies
+  assert_output --partial "error"
+
+  # With a working helper the same stale lock is reclaimed.
+  run_audit_env --run
+  assert_success
+  assert_output --partial "reclaiming"
+}
+
+@test "gitleaks-audit: an unopenable reclaim file exits 1, not 75" {
+  mkrepo alpha
+  stale_dead_lock
+  mkdir -p "$(LOCKD).reclaim"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot open reclaim mutex file $(LOCKD).reclaim"
+  [[ -d "$(LOCKD)" ]]
+  run notifies
+  assert_output --partial "error"
+}
+
+@test "gitleaks-audit: genuine contention (live holder, reclaim mutex held) stays 75 and is not an error" {
+  mkrepo alpha
+  sleep 60 &
+  local holder=$!
+  mkdir -p "$(LOCKD)"
+  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$holder" "$(/bin/hostname)" "$(/bin/date -u +%s)" >"$(LOCKD)/owner"
+  run_audit --run
+  kill "$holder" 2>/dev/null
+  assert_failure 75
+  assert_output --partial "skipping run"
+  refute_output --partial "ERROR"
+
+  rm -rf "$(LOCKD)"
+  stale_dead_lock
+  hold_reclaim_mutex
+  GITLEAKS_AUDIT_RECLAIM_WAIT=1 run_audit_env --run
+  kill "$HOLDER_PID" 2>/dev/null
+  assert_failure 75
+  assert_output --partial "another run is reclaiming"
+  refute_output --partial "ERROR"
+  [[ -d "$(LOCKD)" ]]
+  run notifies
+  assert_output ""
 }
 
 # --- dry runs never write state, even on fatal paths ---------------------------
