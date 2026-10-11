@@ -71,8 +71,9 @@ Exit codes:
   1   one or more steps failed or timed out (later steps still ran), or
       install/uninstall failed, or run as root, or a lock infrastructure
       failure (nothing done): owner metadata could not be written (lock
-      released), lock parent not a writable directory, or the reclaim
-      mutex file unopenable or its perl helper missing/failing
+      released), lock parent not a writable directory, a non-directory at
+      the lock path, the reclaim mutex file unopenable or its perl helper
+      or flock failing, or a stale lock that cannot be removed
   2   usage error
   75  another run holds the lock (live owner pid, a lock with no parseable
       owner younger than 6h, or another run is reclaiming); nothing done
@@ -405,20 +406,43 @@ write_lock_owner() {
   return 1
 }
 
-# take_lock: 0 = held; 1 = lock dir already exists; 2 = error (LOCK_ERR set):
-# the lock dir could not be created although none exists (mkdir failing for a
-# reason other than EEXIST), or it was created but the owner could not be
-# published, so the lock was released again. A dir that vanishes between a
-# failed mkdir and the check (holder released it) gets one more try.
+# lock_path_blocked: set LOCK_ERR and return 0 when a failed mkdir of the
+# lock dir is an infrastructure failure, judged only from conditions that
+# contention cannot produce: the parent is not a writable directory, or a
+# non-directory (file, symlink) sits at the lock path. Runs only ever create
+# and remove the lock as a plain directory, so neither state is a holder's.
+lock_path_blocked() {
+  local parent
+  parent="$(dirname "$LOCK_DIR")"
+  if [[ ! -d "$parent" || ! -w "$parent" ]]; then
+    LOCK_ERR="lock: cannot create $LOCK_DIR: $parent is not a writable directory (fix its permissions or remove what is in the way); nothing done"
+    return 0
+  fi
+  if [[ -L "$LOCK_DIR" || (-e "$LOCK_DIR" && ! -d "$LOCK_DIR") ]]; then
+    LOCK_ERR="lock: cannot create $LOCK_DIR: a non-directory is in the way (remove it); nothing done"
+    return 0
+  fi
+  return 1
+}
+
+# take_lock: 0 = held; 1 = busy; 2 = error (LOCK_ERR set). A failed mkdir is
+# an error only when lock_path_blocked says so; otherwise it is contention
+# (the lock exists, or a holder released it between our mkdir and any later
+# look), retried up to LOCK_MKDIR_TRIES times and then reported busy. The
+# errno of a failed mkdir is never inferred from the path being absent
+# afterwards. 2 also means the dir was created but the owner could not be
+# published, so the lock was released again.
+LOCK_MKDIR_TRIES=3
 take_lock() {
-  local try
-  for try in 1 2; do
+  local try=0
+  while :; do
+    test_hook lock-mkdir
     mkdir "$LOCK_DIR" 2>/dev/null && break
+    test_hook lock-mkdir-failed
+    lock_path_blocked && return 2
     [[ -d "$LOCK_DIR" ]] && return 1
-    if [[ $try -eq 2 ]]; then
-      LOCK_ERR="lock: cannot create $LOCK_DIR (mkdir failed and no lock exists; check $(dirname "$LOCK_DIR")); nothing done"
-      return 2
-    fi
+    try=$((try + 1))
+    [[ $try -lt $LOCK_MKDIR_TRIES ]] || return 1
   done
   if write_lock_owner; then
     LOCK_HELD=1
@@ -498,20 +522,27 @@ inspect_lock() {
 # RECLAIM_FILE is never deleted (unlinking a flocked file breaks exclusion).
 # Returns 0 = held; 1 = another reclaimer held it for RECLAIM_WAIT seconds
 # (contention: the helper's exit 3); 2 = infrastructure failure (LOCK_ERR
-# set): the file cannot be opened, or the helper is missing or fails.
+# set): the file cannot be opened, flock fails with an errno other than
+# EWOULDBLOCK, or the helper is missing or fails.
 reclaim_mutex_take() {
   local rc
   if ! { exec 9>>"$RECLAIM_FILE"; } 2>/dev/null; then
     LOCK_ERR="lock: cannot open reclaim mutex file $RECLAIM_FILE; stale lock $LOCK_DIR left in place, nothing done"
     return 2
   fi
-  # shellcheck disable=SC2016 # perl code: $f/$ARGV are perl variables
-  "$PERL" -e 'use Fcntl qw(:flock); open(my $f, ">&=", 9) or exit 2; my $end = time + $ARGV[0]; until (flock($f, LOCK_EX | LOCK_NB)) { exit 3 if time >= $end; select(undef, undef, undef, 0.05) } exit 0' "$RECLAIM_WAIT"
+  # Helper exits: 0 held; 3 still EWOULDBLOCK at the deadline (contention);
+  # 4 flock failed with any other errno; 2 fd 9 unusable.
+  # shellcheck disable=SC2016 # perl code: $f/$!/$ARGV are perl variables
+  "$PERL" -e 'use Fcntl qw(:flock); use Errno; open(my $f, ">&=", 9) or exit 2; my $end = time + $ARGV[0]; until (flock($f, LOCK_EX | LOCK_NB)) { unless ($!{EWOULDBLOCK} || $!{EAGAIN}) { print STDERR "flock: $!\n"; exit 4 } exit 3 if time >= $end; select(undef, undef, undef, 0.05) } exit 0' "$RECLAIM_WAIT"
   rc=$?
   [[ $rc -eq 0 ]] && return 0
   exec 9>&-
   [[ $rc -eq 3 ]] && return 1
-  LOCK_ERR="lock: reclaim mutex helper $PERL failed (exit $rc); stale lock $LOCK_DIR left in place, nothing done"
+  if [[ $rc -eq 4 ]]; then
+    LOCK_ERR="lock: reclaim mutex flock on $RECLAIM_FILE failed (exit 4: an error other than EWOULDBLOCK); stale lock $LOCK_DIR left in place, nothing done"
+  else
+    LOCK_ERR="lock: reclaim mutex helper $PERL failed (exit $rc); stale lock $LOCK_DIR left in place, nothing done"
+  fi
   return 2
 }
 
@@ -546,10 +577,13 @@ reclaim_lock() {
     stale)
       log "lock: reclaiming stale lock $LOCK_DIR ($LK_WHY)"
       rm -f "$LOCK_DIR/owner" "$LOCK_DIR"/owner.tmp.* 2>/dev/null
-      if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+      # Under the mutex nobody else may touch a stale lock (its owner is
+      # dead and contenders only mkdir), so a failed rmdir of a lock that is
+      # still there is an infrastructure problem, not contention.
+      if ! rmdir "$LOCK_DIR" 2>/dev/null && [[ -e "$LOCK_DIR" || -L "$LOCK_DIR" ]]; then
         reclaim_mutex_release
-        log "lock: could not reclaim $LOCK_DIR (unexpected contents); skipping run"
-        return 1
+        LOCK_ERR="lock: cannot remove stale lock $LOCK_DIR ($LK_WHY): rmdir failed (unexpected contents or permissions; inspect and remove it by hand); nothing done"
+        return 2
       fi
       ;;
     absent) ;;
@@ -573,15 +607,13 @@ reclaim_lock() {
 
 # acquire_lock: 0 = held; 1 = busy (exit 75; LOCK_BUSY_NOTE set when a live
 # holder is older than LOCK_NOTIFY_SECS); 2 = lock infrastructure error
-# (exit 1; LOCK_ERR set): lock parent not a writable directory, lock dir not
-# creatable, owner publish failed, or the reclaim mutex file/helper failed.
+# (exit 1; LOCK_ERR set): lock parent not a writable directory, a
+# non-directory at the lock path, owner publish failed, the reclaim mutex
+# file/helper/flock failed, or a stale lock could not be removed.
 acquire_lock() {
-  local rc parent
-  parent="$(dirname "$LOCK_DIR")"
-  if ! mkdir -p "$parent" 2>/dev/null || [[ ! -d "$parent" || ! -w "$parent" ]]; then
-    LOCK_ERR="lock: cannot create $LOCK_DIR: $parent is not a writable directory (fix its permissions or remove what is in the way); nothing done"
-    return 2
-  fi
+  local rc
+  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
+  lock_path_blocked && return 2
   take_lock
   rc=$?
   [[ $rc -eq 1 ]] || return $rc

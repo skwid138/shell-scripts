@@ -840,10 +840,43 @@ hold_reclaim_mutex() {
   : >"$(LOCK)"
   run_prune --apply --no-notify
   assert_failure 1
-  assert_output --partial "ERROR: lock: cannot create $(LOCK) (mkdir failed and no lock exists"
+  assert_output --partial "ERROR: lock: cannot create $(LOCK): a non-directory is in the way"
   refute_output --partial "skipping run"
   run mutating_calls
   assert_output ""
+
+  # A (dangling) symlink is never made by a contender either.
+  rm -f "$(LOCK)"
+  ln -s "$T/nowhere" "$(LOCK)"
+  run_prune --apply --no-notify
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCK): a non-directory is in the way"
+}
+
+@test "cache-prune: a holder releasing between every failed mkdir and its check is contention (75), never an error" {
+  # Deterministic interleaving via the test hook: before each mkdir another
+  # run takes the lock; after our mkdir fails it releases it again, so every
+  # post-failure check finds no lock. A lock path that is absent after a
+  # failed mkdir must never by itself be an error.
+  mkdir -p "$FAKE_HOME/Library/Caches"
+  cat >"$T/hook-race" <<HOOK
+#!/bin/bash
+case "\$1" in
+  lock-mkdir) mkdir "$(LOCK)" && echo take >>"$T/race.log" ;;
+  lock-mkdir-failed) rmdir "$(LOCK)" && echo release >>"$T/race.log" ;;
+esac
+exit 0
+HOOK
+  chmod +x "$T/hook-race"
+  run_prune_with CACHE_PRUNE_TEST_HOOK="$T/hook-race" -- --apply
+  assert_failure 75
+  refute_output --partial "ERROR"
+  assert_output --partial "skipping run"
+  [[ "$(grep -c release "$T/race.log")" -ge 2 ]]
+  run mutating_calls
+  assert_output ""
+  run grep -c '^osascript' "$CALLS"
+  assert_output "0"
 }
 
 @test "cache-prune: a missing or failing reclaim helper (perl) exits 1 and leaves the stale lock alone" {
@@ -875,6 +908,52 @@ EOF
   run_prune
   assert_success
   assert_output --partial "reclaiming"
+}
+
+@test "cache-prune: a reclaim flock failing with an errno other than EWOULDBLOCK exits 1, not 75" {
+  # Inject a flock that fails with EIO into the real helper code (only the
+  # flock invocation is wrapped). Retrying that until the timeout would turn
+  # an infrastructure error into contention.
+  write_policy_fixture
+  stale_dead_lock
+  cp "$(LOCK)/owner" "$T/owner.before"
+  mkdir -p "$T/perl5"
+  cat >"$T/perl5/FailFlock.pm" <<'EOF'
+package FailFlock;
+use Errno ();
+BEGIN { *CORE::GLOBAL::flock = sub { $! = Errno::EIO(); return 0 }; }
+1;
+EOF
+  cat >"$T/eio-perl" <<EOF
+#!/bin/bash
+case "\$*" in *flock*) exec /usr/bin/perl -I"$T/perl5" -MFailFlock "\$@" ;; esac
+exec /usr/bin/perl "\$@"
+EOF
+  chmod +x "$T/eio-perl"
+  run_prune_with CACHE_PRUNE_PERL="$T/eio-perl" CACHE_PRUNE_RECLAIM_WAIT=1 -- --apply
+  assert_failure 1
+  assert_output --partial "ERROR: lock: reclaim mutex flock on $(LOCK).reclaim failed (exit 4"
+  refute_output --partial "another run is reclaiming"
+  cmp -s "$(LOCK)/owner" "$T/owner.before"
+  run mutating_calls
+  assert_output ""
+  run grep '^osascript' "$CALLS"
+  assert_output --partial "reclaim mutex flock"
+}
+
+@test "cache-prune: a stale lock that cannot be removed under the mutex exits 1, not 75" {
+  write_policy_fixture
+  stale_dead_lock
+  : >"$(LOCK)/unexpected-entry"
+  run_prune --apply
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot remove stale lock $(LOCK)"
+  refute_output --partial "skipping run"
+  [[ -e "$(LOCK)/unexpected-entry" ]]
+  run mutating_calls
+  assert_output ""
+  run grep '^osascript' "$CALLS"
+  assert_output --partial "cannot remove stale lock"
 }
 
 @test "cache-prune: an unopenable reclaim file exits 1, not 75" {
