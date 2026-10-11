@@ -113,14 +113,15 @@ EOF
   chmod +x "$STUBS/launchctl"
 }
 
-# run_audit_env [args...]: run_audit, passing through GITLEAKS_AUDIT_RECLAIM_WAIT
-# and GITLEAKS_AUDIT_PERL.
+# run_audit_env [args...]: run_audit, passing through GITLEAKS_AUDIT_RECLAIM_WAIT,
+# GITLEAKS_AUDIT_PERL and GITLEAKS_AUDIT_TEST_HOOK.
 run_audit_env() {
   run --separate-stderr env -i HOME="$FAKE_HOME" TMPDIR="$TMPD" CALLS="$CALLS" FIX="$FIX" \
     MARKER="$MARKER" GITLEAKS_AUDIT_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
     GITLEAKS_AUDIT_NOW="$NOW" GITLEAKS_AUDIT_TIMEOUT="$TIMEOUT" GITLEAKS_AUDIT_KILL_GRACE="$GRACE" \
     GITLEAKS_AUDIT_RECLAIM_WAIT="${GITLEAKS_AUDIT_RECLAIM_WAIT:-10}" \
     GITLEAKS_AUDIT_PERL="${GITLEAKS_AUDIT_PERL:-/usr/bin/perl}" \
+    GITLEAKS_AUDIT_TEST_HOOK="${GITLEAKS_AUDIT_TEST_HOOK:-}" \
     /bin/bash "$SCRIPT" "$@" </dev/null 3>&-
 }
 
@@ -1148,11 +1149,44 @@ hold_reclaim_mutex() {
   : >"$(LOCKD)"
   run_audit --run
   assert_failure 1
-  assert_output --partial "ERROR: lock: cannot create $(LOCKD) (mkdir failed and no lock exists"
+  assert_output --partial "ERROR: lock: cannot create $(LOCKD): a non-directory is in the way"
   refute_output --partial "skipping run"
   [[ "$(scans)" -eq 0 ]]
   run notifies
   assert_output --partial "error"
+
+  # A (dangling) symlink is never made by a contender either.
+  rm -f "$(LOCKD)"
+  ln -s "$T/nowhere" "$(LOCKD)"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCKD): a non-directory is in the way"
+}
+
+@test "gitleaks-audit: a holder releasing between every failed mkdir and its check is contention (75), never an error" {
+  # Deterministic interleaving via the test hook: before each mkdir another
+  # run takes the lock; after our mkdir fails it releases it again, so every
+  # post-failure check finds no lock. A lock path that is absent after a
+  # failed mkdir must never by itself be an error.
+  mkrepo alpha
+  mkdir -p "$FAKE_HOME/Library/Caches"
+  cat >"$T/hook-race" <<HOOK
+#!/bin/bash
+case "\$1" in
+  lock-mkdir) mkdir "$(LOCKD)" && echo take >>"$T/race.log" ;;
+  lock-mkdir-failed) rmdir "$(LOCKD)" && echo release >>"$T/race.log" ;;
+esac
+exit 0
+HOOK
+  chmod +x "$T/hook-race"
+  GITLEAKS_AUDIT_TEST_HOOK="$T/hook-race" run_audit_env --run
+  assert_failure 75
+  refute_output --partial "ERROR"
+  assert_output --partial "skipping run"
+  [[ "$(grep -c release "$T/race.log")" -ge 2 ]]
+  [[ "$(scans)" -eq 0 ]]
+  run notifies
+  assert_output ""
 }
 
 @test "gitleaks-audit: a missing or failing reclaim helper (perl) exits 1 and leaves the stale lock alone" {
@@ -1188,6 +1222,50 @@ EOF
   run_audit_env --run
   assert_success
   assert_output --partial "reclaiming"
+}
+
+@test "gitleaks-audit: a reclaim flock failing with an errno other than EWOULDBLOCK exits 1, not 75" {
+  # Inject a flock that fails with EIO into the real helper code (only the
+  # flock invocation is wrapped). Retrying that until the timeout would turn
+  # an infrastructure error into contention.
+  mkrepo alpha
+  stale_dead_lock
+  cp "$(LOCKD)/owner" "$T/owner.before"
+  mkdir -p "$T/perl5"
+  cat >"$T/perl5/FailFlock.pm" <<'EOF'
+package FailFlock;
+use Errno ();
+BEGIN { *CORE::GLOBAL::flock = sub { $! = Errno::EIO(); return 0 }; }
+1;
+EOF
+  cat >"$T/eio-perl" <<EOF
+#!/bin/bash
+case "\$*" in *flock*) exec /usr/bin/perl -I"$T/perl5" -MFailFlock "\$@" ;; esac
+exec /usr/bin/perl "\$@"
+EOF
+  chmod +x "$T/eio-perl"
+  GITLEAKS_AUDIT_PERL="$T/eio-perl" GITLEAKS_AUDIT_RECLAIM_WAIT=1 run_audit_env --run
+  assert_failure 1
+  assert_output --partial "ERROR: lock: reclaim mutex flock on $(LOCKD).reclaim failed (exit 4"
+  refute_output --partial "another run is reclaiming"
+  cmp -s "$(LOCKD)/owner" "$T/owner.before"
+  [[ "$(scans)" -eq 0 ]]
+  run notifies
+  assert_output --partial "error"
+}
+
+@test "gitleaks-audit: a stale lock that cannot be removed under the mutex exits 1, not 75" {
+  mkrepo alpha
+  stale_dead_lock
+  : >"$(LOCKD)/unexpected-entry"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot remove stale lock $(LOCKD)"
+  refute_output --partial "skipping run"
+  [[ -e "$(LOCKD)/unexpected-entry" ]]
+  [[ "$(scans)" -eq 0 ]]
+  run notifies
+  assert_output --partial "error"
 }
 
 @test "gitleaks-audit: an unopenable reclaim file exits 1, not 75" {
