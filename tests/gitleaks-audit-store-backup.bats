@@ -62,7 +62,7 @@ write_stubs() {
 } >>"$CALLS"
 case "${1-}" in
   find-generic-password)
-    [[ -f "$FIX/security_sleep" ]] && sleep "$(cat "$FIX/security_sleep")"
+    [[ -f "$FIX/security_sleep" ]] && "${0%/*}/kc-sleep" "$(cat "$FIX/security_sleep")"
     rc="$(cat "$FIX/security_rc" 2>/dev/null || echo 0)"
     if [[ "$rc" -eq 0 ]]; then
       cat "$FIX/passphrase"
@@ -91,6 +91,7 @@ EOF
 exec /usr/bin/openssl "$@"
 EOF
   printf '#!/bin/bash\necho 8.30.1\n' >"$STUBS/gitleaks"
+  ln -s /bin/sleep "$STUBS/kc-sleep"
   chmod +x "$STUBS/security" "$STUBS/openssl-rec" "$STUBS/gitleaks"
 }
 
@@ -252,7 +253,8 @@ tree() {
     done | LC_ALL=C sort | while IFS= read -r p; do
       local h=- acl=noacl
       [[ -f "$p" && ! -L "$p" ]] && h="$(shasum -a 256 <"$p" | cut -d' ' -f1)"
-      [[ "$(/bin/ls -led "$p" | wc -l | tr -d ' ')" -gt 1 ]] && acl=acl
+      [[ "$(/bin/ls -led "$p" | wc -l | tr -d ' ')" -gt 1 ]] &&
+        acl="acl:$(/bin/ls -led "$p" | sed 1d | shasum -a 256 | cut -c1-12)"
       printf '%s %s %s %s %s\n' "$(/usr/bin/stat -f %HT "$p")" "$p" "$(/usr/bin/stat -f %Lp "$p")" "$acl" "$h"
     done
   )
@@ -871,4 +873,299 @@ manifest_archive() {
   run_audit --import-store "$ARCH"
   assert_success
   [[ -d "$BASE/restore-$TS" && -d "$BASE/restore-$TS-2" ]]
+}
+
+# --- post-impl audit: private work dir, restore location, size limits ---------
+
+# bg_audit <args...>: the audit in the background (no TTY); sets BG_PID.
+bg_audit() {
+  local -a envs=()
+  local e
+  while IFS= read -r e; do envs+=("$e"); done < <(audit_env)
+  env -i "${envs[@]}" /bin/bash "$SCRIPT" "$@" </dev/null >"$T/bg.out" 2>"$T/bg.err" 3>&- &
+  BG_PID=$!
+}
+
+wait_for() {
+  local i
+  for i in $(seq 1 150); do
+    "$@" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# acl_scan_hook <path> <phase>: at <phase>, record every node under the
+# audit's work dir(s) that carries an ACL, and which files exist there.
+acl_scan_hook() {
+  cat >"$1" <<HOOK
+#!/bin/bash
+[[ "\$1" == "$2" ]] || exit 0
+[[ -e "$T/scanned" ]] && exit 0
+touch "$T/scanned"
+for w in "$TMPD"/gitleaks-audit.*; do
+  find "\$w" -print | while IFS= read -r p; do
+    [[ "\$(/bin/ls -led "\$p" | wc -l | tr -d ' ')" -gt 1 ]] && echo "ACL \$p" >>"$T/acl.found"
+    echo "\${p##*/}" >>"$T/nodes.seen"
+  done
+done
+exit 0
+HOOK
+  chmod +x "$1"
+}
+
+@test "store backup: the work dir is stripped of an inherited ACL before any plaintext lands in it (export and import)" {
+  mkstore
+  /bin/chmod +a "everyone allow read,file_inherit,directory_inherit" "$TMPD"
+  acl_scan_hook "$T/hook" subdir-created
+  HOOK="$T/hook" run_audit --export-store "$DEST"
+  assert_success
+  [[ ! -e "$T/acl.found" ]] || {
+    cat "$T/acl.found" >&2
+    false
+  }
+  grep -qx store.tar.gz "$T/nodes.seen"
+  grep -qx check.tar "$T/nodes.seen"
+  grep -qx verify.tar.gz "$T/nodes.seen"
+  local a
+  a="$(published)"
+  rm -f "$T/scanned" "$T/nodes.seen"
+  acl_scan_hook "$T/hook" restore-move
+  HOOK="$T/hook" run_audit --import-store "$a"
+  assert_success
+  [[ ! -e "$T/acl.found" ]] || {
+    cat "$T/acl.found" >&2
+    false
+  }
+  grep -qx decrypted.gz "$T/nodes.seen"
+  grep -qx raw.tar "$T/nodes.seen"
+}
+
+@test "store backup: import refuses a symlinked or unsafe store base (nothing restored)" {
+  good_plain_archive
+  local real="$T/realbase"
+  mv "$BASE" "$real"
+  ln -s "$real" "$BASE"
+  run_audit --import-store "$ARCH"
+  assert_failure 1
+  says "symlink"
+  [[ -z "$(find "$real" -maxdepth 1 -name 'restore-*')" ]]
+  rm "$BASE"
+  mv "$real" "$BASE"
+  /bin/chmod 770 "$BASE"
+  run_audit --import-store "$ARCH"
+  assert_failure 1
+  says "group/other writable"
+  [[ -z "$(restore_dirs)" ]]
+  /bin/chmod 700 "$BASE"
+  /bin/chmod 777 "$FAKE_HOME/.config"
+  run_audit --import-store "$ARCH"
+  assert_failure 1
+  [[ -z "$(restore_dirs)" ]]
+}
+
+@test "store backup: under an inherited ACL on the store base, the restore dir is private before anything moves in and the final tree is ACL-free" {
+  good_plain_archive
+  /bin/chmod +a "everyone allow read,file_inherit,directory_inherit" "$BASE"
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == restore-move ]] || exit 0
+# Mid-move, something gives an already-moved item an ACL: the final
+# normalization must still leave the tree private.
+[[ "\$3" == protected ]] && /bin/chmod +a "everyone allow read" "\$2/repos"
+[[ ! -e "$T/seen" ]] || exit 0
+touch "$T/seen"
+echo "empty=\$([[ -z "\$(ls -A "\$2")" ]] && echo yes || echo no) acl-lines=\$(/bin/ls -led "\$2" | wc -l | tr -d ' ') mode=\$(/usr/bin/stat -f %Lp "\$2")" >"$T/seam"
+HOOK
+  chmod +x "$T/hook"
+  HOOK="$T/hook" run_audit --import-store "$ARCH"
+  assert_success
+  run cat "$T/seam"
+  assert_output "empty=yes acl-lines=1 mode=700"
+  local r p
+  r="$(restore_dirs)"
+  [[ -n "$r" ]]
+  while IFS= read -r p; do
+    [[ "$(/bin/ls -led "$p" | wc -l | tr -d ' ')" -eq 1 ]] || {
+      echo "ACL on $p" >&2
+      false
+    }
+    if [[ -d "$p" ]]; then [[ "$(/usr/bin/stat -f %Lp "$p")" == 700 ]]; else [[ "$(/usr/bin/stat -f %Lp "$p")" == 600 ]]; fi
+  done < <(find "$r" -print)
+}
+
+# limit_store <config-bytes> [random]: a store of protected + a config of
+# exactly that many bytes (compressible text, or random bytes).
+limit_store() {
+  mkdir -p "$BASE"
+  store_file protected "# p"
+  if [[ "${2-}" == random ]]; then
+    head -c "$1" /dev/urandom >"$BASE/config"
+  else
+    LC_ALL=C awk -v n="$1" 'BEGIN { while (n >= 4) { printf "# x\n"; n -= 4 } while (n-- > 0) printf "#" }' >"$BASE/config"
+  fi
+  /bin/chmod 600 "$BASE/config"
+  find "$FAKE_HOME/.config" -type d -exec /bin/chmod 700 {} +
+}
+
+@test "store backup: export enforces the import's limits: an at-limit store round-trips, one block more publishes nothing" {
+  # Raw tar = 3 headers + protected (1 block) + MANIFEST (1 block) + end
+  # (2 blocks) + config: 3584 + 6287872 = 6291456 bytes, the import cap.
+  limit_store 6287872
+  run_audit --export-store "$DEST" --plain
+  assert_success
+  [[ "$(/usr/bin/gzip -dc "$(published)" | wc -c | tr -d ' ')" -eq 6291456 ]]
+  run_audit --import-store "$(published)"
+  assert_success
+  rm -rf "$(restore_dirs)" "${DEST:?}"/*
+  limit_store 6287873
+  run_audit --export-store "$DEST" --plain
+  assert_failure 1
+  says "exceeds"
+  [[ -z "$(ls -A "$DEST")" ]]
+}
+
+@test "store backup: export refuses an archive whose compressed size the import would reject" {
+  # Incompressible data: the compressed archive itself reaches the import's
+  # decrypted-size cap (checked first). With the raw tar within its cap the
+  # tar's NUL headers/padding always save more than deflate's overhead, so
+  # this cap only binds together with the raw one.
+  limit_store 6291456 random
+  run_audit --export-store "$DEST" --plain
+  assert_failure 1
+  says "the compressed archive is"
+  [[ -z "$(ls -A "$DEST")" ]]
+}
+
+@test "store backup: export refuses more than 2000 members before validating each node; import rejects them too" {
+  mkstore
+  (cd "$BASE/repos" && mkdir $(seq -f 'r%g' 1 2000))
+  local start=$SECONDS
+  run_audit --export-store "$DEST" --plain
+  assert_failure 1
+  says "too many members"
+  [[ $((SECONDS - start)) -lt 20 ]]
+  [[ -z "$(ls -A "$DEST")" ]]
+  {
+    printf '5\trepos/\t\n'
+    seq -f '5	repos/r%g/	' 1 2000
+  } | tarbuild "$T/many.tar.gz"
+  run_audit --import-store "$T/many.tar.gz"
+  assert_rejected "too many members"
+}
+
+@test "store backup: import rejects a MANIFEST that lists itself" {
+  manifest_archive "$T/a.tar.gz" '$a\
+0000000000000000000000000000000000000000000000000000000000000000  MANIFEST'
+  run_audit --import-store "$T/a.tar.gz"
+  assert_rejected "MANIFEST: lists itself"
+}
+
+@test "store backup: import leaves a live store with real ACLs attached exactly as it was" {
+  good_plain_archive
+  /bin/chmod +a "everyone allow read" "$BASE/protected"
+  /bin/chmod +a "everyone deny delete" "$BASE/repos/alpha"
+  local before
+  before="$(tree "$BASE")"
+  grep -q 'acl:' <<<"$before"
+  run_audit --import-store "$ARCH"
+  assert_success
+  [[ "$(tree "$BASE")" == "$before" ]]
+}
+
+# --- interruption -----------------------------------------------------------------
+
+# assert_interrupted_clean: no artifact or staging dir, no lock, no temp
+# files, no restore dir, and none of the stub/hook processes left.
+assert_interrupted_clean() {
+  [[ -z "$(ls -A "$DEST")" ]] || {
+    echo "dest not empty: $(ls -A "$DEST")" >&2
+    return 1
+  }
+  [[ ! -e "$FAKE_HOME/Library/Caches/gitleaks-audit.lock" ]] || {
+    echo "lock left" >&2
+    return 1
+  }
+  [[ -z "$(ls -A "$TMPD")" ]] || {
+    echo "temp left: $(ls -A "$TMPD")" >&2
+    return 1
+  }
+  [[ -z "$(restore_dirs)" ]] || {
+    echo "restore dir left" >&2
+    return 1
+  }
+  if pgrep -f "$STUBS/|$T/hook" >/dev/null; then
+    echo "processes left: $(pgrep -lf "$STUBS/|$T/hook")" >&2
+    return 1
+  fi
+}
+
+@test "store backup: TERM during the keychain lookup kills the lookup and leaves nothing behind" {
+  mkstore
+  echo 47 >"$FIX/security_sleep"
+  bg_audit --export-store "$DEST"
+  wait_for grep -q '^security \[find-generic-password\]' "$CALLS"
+  sleep 0.3
+  local start=$SECONDS rc=0
+  kill -TERM "$BG_PID"
+  wait "$BG_PID" || rc=$?
+  [[ $rc -eq 143 ]]
+  [[ $((SECONDS - start)) -lt 15 ]]
+  sleep 0.5
+  assert_interrupted_clean
+}
+
+# pause_hook <phase> [arg3]: at <phase> (and, if given, when $3 matches),
+# touch $FIX/paused and wait for $FIX/go.
+pause_hook() {
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == "$1" ]] || exit 0
+[[ -z "${2-}" || "\${3-}" == "${2-}" ]] || exit 0
+touch "$FIX/paused"
+while [[ ! -e "$FIX/go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+}
+
+@test "store backup: TERM at each publication seam leaves no artifact, staging dir, lock, or temp file" {
+  mkstore
+  local seam rc
+  for seam in subdir-created after-strip file-created mid-write; do
+    rm -f "$FIX/paused" "$FIX/go"
+    pause_hook "$seam"
+    HOOK="$T/hook" bg_audit --export-store "$DEST"
+    wait_for test -e "$FIX/paused"
+    kill -TERM "$BG_PID"
+    touch "$FIX/go"
+    rc=0
+    wait "$BG_PID" || rc=$?
+    [[ $rc -ne 0 ]] || {
+      echo "$seam: exited 0" >&2
+      false
+    }
+    sleep 0.3
+    assert_interrupted_clean || {
+      echo "seam $seam" >&2
+      false
+    }
+  done
+}
+
+@test "store backup: TERM in the middle of the restore move removes the unfinished restore dir" {
+  good_plain_archive
+  rm -f "$FIX/paused" "$FIX/go"
+  pause_hook restore-move protected
+  HOOK="$T/hook" bg_audit --import-store "$ARCH"
+  wait_for test -e "$FIX/paused"
+  # repos/ has already moved into the restore dir at this point.
+  [[ -d "$(restore_dirs)/repos" ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/go"
+  local rc=0
+  wait "$BG_PID" || rc=$?
+  [[ $rc -ne 0 ]]
+  sleep 0.3
+  [[ -z "$(restore_dirs)" ]]
+  [[ -z "$(ls -A "$TMPD")" ]]
 }

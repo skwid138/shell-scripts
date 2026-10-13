@@ -103,9 +103,13 @@ protected, and config under ~/.config/gitleaks-audit):
                 environment) and published atomically as
                 <dest-dir>/gitleaks-store-<UTC stamp>.tar.gz.enc (-2 ... -99
                 if taken), mode 600 with no ACL; the path and its sha256 are
-                printed. --plain skips encryption (.tar.gz): it is a
-                plaintext copy of sensitive metadata. Runs under the audit
-                lock (75 when busy).
+                printed. The archive must pass the import's own checks and
+                limits (at most 2000 members, 6 MiB of tar, compressed size
+                below 6 MiB) or nothing is published. --plain skips
+                encryption (.tar.gz): it is a plaintext copy of sensitive
+                metadata. Runs under the audit lock (75 when busy). All
+                intermediates live in a private work dir under $TMPDIR whose
+                ACL is stripped before anything is written into it.
   --import-store <archive>
                 Verify an archive and unpack it into
                 ~/.config/gitleaks-audit/restore-<UTC stamp>/ for a manual
@@ -117,7 +121,13 @@ protected, and config under ~/.config/gitleaks-audit):
                 regular files and directories only, allowlisted names, no
                 links, no '..', no duplicates, NUL padding) before anything
                 is extracted; MANIFEST must match both ways; the restored
-                tree is validated like a live store. The install commands are
+                tree is validated like a live store. The store base must pass
+                the live-store chain checks (no symlinks, owned by you, not
+                group/other writable, no ACL letting others write); the
+                restore dir is made private (700, no ACL) before anything is
+                moved in, and the whole tree is 700/600 with no ACL at the
+                end. An interrupted import removes its unfinished restore
+                dir. The install commands are
                 printed (fresh store, or move the live repos/ and protected
                 aside first, then run --full).
   What the archive holds: repo names and paths, rules, and full
@@ -449,10 +459,16 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# make_work: the private work dir. Its ACL is stripped (an inheritable ACL
+# on $TMPDIR would otherwise reach every file written below it, including
+# plaintext store archives) and verified BEFORE anything is written into
+# it; anything else fails closed.
 make_work() {
   local base="${TMPDIR:-/tmp}"
   WORK="$(mktemp -d "${base%/}/gitleaks-audit.XXXXXX")" || die "cannot create private work dir"
-  chmod 700 "$WORK" || die "cannot chmod work dir"
+  if ! chmod 700 "$WORK" || ! chmod -N "$WORK" 2>/dev/null || ! ls_led_ok "$WORK" drwx------; then
+    die "cannot make the work dir $WORK private (chmod 700 and no ACL)"
+  fi
 }
 
 # --- logging -----------------------------------------------------------------
@@ -2264,38 +2280,50 @@ ls_led_ok() {
   [[ -n "$out" && "$out" != *$'\n'* && "${out:0:10}" == "$2" && "${out:10:1}" != "+" ]]
 }
 
-# keychain_lookup: print the export passphrase from the keychain (stdout,
-# meant for a command substitution: it is never written to disk, argv, or
-# the environment). security runs in its own process group under a
-# SECURITY_TIMEOUT watchdog that kills the whole group. Returns security's
-# exit status, or 124 on timeout.
+# keychain_lookup: set EXPORT_PASS from the keychain. security runs in its
+# own process group (registered as CUR_PGID, its watchdog as WD_PID, so the
+# EXIT trap reaps both if this run is interrupted) and writes the
+# passphrase into a FIFO in the private work dir that this shell reads with
+# the read builtin: it never touches disk, argv, or the environment, and a
+# trapped TERM interrupts the read at once. The watchdog kills the whole
+# group after SECURITY_TIMEOUT seconds. Returns security's exit status, or
+# 124 on timeout.
 keychain_lookup() {
-  local pid wd rc
-  rm -f "$WORK/keychain.timeout"
+  local pid rc fifo="$WORK/keychain.fifo" marker="$WORK/keychain.timeout"
+  EXPORT_PASS=""
+  rm -f "$marker" "$fifo"
+  mkfifo -m 600 "$fifo" || return 1
   # shellcheck disable=SC2016 # perl code: $!/$ARGV are perl variables
   "$PERL" -e 'setpgrp(0, 0) or die "setpgrp: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";' \
-    "$SECURITY" find-generic-password -s "$EXPORT_SERVICE" -a "$ACCT" -w 2>"$WORK/keychain.err" </dev/null &
+    "$SECURITY" find-generic-password -s "$EXPORT_SERVICE" -a "$ACCT" -w >"$fifo" 2>"$WORK/keychain.err" </dev/null &
   pid=$!
+  CUR_PGID="$pid"
   (
     sp=""
     trap 'kill "$sp" 2>/dev/null; exit 0' TERM
     sleep "$SECURITY_TIMEOUT" &
     sp=$!
     wait "$sp"
-    : >"$WORK/keychain.timeout"
+    : >"$marker"
     kill -TERM -- "-$pid" 2>/dev/null
     sleep 1 &
     sp=$!
     wait "$sp"
     kill -KILL -- "-$pid" 2>/dev/null
   ) >/dev/null 2>&1 </dev/null &
-  wd=$!
+  WD_PID=$!
+  IFS= read -r EXPORT_PASS <"$fifo"
   wait "$pid"
   rc=$?
-  kill -TERM "$wd" 2>/dev/null
-  wait "$wd" 2>/dev/null
-  kill -KILL -- "-$pid" 2>/dev/null
-  [[ -e "$WORK/keychain.timeout" ]] && return 124
+  stop_watchdog
+  reap_group "$pid"
+  CUR_PGID=""
+  rm -f "$fifo"
+  if [[ -e "$marker" ]]; then
+    EXPORT_PASS=""
+    return 124
+  fi
+  [[ $rc -eq 0 ]] || EXPORT_PASS=""
   return "$rc"
 }
 
@@ -2311,7 +2339,7 @@ get_export_passphrase() {
     return 1
   fi
   [[ -n "$ACCT" ]] || ACCT="${USER:-$(id -un 2>/dev/null)}"
-  EXPORT_PASS="$(keychain_lookup)"
+  keychain_lookup
   rc=$?
   case "$rc" in
     0)
@@ -2440,6 +2468,14 @@ store_validate() {
   [[ $SV_REPOS -eq 1 ]] || return 0
   if ! find "$base/repos" -mindepth 1 -print0 >"$WORK/sv.find" 2>"$WORK/sv.find.err"; then
     STORE_ERR="cannot list $base/repos: $(head -n1 "$WORK/sv.find.err" | cut -c1-200)"
+    return 1
+  fi
+  # The import's member limit, checked before validating node by node:
+  # every node below repos/, plus repos/, protected, config, and MANIFEST.
+  local nodes
+  nodes="$(tr -cd '\0' <"$WORK/sv.find" | wc -c | tr -d ' ')"
+  if [[ $((nodes + 2 + SV_PROTECTED + SV_CONFIG)) -gt "$STORE_MAX_MEMBERS" ]]; then
+    STORE_ERR="too many members: $((nodes + 2 + SV_PROTECTED + SV_CONFIG)) (the import accepts at most $STORE_MAX_MEMBERS)"
     return 1
   fi
   while IFS= read -r -d '' p; do
@@ -2898,9 +2934,23 @@ do_export_store() {
     store_fail "tar failed: $(head -n1 "$WORK/tar.err"); nothing exported"
     return
   fi
-  # Self-check: the import's reader must accept exactly these members.
-  if ! /usr/bin/gzip -dc "$WORK/store.tar.gz" >"$WORK/check.tar" 2>/dev/null ||
-    ! ustar_check "$WORK/check.tar" "$WORK/check.members" ||
+  # Self-check: whatever is published must pass the import's own checks:
+  # the same size caps (the compressed archive below STORE_MAX_BYTES, the
+  # tar at most STORE_MAX_BYTES) and the reader accepting exactly these
+  # members.
+  local size
+  size="$(wc -c <"$WORK/store.tar.gz" | tr -d ' ')"
+  if [[ ! "$size" =~ ^[0-9]+$ || "$size" -ge "$STORE_MAX_BYTES" ]]; then
+    store_fail "the compressed archive is ${size:-?} bytes; the import accepts less than $STORE_MAX_BYTES (exceeds limit); nothing exported"
+    return
+  fi
+  /usr/bin/gzip -dc <"$WORK/store.tar.gz" 2>/dev/null | head -c "$((STORE_MAX_BYTES + 1))" >"$WORK/check.tar"
+  size="$(wc -c <"$WORK/check.tar" | tr -d ' ')"
+  if [[ "$size" -gt "$STORE_MAX_BYTES" ]]; then
+    store_fail "the archive is larger than $STORE_MAX_BYTES bytes uncompressed, which the import rejects (exceeds limit); nothing exported"
+    return
+  fi
+  if ! ustar_check "$WORK/check.tar" "$WORK/check.members" ||
     [[ "$(cut -c3- "$WORK/check.members")" != "$(cat "$WORK/members")" ]]; then
     store_fail "the archive does not pass the import checks (${STORE_ERR:-member list differs}); nothing exported"
     return
@@ -2985,6 +3035,44 @@ tree_nodes() {
       echo "x $rel"
     fi
   done | LC_ALL=C sort
+}
+
+# restore_base_ok: GLP_BASE is safe to restore into (glp_check_base); a
+# missing part (only below an existing, validated prefix) is created first.
+restore_base_ok() {
+  local rc
+  glp_ids
+  glp_check_base
+  rc=$?
+  if [[ $rc -eq 1 ]]; then
+    if ! mkdir -p "$GLP_BASE" 2>/dev/null; then
+      STORE_ERR="cannot create $GLP_BASE"
+      return 1
+    fi
+    glp_check_base
+    rc=$?
+  fi
+  if [[ $rc -ne 0 ]]; then
+    STORE_ERR="unsafe store base: ${GLP_ERR:-$GLP_BASE is not usable}"
+    return 1
+  fi
+}
+
+# restore_tree_private <dir>: every node is a directory (700) or regular
+# file (600) without ACL entries.
+restore_tree_private() {
+  local p
+  while IFS= read -r -d '' p; do
+    if [[ -L "$p" ]]; then
+      return 1
+    elif [[ -d "$p" ]]; then
+      ls_led_ok "$p" drwx------ || return 1
+    elif [[ -f "$p" ]]; then
+      ls_led_ok "$p" -rw------- || return 1
+    else
+      return 1
+    fi
+  done < <(find "$1" -print0 2>/dev/null)
 }
 
 do_import_store() {
@@ -3078,9 +3166,12 @@ do_import_store() {
     store_fail "import rejected: restored store: $STORE_ERR; nothing restored"
     return
   fi
-  # 7. Move it to a new restore-<UTC> dir; nothing live is touched.
-  if [[ ! -d "$GLP_BASE" ]] && ! mkdir -p "$GLP_BASE" 2>/dev/null; then
-    store_fail "import: cannot create $GLP_BASE; nothing restored"
+  # 7. Move it to a new restore-<UTC> dir; nothing live is touched. The
+  # store base must pass the same chain checks as a live store (no
+  # symlinks, owned by you, not group/other writable, no ACL letting anyone
+  # else write); missing parts are created (700) and checked again.
+  if ! restore_base_ok; then
+    store_fail "import: $STORE_ERR; nothing restored"
     return
   fi
   ts="$(utc_stamp)"
@@ -3097,15 +3188,23 @@ do_import_store() {
     store_fail "import: no free restore-$ts name under $GLP_BASE; nothing restored"
     return
   fi
+  # Private (700, no ACL: an inheritable ACL on the base would reach the
+  # restored files) BEFORE anything is moved in.
+  if ! chmod 700 "$d" 2>/dev/null || ! chmod -N "$d" 2>/dev/null || ! ls_led_ok "$d" drwx------; then
+    store_fail "import: cannot make $d private (chmod 700 and no ACL); nothing restored"
+    return
+  fi
   for top in repos protected config MANIFEST; do
     [[ -e "$x/$top" ]] || continue
+    test_hook restore-move "$d" "$top"
     if ! mv "$x/$top" "$d/" 2>/dev/null; then
       store_fail "import: cannot move $top into $d; nothing restored"
       return
     fi
   done
-  if ! chmod 700 "$d" 2>/dev/null; then
-    store_fail "import: cannot chmod $d; nothing restored"
+  if ! find "$d" -type d -exec chmod 700 {} + 2>/dev/null || ! find "$d" -type f -exec chmod 600 {} + 2>/dev/null ||
+    ! chmod -RN "$d" 2>/dev/null || ! restore_tree_private "$d"; then
+    store_fail "import: the restored tree in $d is not private (700/600, no ACL); nothing restored"
     return
   fi
   RESTORE_DIR=""

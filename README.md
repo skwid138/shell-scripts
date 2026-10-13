@@ -302,8 +302,12 @@ gitleaks-audit.sh --import-store <archive>      # verify + unpack to restore-<UT
   is encrypted with `openssl enc -aes-256-cbc -pbkdf2 -iter 600000`, the
   passphrase passed on a file descriptor only, and published atomically
   into `<dest-dir>` (an existing real directory you own) as a 600 file with
-  no ACL; the path and sha256 are printed. It runs under the audit lock
-  (exit 75 when busy). `--plain` skips encryption: avoid it.
+  no ACL; the path and sha256 are printed. The archive must pass the
+  import's own checks and limits (at most 2000 members, 6 MiB of tar,
+  compressed size below 6 MiB) or nothing is published. Intermediates live in
+  a private work dir whose ACL is stripped before anything is written. It
+  runs under the audit lock (exit 75 when busy). `--plain` skips encryption:
+  avoid it.
 - **What the archive holds.** Sensitive metadata: repo names and paths,
   rules, and full fingerprints (commit:file:rule:line) of findings,
   including unrotated secrets, but no secret values.
@@ -321,6 +325,10 @@ gitleaks-audit.sh --import-store <archive>      # verify + unpack to restore-<UT
   directories only, allowlisted names, no links, `..`, duplicates, or
   hidden name suffixes), verifies `MANIFEST` both ways, validates the result
   like a live store, and moves it to `~/.config/gitleaks-audit/restore-<UTC>/`.
+  The store base must pass the live-store chain checks (no symlinks, owned
+  by you, not group/other writable); the restore dir is private (700, no
+  ACL) before anything moves in, the final tree is 700/600 without ACLs, and
+  an interrupted import removes its unfinished restore dir.
 - **Install (manual), as printed by the import.** Fresh machine:
   `mv restore-<UTC>/repos ~/.config/gitleaks-audit/repos`, the same for
   `protected`, and `config` only if none exists. Existing store: first move
