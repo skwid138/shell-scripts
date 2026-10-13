@@ -48,7 +48,7 @@ teardown() {
   if [[ -n "${BG_PID:-}" ]] && [[ "$(/bin/ps -o command= -p "$BG_PID" 2>/dev/null)" == *personal/cache-prune.sh* ]]; then
     kill -KILL "$BG_PID" 2>/dev/null
   fi
-  pkill -KILL -f "$T/(tsleep|desc|slowperl|hook|stubs/)" 2>/dev/null
+  pkill -KILL -f "$T/(tsleep|desc|slowperl|deadperl|slowps|joiner|hook|stubs/)" 2>/dev/null
   return 0
 }
 
@@ -138,6 +138,9 @@ case "$1 ${2-}" in
     [[ -f "$FIX/break_log_on_image_inspect" ]] && chmod 000 "$HOME/Library/Logs/cache-prune.log"
     fail image_inspect; ids=(); while IFS= read -r i; do ids+=("$i"); done < <(nonflag_ids "$@"); pick "$FIX/images.txt" "${ids[@]}" ;;
   "image rm")
+    # break_log_on_rm: the log becomes unwritable while this removal fails
+    # (its FAILED line is the first failed write: every later rm is refused).
+    [[ -f "$FIX/break_log_on_rm" ]] && chmod 000 "$HOME/Library/Logs/cache-prune.log"
     fail image_rm
     # Untag in the fixture; drop the row when no tags remain unless
     # rm_leaves_dangling (then the image lingers untagged = dangling).
@@ -1936,4 +1939,203 @@ EOF
   assert_output --partial "[success] report:pip"
   refute_output --partial "ERROR"
   assert_output --partial "finished with 5 failed/timed-out step(s)"
+}
+
+# --- unresolved groups, bounded observation, more coverage -------------------
+
+# wait_long <secs> <command...>: poll up to <secs> seconds.
+wait_long() {
+  local n=$(($1 * 10)) i=0
+  shift
+  until "$@"; do
+    [[ $i -lt $n ]] || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+
+# write_report_hook: $T/hook pauses at the start of the report steps
+# (touching $FIX/hook.paused) until $FIX/hook.go exists.
+write_report_hook() {
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == report-steps ]] || exit 0
+touch "$FIX/hook.paused"
+while [[ ! -e "$FIX/hook.go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+}
+
+@test "cache-prune: a group that cannot be confirmed empty stays registered: TERM in a later report step still stops it (143)" {
+  setup_mut_fixture
+  # $T/joiner <fix> <pgid>: leaves for its own group, forks Z into <pgid>
+  # and never reaps it, so Z's zombie keeps <pgid> alive after the
+  # cleanup's KILL. On $FIX/join it joins <pgid> itself: a live member the
+  # cleanup never saw. It records a TERM in $FIX/joiner.term.
+  cat >"$T/joiner" <<'EOF'
+#!/usr/bin/perl
+use POSIX ();
+my ($fix, $g) = @ARGV;
+sub touch { open(my $f, '>', $_[0]) or die; print $f "$$\n"; close $f }
+setpgrp(0, 0) or die;
+my $z = fork();
+die unless defined $z;
+if (!$z) { POSIX::setpgid(0, $g) or exit 9; touch("$fix/z.pid"); sleep 600 while 1; exit 0 }
+touch("$fix/joiner.pid");
+select(undef, undef, undef, 0.05) until -e "$fix/join";
+$SIG{TERM} = sub { touch("$fix/joiner.term"); exit 0 };
+POSIX::setpgid(0, $g) or do { touch("$fix/joiner.joinfail"); exit 8 };
+touch("$fix/joiner.joined");
+sleep 600 while 1;
+EOF
+  chmod +x "$T/joiner"
+  make_stub "$STUBS/uv" \
+    "T_DIR='$T'" \
+    'case "$*" in' \
+    '  "cache dir") echo "$HOME/.cache/uv"; exit 0 ;;' \
+    '  "cache prune") ;;' \
+    '  *) exit 0 ;;' \
+    'esac' \
+    'printf "pid=%s pgid=%s\n" "$$" "$(/bin/ps -o pgid= -p $$ | tr -d " ")" >"$FIX/uv.marker"' \
+    '"$T_DIR/joiner" "$FIX" "$$" </dev/null >/dev/null 2>&1 &' \
+    'i=0; while [[ ! -s "$FIX/z.pid" && $i -lt 200 ]]; do sleep 0.05; i=$((i + 1)); done' \
+    'exit 0'
+  printf '#!/bin/bash\nexit 1\n' >"$T/badps"
+  chmod +x "$T/badps"
+  write_report_hook
+  bg_prune "$T/b" CACHE_PRUNE_PS="$T/badps" CACHE_PRUNE_GRACE=1 CACHE_PRUNE_TEST_HOOK="$T/hook" -- --apply --no-notify
+  wait_long 30 test -e "$FIX/hook.paused"
+  local g
+  g="$(marker_field pgid)"
+  [[ -n "$g" && "$g" == "$(marker_field pid)" ]]
+  grep -q "ERROR: process group $g could not be confirmed empty" "$T/b.out"
+  # A live member appears in that group after the cleanup gave up.
+  touch "$FIX/join"
+  wait_long 10 test -e "$FIX/joiner.joined"
+  [[ " $(group_members "$g")" == *" $(cat "$FIX/joiner.pid") "* ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/hook.go"
+  wait_exit "$BG_PID" 20
+  [[ "$EXIT_RC" -eq 143 ]]
+  # The handler went after that group: its member got TERM and is gone.
+  [[ -e "$FIX/joiner.term" ]]
+  wait_long 5 pid_gone "$(cat "$FIX/joiner.pid")"
+  wait_long 5 group_empty "$g"
+  grep -q "signal: stopping mutation process group $g" "$T/b.out"
+  # No mutation ran after the unresolved one.
+  run mutating_calls
+  assert_output "uv cache prune"
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: run_mutating refuses to start while an earlier group is still registered" {
+  local fn
+  : >"$T/rm.sh"
+  for fn in test_hook end_critical observe_groups group_has_members wait_group_empty stop_group abort_unready run_mutating; do
+    fn_src "$fn" >>"$T/rm.sh"
+  done
+  sed -n "/^MUT_SPAWN='/,/^exit 127;'\$/p" "$SCRIPT" >>"$T/rm.sh"
+  run env -i PATH=/usr/bin:/bin T="$T" /bin/bash -c '
+    log() { echo "log: $*"; }
+    on_signal() { exit "$1"; }
+    WORK="$T/w"; mkdir -p "$WORK"
+    PERL=/usr/bin/perl PS_BIN=/bin/ps TEST_HOOK="" GRACE=1 KILL_WAIT=1 READY_WAIT=2 OBS_WAIT=2
+    IN_CRITICAL=0 PENDING_SIG="" CHILD_PGID=4242 MUT_SEQ=0 MUT_ERR="" REFUSE_MUTATIONS=0 OBS_SEQ=0
+    . "$T/rm.sh"
+    run_mutating "$T/o" "$T/o" touch "$T/ran"
+    echo "rc=$? pgid=$CHILD_PGID refuse=$REFUSE_MUTATIONS"' </dev/null
+  assert_line "rc=1 pgid=4242 refuse=1"
+  assert_output --partial "process group 4242"
+  [[ ! -e "$T/ran" ]]
+}
+
+@test "cache-prune: a stalled process-group observer cannot block KILL escalation: exit within GRACE + a small margin" {
+  setup_mut_fixture
+  echo "ign:ignore" >"$FIX/uv_desc"
+  touch "$FIX/uv_hang"
+  # Every observation stalls for 30s (one process, killable by pid).
+  printf '#!/bin/bash\nexec "%s/tsleep" 30\n' "$T" >"$T/slowps"
+  chmod +x "$T/slowps"
+  bg_prune "$T/b" CACHE_PRUNE_PS="$T/slowps" CACHE_PRUNE_GRACE=2 -- --apply --no-notify
+  wait_for test -e "$FIX/uv.ready"
+  local start=$SECONDS
+  kill -TERM "$BG_PID"
+  wait_exit "$BG_PID" 25
+  local took=$((SECONDS - start))
+  [[ "$EXIT_RC" -eq 143 ]]
+  # GRACE 2 + KILL wait 2 + at most ~1s rounding per phase + slack.
+  [[ $took -le 9 ]] || {
+    echo "took ${took}s" >&2
+    false
+  }
+  # The TERM-ignoring member was KILLed.
+  pid_gone "$(cat "$FIX/ign.pid")"
+  group_empty "$(marker_field pgid)"
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: a spawn helper that dies before readiness is a bounded step failure (leader reaped, command never run)" {
+  setup_mut_fixture
+  cat >"$T/deadperl" <<EOF
+#!/usr/bin/perl
+if ((grep { /setpgrp/ } @ARGV) && ! -e "$FIX/dead.pid") {
+  open(my \$f, '>', "$FIX/dead.pid") or die; print \$f "\$\$\\n"; close \$f;
+  exit 3;
+}
+exec '/usr/bin/perl', @ARGV or exit 126;
+EOF
+  chmod +x "$T/deadperl"
+  local start=$SECONDS
+  bg_prune "$T/b" CACHE_PRUNE_PERL="$T/deadperl" -- --apply --no-notify
+  wait_exit "$BG_PID" 40
+  [[ "$EXIT_RC" -eq 1 ]]
+  [[ $((SECONDS - start)) -le 25 ]]
+  grep -qE '\[fail\] uv: .*readiness' "$T/b.out"
+  local dead
+  dead="$(cat "$FIX/dead.pid")"
+  # Reaped: no process (not even a zombie) with that pid.
+  pid_gone "$dead"
+  run grep -c '^uv cache prune' "$CALLS"
+  assert_output "0"
+  [[ ! -e "$FIX/uv.marker" ]]
+  grep -q '^pnpm store prune$' "$CALLS"
+}
+
+@test "cache-prune: TERM while a leftover descendant is being reaped after a normal leader exit: exits 143, group empty" {
+  setup_mut_fixture
+  echo "ign:ignore" >"$FIX/uv_desc"
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == mutation-reaping ]] || exit 0
+echo "\${2-}" >"$FIX/hook.pid"
+touch "$FIX/hook.paused"
+while [[ ! -e "$FIX/hook.go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+  bg_prune "$T/b" CACHE_PRUNE_TEST_HOOK="$T/hook" CACHE_PRUNE_GRACE=2 -- --apply --no-notify
+  wait_long 15 test -e "$FIX/hook.paused"
+  local g
+  g="$(marker_field pgid)"
+  [[ -n "$g" && "$(cat "$FIX/hook.pid")" == "$g" ]]
+  pid_gone "$(marker_field pid)"
+  kill -TERM "$BG_PID"
+  touch "$FIX/hook.go"
+  wait_exit "$BG_PID" 15
+  [[ "$EXIT_RC" -eq 143 ]]
+  group_empty "$g"
+  pid_gone "$(cat "$FIX/ign.pid")"
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: docker:tagged-images with a failed removal and later removals refused accounts as fail, not skip" {
+  write_policy_fixture
+  touch "$FIX/fail_image_rm" "$FIX/break_log_on_rm"
+  run_prune --apply --no-notify
+  chmod 644 "$(LOGF)"
+  assert_failure 1
+  assert_output --partial "FAILED to remove old:91"
+  assert_output --regexp '\[fail\] docker:tagged-images: .*2 removals refused \(log unwritable\); 1 removals failed'
+  refute_output --partial "[skip] docker:tagged-images"
+  run grep -cE '^docker .* image rm ' "$CALLS"
+  assert_output "1"
 }

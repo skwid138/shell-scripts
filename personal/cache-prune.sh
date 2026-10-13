@@ -66,8 +66,11 @@ Signals and process groups:
   exits 143/130 with the lock released. When a command exits but leaves
   processes in its group, they get the same TERM/grace/KILL; if the group
   still cannot be confirmed empty, the step fails, no later mutation runs,
-  and the run exits 1 (report steps still run). A mutation whose group never
-  confirms readiness (5s) is killed before it execs and its step fails.
+  and the run exits 1 (report steps still run); the group stays registered,
+  so a TERM/INT later in the run still stops it first. The stop deadlines
+  are wall-clock, and each look at the group (ps) is cut off after 2s and
+  then counts as non-empty. A mutation whose group never confirms readiness
+  (5s) is killed before it execs and its step fails.
   Because these groups are not the launchd job's, launchd's job-group
   cleanup no longer reaches them: this cleanup plus the agent's ExitTimeOut
   (30s) take its place.
@@ -114,10 +117,12 @@ Environment overrides (tests/advanced use):
                          starting each mutation in its own process group
                          (default /usr/bin/perl)
   CACHE_PRUNE_PS         ps used to watch a mutation's process group (default
-                         /bin/ps); a failing ps never counts as an empty group
-  CACHE_PRUNE_TEST_HOOK  test-only: command run at lock decision points and
-                         when a mutation's group is ready (before it is
-                         registered)
+                         /bin/ps); a failing or stalled (>2s) ps never counts
+                         as an empty group
+  CACHE_PRUNE_TEST_HOOK  test-only: command run at lock decision points, when
+                         a mutation's group is ready (before it is
+                         registered) or being reaped after its leader
+                         exited, and before the report steps
 EOF
 }
 
@@ -359,6 +364,9 @@ GRACE="${CACHE_PRUNE_GRACE:-8}"
 KILL_WAIT=2
 READY_WAIT=5
 PS_BIN="${CACHE_PRUNE_PS:-/bin/ps}"
+OBS_WAIT=2 # seconds one process-group observation may take (observe_groups)
+OBS_SEQ=0
+OBS_PID="" # an observation in flight (on_signal kills it)
 # shellcheck disable=SC2329  # invoked via trap
 on_signal() { # <exit code>
   if [[ "$IN_CRITICAL" -eq 1 || "$SIG_CLEANUP" -eq 1 ]]; then
@@ -366,6 +374,8 @@ on_signal() { # <exit code>
     return 0
   fi
   SIG_CLEANUP=1
+  # An observation interrupted by this signal is abandoned, not left running.
+  [[ -n "$OBS_PID" ]] && kill -KILL "$OBS_PID" 2>/dev/null
   if [[ -n "$CHILD_PGID" ]]; then
     log "  signal: stopping mutation process group $CHILD_PGID (TERM, up to ${GRACE}s, then KILL)"
     stop_group "$CHILD_PGID" ||
@@ -822,28 +832,60 @@ status_for_rc() {
 
 # --- mutating commands: own process group ------------------------------------
 
-# group_has_members <pgid>: 0 when the group has a live (non-zombie) member
-# OR cannot be observed; 1 only when a successful ps listing (one that
-# includes this shell) shows no live member. An observation failure is
-# never read as an empty group.
+# observe_groups <file> <until>: one bounded process listing (pid, pgid,
+# stat) into <file>. ps runs in the background and is killed if it is
+# still running OBS_WAIT seconds after it started, or once SECONDS passes
+# <until> (a phase deadline), so a stalled observer never holds up a
+# deadline. 0 = ps finished in time and succeeded; 1 = it failed, stalled,
+# or was killed.
+observe_groups() {
+  local file="$1" until="$2" start=$SECONDS
+  "$PS_BIN" -A -o pid= -o pgid= -o stat= >"$file" 2>/dev/null </dev/null &
+  OBS_PID=$!
+  while kill -0 "$OBS_PID" 2>/dev/null; do
+    if [[ $((SECONDS - start)) -gt $OBS_WAIT || $SECONDS -gt $until ]]; then
+      { kill -KILL "$OBS_PID" && wait "$OBS_PID"; } 2>/dev/null
+      OBS_PID=""
+      return 1
+    fi
+    /bin/sleep 0.05
+  done
+  wait "$OBS_PID" 2>/dev/null
+  local rc=$?
+  OBS_PID=""
+  return "$rc"
+}
+
+# group_has_members <pgid> [until]: 0 when the group has a live (non-zombie)
+# member OR cannot be observed (ps failed, stalled, or its listing does not
+# include this shell); 1 only when a successful listing shows no live
+# member. An observation failure is never read as an empty group. <until>
+# (a SECONDS value) caps the observation; by default OBS_WAIT bounds it.
 group_has_members() {
-  local out verdict
-  out="$("$PS_BIN" -A -o pid= -o pgid= -o stat= 2>/dev/null)" || return 0
+  local file verdict
+  OBS_SEQ=$((OBS_SEQ + 1))
+  file="$WORK/obs.$OBS_SEQ"
+  if ! observe_groups "$file" "${2:-$((SECONDS + OBS_WAIT + 1))}"; then
+    rm -f "$file" 2>/dev/null
+    return 0
+  fi
   verdict="$(awk -v g="$1" -v me="$$" '
     $1 == me { seen = 1 }
     $2 == g && $3 !~ /^Z/ { live = 1 }
-    END { print (seen && !live) ? "empty" : "busy" }' <<<"$out" 2>/dev/null)"
+    END { print (seen && !live) ? "empty" : "busy" }' "$file" 2>/dev/null)"
+  rm -f "$file" 2>/dev/null
   [[ "$verdict" != empty ]]
 }
 
 # wait_group_empty <pgid> <secs>: 0 once the group is observed empty, 1 if
-# it is not within about <secs> seconds.
+# it is not by the wall-clock deadline: <secs> seconds from now (bash's
+# whole-second SECONDS, so between <secs> and <secs>+1 of real time). Each
+# observation is capped by that deadline too.
 wait_group_empty() {
-  local i=0 n=$(($2 * 10))
-  while group_has_members "$1"; do
-    [[ $i -lt $n ]] || return 1
+  local end=$((SECONDS + $2))
+  while group_has_members "$1" "$end"; do
+    [[ $SECONDS -le $end ]] || return 1
     /bin/sleep 0.1
-    i=$((i + 1))
   done
   return 0
 }
@@ -851,6 +893,7 @@ wait_group_empty() {
 # stop_group <pgid>: TERM the group, wait up to GRACE seconds for it to
 # empty, then KILL it and wait up to KILL_WAIT. 0 = observed empty;
 # 1 = emptiness could not be established (members persist or ps fails).
+# Bounded by wall clock: about GRACE + KILL_WAIT + 2 seconds in all.
 stop_group() {
   kill -TERM -- "-$1" 2>/dev/null
   wait_group_empty "$1" "$GRACE" && return 0
@@ -877,14 +920,14 @@ MUT_ERR=""
 
 # abort_unready <pid>: the leader never confirmed its group: TERM it (and a
 # group of that id, if it got that far), a short grace, KILL both, reap the
-# leader, and check that no group of that id is left.
+# leader, and check that no group of that id is left (if that cannot be
+# confirmed, the group stays registered in CHILD_PGID).
 abort_unready() {
-  local pid="$1" i=0
+  local pid="$1" end=$((SECONDS + 1))
   kill -TERM "$pid" 2>/dev/null
   kill -TERM -- "-$pid" 2>/dev/null
-  while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
+  while kill -0 "$pid" 2>/dev/null && [[ $SECONDS -le $end ]]; do
     /bin/sleep 0.1
-    i=$((i + 1))
   done
   kill -KILL "$pid" 2>/dev/null
   kill -KILL -- "-$pid" 2>/dev/null
@@ -892,6 +935,8 @@ abort_unready() {
   MUT_ERR="mutation not started: no readiness signal from its process group within ${READY_WAIT}s (leader $pid terminated)"
   if ! wait_group_empty "$pid" "$KILL_WAIT"; then
     MUT_ERR="$MUT_ERR; process group $pid could not be confirmed empty after TERM and KILL"
+    # Stays registered: a later TERM/INT still goes after it (on_signal).
+    CHILD_PGID="$pid"
     REFUSE_MUTATIONS=1
     REFUSE_WHY="an earlier mutation's process group could not be confirmed empty"
   fi
@@ -903,8 +948,9 @@ abort_unready() {
 # files are the same), stdin </dev/null. Returns the command's own exit
 # status. MUT_ERR is set (and the return is nonzero) when the command never
 # started (no readiness) or when its group could not be confirmed empty
-# afterwards; the latter also sets REFUSE_MUTATIONS. Never use this for
-# inventory commands (run_timed).
+# afterwards; the latter also sets REFUSE_MUTATIONS and leaves the group
+# registered in CHILD_PGID (cleared only once the group is observed empty).
+# Never use this for inventory commands (run_timed).
 #
 # Startup is a critical section: the group exists from the helper's setpgrp
 # on, but this shell only knows it once the readiness byte arrives, so a
@@ -916,6 +962,16 @@ run_mutating() {
   local out="$1" err="$2" dir="$WORK/mut" fifo pid rc byte="" end
   shift 2
   MUT_ERR=""
+  # A group that could not be confirmed empty stays registered until the
+  # run ends; never start (or register) another one over it. REFUSE_MUTATIONS
+  # already keeps callers from getting here; this is the backstop.
+  if [[ -n "$CHILD_PGID" ]]; then
+    MUT_ERR="mutation not started: process group $CHILD_PGID of an earlier mutation is still registered (not confirmed empty)"
+    REFUSE_MUTATIONS=1
+    REFUSE_WHY="an earlier mutation's process group could not be confirmed empty"
+    log "  ERROR: $MUT_ERR"
+    return 1
+  fi
   MUT_SEQ=$((MUT_SEQ + 1))
   fifo="$dir/ready.$MUT_SEQ"
   if ! { [[ -d "$dir" ]] || mkdir -m 700 "$dir"; } 2>/dev/null ||
@@ -953,12 +1009,14 @@ run_mutating() {
   # The leader is gone; anything it left in its group is stopped too.
   if group_has_members "$pid"; then
     log "  process group $pid still has members after its leader exited ($rc); stopping them (TERM, up to ${GRACE}s, then KILL)"
+    test_hook mutation-reaping "$pid"
     if ! stop_group "$pid"; then
       MUT_ERR="process group $pid could not be confirmed empty after TERM and KILL"
       log "  ERROR: $MUT_ERR; refusing all further destructive steps"
       REFUSE_MUTATIONS=1
       REFUSE_WHY="an earlier mutation's process group could not be confirmed empty"
-      CHILD_PGID=""
+      # CHILD_PGID stays set: emptiness was never observed, so a TERM/INT
+      # later in the run (report steps) still stops this group first.
       [[ $rc -ne 0 ]] || rc=1
       return "$rc"
     fi
@@ -1764,6 +1822,7 @@ report_library_caches() {
 }
 
 report_steps() {
+  test_hook report-steps
   log ""
   log "== Report only (nothing below is modified) =="
   log "  pip:"
