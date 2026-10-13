@@ -477,6 +477,51 @@ good_plain_archive() {
   [[ "$(tree "$(restore_dirs)")" == "$(tree "$BASE")" ]]
 }
 
+@test "store backup: import decrypts with the passphrase on fd 3 only (never in argv or env)" {
+  mkstore
+  run_audit --export-store "$DEST"
+  assert_success
+  local a
+  a="$(published)"
+  : >"$CALLS"
+  run_audit --import-store "$a"
+  assert_success
+  grep -qxF "security [find-generic-password] [-s] [gitleaks-audit-export] [-a] [tuser] [-w]" "$CALLS"
+  grep -q '^openssl \[enc\] \[-d\] .*\[-pass\] \[fd:3\]' "$CALLS"
+  run grep -cF -- "$PASS" "$CALLS"
+  assert_output "0"
+}
+
+@test "store backup: export holds only repos/, protected, config and MANIFEST (no review/, restore-*/, or audit state)" {
+  mkstore
+  mkdir -p "$BASE/review" "$BASE/restore-20300101T000000Z/repos/x" "$FAKE_HOME/Library/Application Support/gitleaks-audit/repos/abc"
+  printf 'draft\n' >"$BASE/review/notes"
+  printf 'old\n' >"$BASE/restore-20300101T000000Z/repos/x/gitleaksignore"
+  printf 'state\n' >"$FAKE_HOME/Library/Application Support/gitleaks-audit/repos/abc/known"
+  printf 'x\n' >"$BASE/stray-file"
+  find "$BASE" -type d -exec /bin/chmod 700 {} +
+  run_audit --export-store "$DEST" --plain
+  assert_success
+  run /usr/bin/tar -tzf "$(published)"
+  assert_success
+  local m
+  while IFS= read -r m; do
+    case "$m" in
+      MANIFEST | config | protected | repos/ | repos/*) ;;
+      *)
+        echo "unexpected member: $m" >&2
+        return 1
+        ;;
+    esac
+  done <<<"$output"
+  refute_output --partial "review"
+  refute_output --partial "restore-"
+  refute_output --partial "known"
+  refute_output --partial "stray-file"
+  assert_line "repos/alpha/gitleaksignore"
+  assert_line "MANIFEST"
+}
+
 @test "store backup: a wrong passphrase is a decrypt error and creates no restore dir" {
   mkstore
   run_audit --export-store "$DEST"
