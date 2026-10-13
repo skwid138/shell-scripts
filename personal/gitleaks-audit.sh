@@ -55,8 +55,10 @@ Modes:
                 rows (including legacy count rows) are kept byte-for-byte
                 and are still announced by the next --run. Never notifies
                 and never settles or rewrites anything else. Afterwards a
-                pruned fingerprint that reappears is NEW if its repo has a
-                known file, or baselined if it has none. Exit 0 (also when
+                pruned fingerprint that is already in its repo's known stays
+                known (never re-announced); one that is not reappears as NEW
+                if the repo has a known file, or is baselined if it has
+                none. Exit 0 (also when
                 there is nothing to prune), 75 when another run holds the
                 lock, 1 on a read/write/chmod/rename/log/lock failure (the
                 pending file is left byte-identical).
@@ -2112,12 +2114,18 @@ report_delivered() {
   return 0
 }
 
-# prune_fail <message>: the --prune-delivered error path. Logs (best effort),
-# removes only its own temp file, and exits 1. It never notifies, settles,
-# or touches the pending file.
+# prune_fail <message>: the --prune-delivered error path. Logs (best effort)
+# and exits 1. It never notifies, settles, or touches the pending file, and
+# removes nothing but the invocation-unique temp file this run created while
+# holding the lock (PRUNE_TMP): never the shared pending-announce.tmp of a
+# concurrent --run, and nothing at all from a preview.
+PRUNE_TMP=""
 prune_fail() {
   log "ERROR: $1"
-  rm -f "$PENDING_FILE.tmp" 2>/dev/null
+  if [[ -n "$PRUNE_TMP" && "$LOCK_HELD" -eq 1 ]]; then
+    rm -f "$PRUNE_TMP" 2>/dev/null
+  fi
+  PRUNE_TMP=""
   EXIT_CODE=1
 }
 
@@ -2127,7 +2135,7 @@ prune_fail() {
 # writes the log only before replacing the pending file, and replaces it
 # atomically (tmp + chmod 600 + rename; removed when nothing is kept).
 do_prune_delivered() {
-  local n_rm n_keep
+  local n_rm n_keep tmp
   make_work
   if [[ "$PRUNE_DRY" -eq 0 ]]; then
     open_log
@@ -2159,7 +2167,7 @@ do_prune_delivered() {
     return
   fi
   if ! delivered_rows "$WORK/pending.orig" "$WORK/delivered" ||
-    ! awk -F'\t' '$1 != "new.delivered" && $1 != "baselined.delivered"' "$WORK/pending.orig" >"$WORK/pending.keep" 2>/dev/null; then
+    ! "$PERL" -ne 'print unless /^(?:new|baselined)\.delivered\t/' "$WORK/pending.orig" >"$WORK/pending.keep" 2>/dev/null; then
     prune_fail "prune-delivered: cannot process $PENDING_FILE; nothing changed"
     return
   fi
@@ -2175,16 +2183,24 @@ do_prune_delivered() {
     delivered_list "$WORK/delivered"
     return
   fi
+  # Kept rows go through an invocation-unique temp file, created exclusively
+  # (noclobber) while holding the lock, then renamed over the pending file.
+  # The filter above (perl -n) keeps every kept row byte-for-byte, including
+  # an unterminated final row.
+  tmp="$PENDING_FILE.prune.$$"
   if [[ "$n_keep" -gt 0 ]]; then
-    # Exclusive create (noclobber): anything already at the temp path
-    # (a directory, a symlink, a leftover) is a failure, never written into.
-    rm -f "$PENDING_FILE.tmp" 2>/dev/null
-    if ! (set -C && cat "$WORK/pending.keep" >"$PENDING_FILE.tmp") 2>/dev/null; then
-      prune_fail "prune-delivered: cannot write $PENDING_FILE.tmp; nothing changed"
+    if [[ -e "$tmp" || -L "$tmp" ]]; then
+      prune_fail "prune-delivered: $tmp already exists (not this run's); nothing changed"
       return
     fi
-    if ! chmod 600 "$PENDING_FILE.tmp" 2>/dev/null; then
-      prune_fail "prune-delivered: cannot chmod $PENDING_FILE.tmp; nothing changed"
+    if ! (set -C && cat "$WORK/pending.keep" >"$tmp") 2>/dev/null; then
+      [[ -e "$tmp" ]] && PRUNE_TMP="$tmp"
+      prune_fail "prune-delivered: cannot write $tmp; nothing changed"
+      return
+    fi
+    PRUNE_TMP="$tmp"
+    if ! chmod 600 "$tmp" 2>/dev/null; then
+      prune_fail "prune-delivered: cannot chmod $tmp; nothing changed"
       return
     fi
   fi
@@ -2194,10 +2210,11 @@ do_prune_delivered() {
     return
   fi
   if [[ "$n_keep" -gt 0 ]]; then
-    if ! mv -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null; then
+    if ! mv -f "$tmp" "$PENDING_FILE" 2>/dev/null; then
       prune_fail "prune-delivered: cannot replace $PENDING_FILE; nothing changed"
       return
     fi
+    PRUNE_TMP=""
   elif ! rm -f "$PENDING_FILE" 2>/dev/null; then
     prune_fail "prune-delivered: cannot remove $PENDING_FILE; nothing changed"
     return

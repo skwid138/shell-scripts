@@ -2825,6 +2825,8 @@ retained_rows() {
   assert_success
   assert_output --partial "--prune-delivered"
   assert_output --partial "--prune-delivered --dry-run"
+  assert_output --partial "already in its repo's known stays"
+  assert_output --partial "known (never re-announced)"
 }
 
 @test "gitleaks-audit: --dry-run without --prune-delivered is a usage error" {
@@ -2950,13 +2952,13 @@ retained_rows() {
   cp -p "$(PENDING)" "$T/pending.orig"
   same() { cmp -s "$(PENDING)" "$T/pending.orig" && [[ "$(/usr/bin/stat -f %Lp "$(PENDING)")" == 600 ]]; }
 
-  # Obstructed publication: the temp path is a directory.
-  mkdir "$(PENDING).tmp"
+  # Obstructed publication: the state dir does not take a new file.
+  /bin/chmod 500 "$STATE"
   run_audit --prune-delivered
+  /bin/chmod 700 "$STATE"
   assert_failure 1
   assert_output --partial "ERROR: prune-delivered:"
   same
-  rmdir "$(PENDING).tmp"
 
   # Rename failure.
   cat >"$STUBS/mv" <<'STUB'
@@ -2973,7 +2975,7 @@ STUB
   # chmod failure on the new file.
   cat >"$STUBS/chmod" <<'STUB'
 #!/bin/bash
-case "${@: -1}" in */pending-announce.tmp) exit 1 ;; esac
+case "${@: -1}" in */pending-announce.prune.*) exit 1 ;; esac
 exec /bin/chmod "$@"
 STUB
   chmod +x "$STUBS/chmod"
@@ -2981,7 +2983,7 @@ STUB
   assert_failure 1
   same
   rm "$STUBS/chmod"
-  [[ ! -e "$(PENDING).tmp" ]]
+  [[ -z "$(find "$STATE" -name 'pending-announce.prune.*')" ]]
 
   # Read failure.
   chmod 000 "$(PENDING)"
@@ -3073,4 +3075,60 @@ STUB
   run notifies
   assert_output --partial "1 existing findings in 1 repos baselined"
   refute_output --partial "NEW"
+}
+
+@test "gitleaks-audit: --prune-delivered never touches another run's pending-announce.tmp (failing preview, pre-lock log failure, success)" {
+  mkrepo alpha
+  mixed_pending
+  printf 'another run is writing this\n' >"$(PENDING).tmp"
+  /bin/chmod 600 "$(PENDING).tmp"
+  cp -p "$(PENDING).tmp" "$T/tmp.orig"
+  untouched() { cmp -s "$(PENDING).tmp" "$T/tmp.orig"; }
+  # A failing preview (unreadable pending file) writes and removes nothing.
+  /bin/chmod 000 "$(PENDING)"
+  run_audit --prune-delivered --dry-run
+  /bin/chmod 600 "$(PENDING)"
+  assert_failure 1
+  untouched
+  # A log failure before the lock is taken.
+  mkdir -p "$(dirname "$LOGF")"
+  : >"$LOGF"
+  /bin/chmod 000 "$LOGF"
+  run_audit --prune-delivered
+  /bin/chmod 600 "$LOGF"
+  assert_failure 1
+  untouched
+  # A successful prune uses its own temp file.
+  run_audit --prune-delivered
+  assert_success
+  untouched
+  [[ -z "$(find "$STATE" -name 'pending-announce.prune.*')" ]]
+}
+
+@test "gitleaks-audit: a pruned delivered fingerprint that is already in known stays known (not re-announced)" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  grep -qx "$(fp 1)" "$(state_dir alpha)/known"
+  printf 'new.delivered\talpha\t%s\n' "$(fp 1)" >"$(PENDING)"
+  run_audit --prune-delivered
+  assert_success
+  commit_in alpha
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  run notifies
+  assert_output ""
+}
+
+@test "gitleaks-audit: --prune-delivered keeps an unterminated final retained row byte-for-byte" {
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
+  printf 'new.delivered\talpha\t%s\nnew\tbeta\t%s\nbaselined.delivered\tgamma\t%s\nbaselined\tbeta\t%s' \
+    "$(fp 1)" "$(fp 2)" "$(fp 3)" "$(fp 4)" >"$(PENDING)"
+  printf 'new\tbeta\t%s\nbaselined\tbeta\t%s' "$(fp 2)" "$(fp 4)" >"$T/expected"
+  run_audit --prune-delivered
+  assert_success
+  cmp "$(PENDING)" "$T/expected"
 }

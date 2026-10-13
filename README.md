@@ -257,7 +257,8 @@ A few scripts here are interactive launchers wired up via aliases in
   byte-for-byte (the next `--run` still announces them); it never notifies,
   exits 75 when the lock is busy, and exits 1 with the pending file
   untouched on any read/write/rename/log failure. Afterwards a pruned
-  fingerprint that reappears is NEW if its repo has a known file, or
+  fingerprint already in its repo's known stays known (never re-announced);
+  one that is not reappears as NEW if the repo has a known file, or is
   baselined if not. Preview with `--prune-delivered --dry-run` (no lock,
   log, or state writes). The audit trusts a repo as
   unchanged only when its findings, provenance, and
