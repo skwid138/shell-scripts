@@ -856,6 +856,33 @@ hold_reclaim_mutex() {
 # fn_src <name>: the source of one top-level function of the script.
 fn_src() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
 
+# classify_path <lock-path> [perl]: lock_path_type's single line for one path.
+classify_path() {
+  fn_src lock_path_type >"$T/fn.sh"
+  [[ -s "$T/fn.sh" ]] || return 1
+  LOCK_DIR="$1" PERL="${2:-/usr/bin/perl}" PATH=/opt/homebrew/opt/coreutils/libexec/gnubin:/usr/bin:/bin \
+    /bin/bash -c '. "$1"; lock_path_type' _ "$T/fn.sh"
+}
+
+# lstat_errno_perl <out> <ERRNO-name>: a perl wrapper whose lstat (only in
+# the lock-path helper, matched by its code) fails with that errno; every
+# other perl invocation runs the real /usr/bin/perl.
+lstat_errno_perl() {
+  mkdir -p "$T/perl5-$2"
+  cat >"$T/perl5-$2/FailLstat.pm" <<EOF
+package FailLstat;
+use Errno ();
+BEGIN { *CORE::GLOBAL::lstat = sub { \$! = Errno::$2(); return () }; }
+1;
+EOF
+  cat >"$1" <<EOF
+#!/bin/bash
+case "\$*" in *lstat*) exec /usr/bin/perl -I"$T/perl5-$2" -MFailLstat "\$@" ;; esac
+exec /usr/bin/perl "\$@"
+EOF
+  chmod +x "$1"
+}
+
 @test "cache-prune: lock_path_type classifies the lock path with one lstat (absent/dir/other)" {
   local d="$T/cls" f got
   mkdir -p "$d/dir"
@@ -863,11 +890,8 @@ fn_src() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
   ln -s "$d/dir" "$d/link-dir"
   ln -s "$d/nowhere" "$d/dangling"
   mkfifo "$d/fifo"
-  fn_src lock_path_type >"$T/fn.sh"
-  [[ -s "$T/fn.sh" ]]
   for f in absent:absent dir:dir file:other link-dir:other dangling:other fifo:other; do
-    got="$(LOCK_DIR="$d/${f%%:*}" PATH=/opt/homebrew/opt/coreutils/libexec/gnubin:/usr/bin:/bin \
-      /bin/bash -c '. "$1"; lock_path_type' _ "$T/fn.sh")"
+    got="$(classify_path "$d/${f%%:*}")"
     [[ "$got" == "${f#*:}" ]] || {
       echo "${f%%:*}: expected ${f#*:}, got '$got'" >&3
       false
@@ -875,14 +899,164 @@ fn_src() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
   done
 }
 
+@test "cache-prune: lock_path_type: only ENOENT is absent; EACCES, ENOTDIR and EIO are errors" {
+  local d="$T/cls"
+  mkdir -p "$d/sealed/inner"
+  : >"$d/file"
+  run classify_path "$d/no-such-lock"
+  assert_output "absent"
+  chmod 000 "$d/sealed"
+  run classify_path "$d/sealed/inner"
+  chmod 755 "$d/sealed"
+  assert_output --regexp '^error Permission denied \(errno 13\)$'
+  run classify_path "$d/file/lock"
+  assert_output --regexp '^error Not a directory \(errno 20\)$'
+  lstat_errno_perl "$T/eio-perl" EIO
+  run classify_path "$d/no-such-lock" "$T/eio-perl"
+  assert_output --regexp '^error Input/output error \(errno 5\)$'
+  lstat_errno_perl "$T/enoent-perl" ENOENT
+  run classify_path "$d/file" "$T/enoent-perl"
+  assert_output "absent"
+}
+
+@test "cache-prune: lock_path_type: a missing, failing, silent or garbled lstat helper is an error" {
+  local d="$T/cls" p
+  mkdir -p "$d"
+  run classify_path "$d/x" "$T/no-such-perl"
+  assert_output --regexp "^error lstat helper $T/no-such-perl failed \(exit 127\)$"
+  printf '#!/bin/bash\nexit 3\n' >"$T/fail-perl"
+  printf '#!/bin/bash\nexit 0\n' >"$T/silent-perl"
+  printf '#!/bin/bash\necho directory\n' >"$T/garbled-perl"
+  printf '#!/bin/bash\nprintf "dir\\nother\\n"\n' >"$T/twoline-perl"
+  chmod +x "$T/fail-perl" "$T/silent-perl" "$T/garbled-perl" "$T/twoline-perl"
+  run classify_path "$d/x" "$T/fail-perl"
+  assert_output "error lstat helper $T/fail-perl failed (exit 3)"
+  for p in silent garbled twoline; do
+    run classify_path "$d/x" "$T/$p-perl"
+    assert_output "error lstat helper $T/$p-perl gave unexpected output"
+  done
+}
+
+@test "cache-prune: an lstat error at the lock path (EACCES, ENOTDIR, EIO) is a lock infrastructure ERROR (exit 1, notified), never absent" {
+  write_policy_fixture
+  local e
+  for e in EACCES ENOTDIR EIO; do
+    lstat_errno_perl "$T/$e-perl" "$e"
+    : >"$CALLS"
+    run_prune_with CACHE_PRUNE_PERL="$T/$e-perl" -- --apply
+    assert_failure 1
+    assert_output --partial "ERROR: lock: cannot classify $(LOCK):"
+    refute_output --partial "skipping run"
+    [[ ! -e "$(LOCK)" ]]
+    run mutating_calls
+    assert_output ""
+    grep -q "ERROR: lock: cannot classify" "$FAKE_HOME/Library/Logs/cache-prune.log"
+    run grep '^osascript' "$CALLS"
+    assert_output --partial "cannot classify"
+  done
+  # Control: an injected ENOENT is absent, so the run proceeds normally.
+  lstat_errno_perl "$T/ENOENT-perl" ENOENT
+  run_prune_with CACHE_PRUNE_PERL="$T/ENOENT-perl" --
+  assert_success
+}
+
+@test "cache-prune: a failing or garbled lstat helper at the lock path is a lock infrastructure ERROR (exit 1)" {
+  cat >"$T/lstat-fails-perl" <<'EOF'
+#!/bin/bash
+case "$*" in *lstat*) exit 9 ;; esac
+exec /usr/bin/perl "$@"
+EOF
+  cat >"$T/lstat-garbled-perl" <<'EOF'
+#!/bin/bash
+case "$*" in *lstat*) echo "Directory"; exit 0 ;; esac
+exec /usr/bin/perl "$@"
+EOF
+  chmod +x "$T/lstat-fails-perl" "$T/lstat-garbled-perl"
+  run_prune_with CACHE_PRUNE_PERL="$T/lstat-fails-perl" -- --apply --no-notify
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot classify $(LOCK): lstat helper $T/lstat-fails-perl failed (exit 9)"
+  run mutating_calls
+  assert_output ""
+  run_prune_with CACHE_PRUNE_PERL="$T/lstat-garbled-perl" --
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot classify $(LOCK): lstat helper $T/lstat-garbled-perl gave unexpected output"
+}
+
+# take_lock_harness <hook>: source the real lock functions and call take_lock
+# once against $(LOCK); prints "rc=<n> held=<LOCK_HELD>".
+take_lock_harness() {
+  local fn
+  : >"$T/tl.sh"
+  for fn in test_hook lock_path_type lock_path_blocked write_lock_owner take_lock; do
+    fn_src "$fn" >>"$T/tl.sh"
+  done
+  env -i LOCK_DIR="$(LOCK)" PERL=/usr/bin/perl TEST_HOOK="$1" PATH=/usr/bin:/bin \
+    /bin/bash -c '. "$1"; LOCK_MKDIR_TRIES=3 THIS_HOST=h LOCK_HELD=0 LOCK_ERR=""
+      take_lock; rc=$?; echo "rc=$rc held=$LOCK_HELD"' _ "$T/tl.sh"
+}
+
+# release_hook <path> [retake-pid]: at the FIRST lock-classify following a
+# failed mkdir, remove the lock dir (a holder releasing right after the
+# classifier's single observation); with a pid, re-take the lock for that
+# pid at our next mkdir. Every phase is traced to $T/trace.
+release_hook() {
+  cat >"$1" <<HOOK
+#!/bin/bash
+echo "\$1" >>"$T/trace"
+case "\$1" in
+  lock-mkdir-failed) touch "$T/mkdir-failed" ;;
+  lock-classify)
+    if [[ -e "$T/mkdir-failed" && ! -e "$T/released" ]]; then
+      rm -rf "$(LOCK)" && touch "$T/released" && echo released >>"$T/trace"
+    fi
+    ;;
+  lock-mkdir)
+    if [[ -n "${2-}" && -e "$T/released" && ! -e "$T/retaken" ]]; then
+      mkdir "$(LOCK)" && printf 'pid=%s\nhost=h\nstarted=1\n' "${2-}" >"$(LOCK)/owner" && touch "$T/retaken"
+    fi
+    ;;
+esac
+exit 0
+HOOK
+  chmod +x "$1"
+}
+
+@test "cache-prune: take_lock decides from the cached post-failed-mkdir classification (direct return)" {
+  mkdir -p "$(LOCK)"
+  release_hook "$T/hook"
+  run take_lock_harness "$T/hook"
+  assert_output "rc=1 held=0"
+  [[ -e "$T/released" ]]
+  run cat "$T/trace"
+  assert_output "$(printf '%s\n' lock-mkdir lock-mkdir-failed lock-classify released)"
+}
+
+@test "cache-prune: a run reuses take_lock's cached classification (busy return reaches the inspection)" {
+  sleep 60 &
+  local holder=$!
+  write_lock_owner "$holder" h
+  release_hook "$T/hook" "$holder"
+  run_prune_with CACHE_PRUNE_TEST_HOOK="$T/hook" -- --apply --no-notify
+  kill "$holder" 2>/dev/null
+  assert_failure 75
+  [[ -e "$T/released" && -e "$T/retaken" ]]
+  assert_output --partial "was re-taken by a concurrent run; skipping run"
+  refute_output --partial "held by live pid"
+  refute_output --partial "ERROR"
+  run mutating_calls
+  assert_output ""
+}
+
 @test "cache-prune: lock-path classification never re-observes the path (structural guard)" {
   # One observation only: a holder releasing between two stat calls (-e then
   # -d) would turn a normal release into "a non-directory is in the way".
   local fn
   run fn_src lock_path_type
-  assert_output --partial '/usr/bin/stat -f %HT "$LOCK_DIR"'
-  [[ "$(grep -c '/usr/bin/stat' <<<"$output")" -eq 1 ]]
-  refute_output --regexp 'stat +-L|stat .* -L '
+  assert_output --partial 'lstat($ARGV[0])'
+  [[ "$(grep -o 'lstat(' <<<"$output" | grep -c .)" -eq 1 ]]
+  assert_output --partial '"$LOCK_DIR"'
+  refute_output --partial '/usr/bin/stat'
+  refute_output --regexp '(^|[^l])stat\('
   for fn in lock_path_blocked take_lock reclaim_lock; do
     run fn_src "$fn"
     [[ -n "$output" ]]
@@ -940,15 +1114,17 @@ HOOK
   write_policy_fixture
   stale_dead_lock
   cp "$(LOCK)/owner" "$T/owner.before"
+  # Missing perl is already needed for the lock-path lstat, which runs
+  # before the reclaim mutex: an error, never contention.
   run_prune_with CACHE_PRUNE_PERL="$T/no-such-perl" -- --apply
   assert_failure 1
-  assert_output --partial "ERROR: lock: reclaim mutex helper $T/no-such-perl failed"
+  assert_output --partial "ERROR: lock: cannot classify $(LOCK): lstat helper $T/no-such-perl failed"
   refute_output --partial "skipping run"
   cmp -s "$(LOCK)/owner" "$T/owner.before"
   run mutating_calls
   assert_output ""
   run grep '^osascript' "$CALLS"
-  assert_output --partial "reclaim mutex"
+  assert_output --partial "cannot classify"
 
   cat >"$T/bad-perl" <<'EOF'
 #!/bin/bash

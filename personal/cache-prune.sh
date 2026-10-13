@@ -72,8 +72,10 @@ Exit codes:
       install/uninstall failed, or run as root, or a lock infrastructure
       failure (nothing done): owner metadata could not be written (lock
       released), lock parent not a writable directory, a non-directory at
-      the lock path, the reclaim mutex file unopenable or its perl helper
-      or flock failing, or a stale lock that cannot be removed
+      the lock path, a lock path that cannot be classified (an lstat error
+      other than ENOENT, e.g. EACCES/ENOTDIR/EIO, or its perl helper
+      failing), the reclaim mutex file unopenable or its perl helper or
+      flock failing, or a stale lock that cannot be removed
   2   usage error
   75  another run holds the lock (live owner pid, a lock with no parseable
       owner younger than 6h, or another run is reclaiming); nothing done
@@ -86,7 +88,8 @@ Environment overrides (tests/advanced use):
   CACHE_PRUNE_LOCK_STALE_SECS  age after which a lock with no parseable owner
                          pid is reclaimed (default 21600 = 6h)
   CACHE_PRUNE_RECLAIM_WAIT  seconds to wait for the reclaim mutex (default 10)
-  CACHE_PRUNE_PERL       perl for the reclaim mutex (default /usr/bin/perl)
+  CACHE_PRUNE_PERL       perl for the lock-path lstat and the reclaim mutex
+                         (default /usr/bin/perl)
   CACHE_PRUNE_TEST_HOOK  test-only: command run at lock decision points
 EOF
 }
@@ -407,47 +410,67 @@ write_lock_owner() {
 }
 
 # lock_path_type: classify LOCK_DIR from ONE filesystem observation that
-# does not follow symlinks (BSD stat without -L is an lstat; the absolute
-# path keeps GNU coreutils on PATH out): prints "absent" (stat failed),
-# "dir", or "other" (regular file, symlink - dangling or not -, fifo, ...).
-# Callers use the printed type and never stat the path again: a holder can
-# release its dir between two separate tests (-e then -d), which would make a
-# normal release look like a non-directory in the way.
+# does not follow symlinks: a single lstat(2) in a perl helper (errno is
+# read from the call itself, never inferred). Prints one line:
+#   absent          lstat failed with ENOENT (and only then)
+#   dir             a directory
+#   other           anything else (regular file, symlink - dangling or not -,
+#                   fifo, ...)
+#   error <diag>    lstat failed with any other errno (EACCES, ENOTDIR, EIO,
+#                   ...), or the helper failed to run or printed anything
+#                   unexpected; never treated as absent
+# It runs in a command substitution, so it cannot set LOCK_ERR: the
+# diagnosis travels in the output. Callers use the printed type and never
+# stat the path again: a holder can release its dir between two separate
+# tests (-e then -d), which would make a normal release look like a
+# non-directory in the way.
 lock_path_type() {
-  local t
-  if ! t="$(/usr/bin/stat -f %HT "$LOCK_DIR" 2>/dev/null)"; then
-    echo absent
+  local out rc
+  # shellcheck disable=SC2016 # perl code: $!/$ARGV are perl variables
+  out="$(LC_ALL=C "$PERL" -e 'use Errno; my @s = lstat($ARGV[0]); unless (@s) { if ($!{ENOENT}) { print "absent\n" } else { printf "error %s (errno %d)\n", $!, $! + 0 } exit 0 } print((-d _) ? "dir\n" : "other\n"); exit 0' "$LOCK_DIR" 2>/dev/null)"
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "error lstat helper $PERL failed (exit $rc)"
     return
   fi
-  case "$t" in
-    Directory) echo dir ;;
-    *) echo other ;;
+  case "$out" in
+    *$'\n'*) echo "error lstat helper $PERL gave unexpected output" ;;
+    absent | dir | other | "error "?*) echo "$out" ;;
+    *) echo "error lstat helper $PERL gave unexpected output" ;;
   esac
 }
 
 # lock_path_blocked: set LOCK_ERR and return 0 when a failed mkdir of the
 # lock dir is an infrastructure failure, judged only from conditions that
 # contention cannot produce: the parent is not a writable, searchable
-# directory, or a non-directory (file, symlink) sits at the lock path. Runs
-# only ever create and remove the lock as a plain directory, so neither
-# state is a holder's. Sets LOCK_PATH_TYPE (lock_path_type's single
-# observation) for the caller; the lock-classify test hook runs right after
-# that observation.
+# directory, a non-directory (file, symlink) sits at the lock path, or the
+# lock path cannot be classified (lstat error other than ENOENT, or helper
+# failure). Runs only ever create and remove the lock as a plain directory,
+# so none of these states is a holder's. Sets LOCK_PATH_TYPE (lock_path_type's
+# single observation: absent|dir|other|error) for the caller; the
+# lock-classify test hook runs right after that observation.
 LOCK_PATH_TYPE=""
 lock_path_blocked() {
-  local parent
+  local parent cls
   LOCK_PATH_TYPE=""
   parent="$(dirname "$LOCK_DIR")"
   if [[ ! -d "$parent" || ! -w "$parent" || ! -x "$parent" ]]; then
     LOCK_ERR="lock: cannot create $LOCK_DIR: $parent is not a writable directory (fix its permissions or remove what is in the way); nothing done"
     return 0
   fi
-  LOCK_PATH_TYPE="$(lock_path_type)"
+  cls="$(lock_path_type)"
+  LOCK_PATH_TYPE="${cls%% *}"
   test_hook lock-classify
-  if [[ "$LOCK_PATH_TYPE" == other ]]; then
-    LOCK_ERR="lock: cannot create $LOCK_DIR: a non-directory is in the way (remove it); nothing done"
-    return 0
-  fi
+  case "$LOCK_PATH_TYPE" in
+    other)
+      LOCK_ERR="lock: cannot create $LOCK_DIR: a non-directory is in the way (remove it); nothing done"
+      return 0
+      ;;
+    error)
+      LOCK_ERR="lock: cannot classify $LOCK_DIR: ${cls#error } (an lstat error is never taken as an absent lock; inspect the path and its parent); nothing done"
+      return 0
+      ;;
+  esac
   return 1
 }
 
