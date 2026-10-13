@@ -459,9 +459,28 @@ cleanup() {
   [[ -n "$RESTORE_DIR" ]] && rm -rf "$RESTORE_DIR"
   [[ -n "$WORK" && -d "$WORK" ]] && rm -rf "$WORK"
 }
+# TERM/INT handlers are installed once and never replaced (bash 3.2 briefly
+# installs SIG_IGN while a trap is being replaced, which can drop a signal).
+# Inside a critical section (IN_CRITICAL=1) they only record the signal;
+# the section's end exits through the normal path (end_critical).
+IN_CRITICAL=0
+PENDING_SIG=""
+on_signal() { # <exit code>
+  if [[ "$IN_CRITICAL" -eq 1 ]]; then
+    PENDING_SIG="$1"
+    return 0
+  fi
+  exit "$1"
+}
+# end_critical: leave the critical section; exit now (130/143, EXIT trap
+# cleanup) if a signal arrived inside it.
+end_critical() {
+  IN_CRITICAL=0
+  [[ -z "$PENDING_SIG" ]] || exit "$PENDING_SIG"
+}
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 # make_work: the private work dir. Its ACL is stripped (an inheritable ACL
 # on $TMPDIR would otherwise reach every file written below it, including
@@ -2213,23 +2232,21 @@ do_prune_delivered() {
       return
     fi
     # Create it in THIS shell (noclobber: an O_EXCL open, no subshell) and
-    # record ownership in the same step. Until both are done TERM/INT only
-    # set a flag (a deferred trap runs between the two statements without
-    # exiting), so cleanup can never miss a file this run created; a file
-    # that already exists makes the exclusive create fail and is never
-    # recorded, so it is never removed.
-    local created=0 sig=""
-    trap 'sig=143' TERM
-    trap 'sig=130' INT
+    # record ownership inside one critical section: a TERM/INT arriving in
+    # between is only recorded (on_signal) and acted on by end_critical, so
+    # cleanup can never miss a file this run created; a file that already
+    # exists makes the exclusive create fail and is never recorded, so it is
+    # never removed. No trap is replaced here.
+    local created=0
+    IN_CRITICAL=1
     set -C
     if { : >"$tmp"; } 2>/dev/null; then
       created=1
+      test_hook prune-critical "$tmp"
       PRUNE_TMP="$tmp"
     fi
     set +C
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    [[ -n "$sig" ]] && exit "$sig"
+    end_critical
     if [[ $created -ne 1 ]]; then
       prune_fail "prune-delivered: cannot create $tmp (exists, or the state dir is not writable); nothing changed"
       return

@@ -3208,3 +3208,28 @@ HOOK
   cmp -s "$(PENDING)" "$T/pending.orig"
   [[ ! -e "$(LOCKD)" ]]
 }
+
+@test "gitleaks-audit: TERM inside the prune temp file's critical section (created, not yet registered) is deferred, then exits 143 with no orphan" {
+  mkrepo alpha
+  mixed_pending
+  cp -p "$(PENDING)" "$T/pending.orig"
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == prune-critical ]] || exit 0
+[[ -e "\$2" ]] && touch "$T/tmp.seen"
+touch "$FIX/paused"
+while [[ ! -e "$FIX/go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+  bg_audit "$T/p" GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --prune-delivered
+  wait_for test -e "$FIX/paused"
+  [[ -e "$T/tmp.seen" ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/go"
+  local rc=0
+  wait "$BG_PID" || rc=$?
+  [[ $rc -eq 143 ]]
+  [[ -z "$(find "$STATE" -name 'pending-announce.prune.*')" ]]
+  cmp -s "$(PENDING)" "$T/pending.orig"
+  [[ ! -e "$(LOCKD)" ]]
+}
