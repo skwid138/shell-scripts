@@ -3157,3 +3157,54 @@ HOOK
   cmp -s "$(PENDING)" "$T/pending.orig"
   [[ ! -e "$(LOCKD)" ]]
 }
+
+@test "gitleaks-audit: TERM while the prune temp file is being written (after its creation) leaves no orphan" {
+  mkrepo alpha
+  mixed_pending
+  cp -p "$(PENDING)" "$T/pending.orig"
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == prune-writing ]] || exit 0
+[[ -e "\$2" ]] && touch "$T/tmp.seen"
+touch "$FIX/paused"
+while [[ ! -e "$FIX/go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+  bg_audit "$T/p" GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --prune-delivered
+  wait_for test -e "$FIX/paused"
+  [[ -e "$T/tmp.seen" ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/go"
+  local rc=0
+  wait "$BG_PID" || rc=$?
+  [[ $rc -ne 0 ]]
+  [[ -z "$(find "$STATE" -name 'pending-announce.prune.*')" ]]
+  cmp -s "$(PENDING)" "$T/pending.orig"
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: a pre-existing pending-announce.prune.<pid> is never written or removed" {
+  mkrepo alpha
+  mixed_pending
+  cp -p "$(PENDING)" "$T/pending.orig"
+  # Pause at the first lock step and plant a file with this run's own
+  # temp name, as a leftover from an earlier run with the same pid would be.
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == lock-mkdir && ! -e "$FIX/paused" ]] || exit 0
+touch "$FIX/paused"
+while [[ ! -e "$FIX/go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+  bg_audit "$T/p" GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --prune-delivered
+  wait_for test -e "$FIX/paused"
+  printf 'not this run\n' >"$STATE/pending-announce.prune.$BG_PID"
+  cp -p "$STATE/pending-announce.prune.$BG_PID" "$T/collision.orig"
+  touch "$FIX/go"
+  local rc=0
+  wait "$BG_PID" || rc=$?
+  [[ $rc -eq 1 ]]
+  cmp -s "$STATE/pending-announce.prune.$BG_PID" "$T/collision.orig"
+  cmp -s "$(PENDING)" "$T/pending.orig"
+  [[ ! -e "$(LOCKD)" ]]
+}

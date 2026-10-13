@@ -1240,3 +1240,48 @@ EOF2
   run_audit --import-store "$a"
   assert_success
 }
+
+@test "store backup: xattrs, quarantine and a resource fork on staged members never reach the archive (no AppleDouble/PAX members)" {
+  mkstore
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == stage-built ]] || exit 0
+find "\$2" -mindepth 1 | while IFS= read -r p; do
+  /usr/bin/xattr -w com.example.synthetic "x" "\$p"
+  /usr/bin/xattr -w com.apple.quarantine "0081;00000000;synthetic;" "\$p"
+  [[ -f "\$p" ]] && /usr/bin/xattr -wx com.apple.ResourceFork "00 01 02 03" "\$p"
+done
+# Proof the staged members carried the metadata (outside the work dir).
+/usr/bin/xattr "\$2/repos/alpha/gitleaksignore" >"$T/stage.tagged"
+HOOK
+  chmod +x "$T/hook"
+  HOOK="$T/hook" run_audit --export-store "$DEST" --plain
+  assert_success
+  # The staged members really carried the metadata.
+  grep -qx com.apple.quarantine "$T/stage.tagged"
+  grep -qx com.apple.ResourceFork "$T/stage.tagged"
+  grep -qx com.example.synthetic "$T/stage.tagged"
+  local a
+  a="$(published)"
+  # Exactly the store members, in archive order, read from the RAW headers
+  # (tar -t hides ._ AppleDouble members and folds PaxHeader records): only
+  # ustar regular files (0) and directories (5), no ._*, no PaxHeader.
+  cat >"$T/rawlist.pl" <<'PL'
+local $/;
+my $d = <STDIN>;
+for (my $p = 0; $p + 512 <= length $d;) {
+  my $h = substr($d, $p, 512);
+  last if $h eq "\0" x 512;
+  my $s = oct(substr($h, 124, 11));
+  printf "%s %s\n", substr($h, 156, 1), unpack("Z100", $h);
+  $p += 512 + $s + ((512 - $s % 512) % 512);
+}
+PL
+  run bash -c '/usr/bin/gzip -dc "$1" | /usr/bin/perl "$2"' _ "$a" "$T/rawlist.pl"
+  assert_success
+  assert_output "$(printf '%s\n' "5 repos/" "5 repos/alpha/" "0 repos/alpha/gitleaks.toml" "0 repos/alpha/gitleaksignore" \
+    "5 repos/empty-dir/" "5 repos/team x/" "5 repos/team x/beta/" "0 repos/team x/beta/gitleaksignore" \
+    "0 protected" "0 config" "0 MANIFEST")"
+  run_audit --import-store "$a"
+  assert_success
+}

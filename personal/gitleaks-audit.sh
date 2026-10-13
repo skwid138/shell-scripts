@@ -2212,12 +2212,33 @@ do_prune_delivered() {
       prune_fail "prune-delivered: $tmp already exists (not this run's); nothing changed"
       return
     fi
-    if ! (set -C && cat "$WORK/pending.keep" >"$tmp") 2>/dev/null; then
-      [[ -e "$tmp" ]] && PRUNE_TMP="$tmp"
+    # Create it in THIS shell (noclobber: an O_EXCL open, no subshell) and
+    # record ownership in the same step. Until both are done TERM/INT only
+    # set a flag (a deferred trap runs between the two statements without
+    # exiting), so cleanup can never miss a file this run created; a file
+    # that already exists makes the exclusive create fail and is never
+    # recorded, so it is never removed.
+    local created=0 sig=""
+    trap 'sig=143' TERM
+    trap 'sig=130' INT
+    set -C
+    if { : >"$tmp"; } 2>/dev/null; then
+      created=1
+      PRUNE_TMP="$tmp"
+    fi
+    set +C
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [[ -n "$sig" ]] && exit "$sig"
+    if [[ $created -ne 1 ]]; then
+      prune_fail "prune-delivered: cannot create $tmp (exists, or the state dir is not writable); nothing changed"
+      return
+    fi
+    test_hook prune-writing "$tmp"
+    if ! cat "$WORK/pending.keep" >>"$tmp" 2>/dev/null; then
       prune_fail "prune-delivered: cannot write $tmp; nothing changed"
       return
     fi
-    PRUNE_TMP="$tmp"
     if ! chmod 600 "$tmp" 2>/dev/null; then
       prune_fail "prune-delivered: cannot chmod $tmp; nothing changed"
       return
@@ -2935,7 +2956,14 @@ do_export_store() {
     store_fail "the store changed while it was being exported; nothing exported (retry)"
     return
   fi
-  # 6. ustar + gzip, explicit member order, no extended metadata.
+  test_hook stage-built "$stage"
+  # 6. ustar + gzip, explicit member order, no extended metadata. The ustar
+  # format is what keeps xattrs, quarantine, resource forks, and ACLs out:
+  # bsdtar writes no ._ AppleDouble members and no PaxHeader records in
+  # ustar even when asked to (--mac-metadata/--xattrs), while the default
+  # (pax) format adds both. The --no-* flags and COPYFILE_DISABLE are belt
+  # and braces. (Proven by the store-backup test that tags every staged
+  # member and inspects the raw headers.)
   if ! (cd "$stage" && COPYFILE_DISABLE=1 /usr/bin/tar --format ustar --no-mac-metadata --no-xattrs \
     --no-acls --no-fflags -c -z -n -f "$WORK/store.tar.gz" "${members[@]}") 2>"$WORK/tar.err"; then
     store_fail "tar failed: $(head -n1 "$WORK/tar.err"); nothing exported"
