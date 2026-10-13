@@ -7,6 +7,8 @@ side effects unless an explicit off-by-default mutation flag is passed. The
 documented exception is `pi-ssh.sh`: it is a transparent SSH passthrough whose
 stdout/exit status belong to `ssh` or the remote command, and allow-listed use
 permits unprompted arbitrary Pi command execution, including remote `sudo`.
+`launchd-shutdown-check.sh` is also not part of the JSON contract: it is an
+opt-in manual exercise with a human-readable PASS/FAIL report.
 
 For the rules every script in this directory follows, see
 [`../docs/CONVENTIONS.md`](../docs/CONVENTIONS.md). For exit-code semantics,
@@ -24,6 +26,7 @@ follow [`../docs/ADDING-A-SCRIPT.md`](../docs/ADDING-A-SCRIPT.md).
 | [`gh-pr-checks-summary.sh`](gh-pr-checks-summary.sh) | Fetch GitHub PR check runs and roll them up to a single status (`passed`/`failed`/`running`/`not_found`). Filterable by check-name regex. | `sonarcloud`, `ticket-plan`, `pr-review` skills; consumed internally by `sonar-pr-issues.sh`. |
 | [`gh-pr-comments.sh`](gh-pr-comments.sh) | Fetch all review comments, threads, reviews, and review metadata for a PR via gh's GraphQL API. Handles large diff hunks via `--rawfile`. | `gh-fetch-pr-comments` skill |
 | [`jira-fetch-ticket.sh`](jira-fetch-ticket.sh) | Fetch a Jira ticket (description, AC, comments, links, attachments) via `acli`. Multiple output modes: full / summary / fields-only. | `jira-ticket`, `jira-enhance`, `ticket-plan` skills |
+| [`launchd-shutdown-check.sh`](launchd-shutdown-check.sh) | Opt-in manual exercise: run a throwaway copy of the gitleaks-audit or cache-prune LaunchAgent against stubs, stop it with `launchctl bootout` and `launchctl kill TERM`, and check nothing survives or half-publishes. Exact-service targets only; `--run` required. | Run by hand (see the top-level README) |
 | [`opencode-deps-check.sh`](opencode-deps-check.sh) | Audit `~/.config/opencode/opencode.json` for outdated or unpinned MCP-server / plugin / agent dependencies. | `update-opencode-deps` command |
 | [`pi-ssh.sh`](pi-ssh.sh) | Pi-only scoped SSH wrapper for agent use. Convenience/scoping exception: transparent SSH passthrough and unprompted arbitrary remote Pi execution when allow-listed. | Any Pi SSH operation; use instead of raw `ssh` |
 | [`scripts-doctor.sh`](scripts-doctor.sh) | Health-check this repo (and the private wpro-shell mirror) against project conventions: required tooling, CI workflow, per-script `--help` / strict-mode / lib-source / bats coverage. Text and JSON output. | `scripts-doctor` slash command |
