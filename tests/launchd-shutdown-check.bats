@@ -66,9 +66,34 @@ if [[ -f "$SIM/no_marker" ]]; then
   exit 0
 fi
 sleep 0.4
-case "$(get ProgramArguments.2)" in
+arg="$(get ProgramArguments.2)"
+hang=0
+[[ -e "$SHUTDOWN_FIXTURE/hang" ]] && hang=1
+if [[ $hang -eq 1 ]]; then
+  if [[ -f "$SIM/lock_owner" ]]; then
+    case "$arg" in --run) lk=gitleaks-audit.lock ;; *) lk=cache-prune.lock ;; esac
+    mkdir -p "$HOME/Library/Caches/$lk"
+    echo "pid=$(cat "$SIM/lock_owner")" >"$HOME/Library/Caches/$lk/owner"
+  fi
+  if [[ -f "$SIM/snapshot_advance" ]]; then
+    sd="$HOME/Library/Application Support/gitleaks-audit/repos/$(printf '%s' shutdowntest-repo | shasum -a 256 | cut -c1-16)"
+    mkdir -p "$sd"
+    echo "advanced $RANDOM" >"$sd/snapshot"
+  fi
+  # A watchdog-like process in the job's group, outside the step's group.
+  if [[ -f "$SIM/job_survivor" ]]; then
+    (trap "" TERM; exec "$stubs/shutdowntest-sleep" 600) </dev/null >/dev/null 2>&1 &
+  fi
+fi
+case "$arg" in
   --run)
-    "$stubs/gitleaks" git --report-path="$HOME/report.json" .
+    # Like the audit's run_group: the step gets its own process group.
+    /usr/bin/perl -e 'setpgrp(0, 0) or die; exec @ARGV or die' \
+      "$stubs/gitleaks" git --report-path="$HOME/report.json" . &
+    sp=$!
+    echo "$sp" >"$SIM/step"
+    echo "$sp" >"$SIM/pgid.$sp"
+    wait "$sp"
     rc=$?
     ;;
   --apply)
@@ -89,14 +114,26 @@ EOF
 #!/bin/bash
 printf 'launchctl %s\n' "$*" >>"$CALLS"
 stop_job() {
-  local pg
+  local pg sp=""
   [[ -f "$SIM/running" ]] || return 0
   pg="$(cat "$SIM/running")"
+  [[ -f "$SIM/step" ]] && sp="$(cat "$SIM/step")"
+  # A slow stop: the request itself takes 2s, and the step's group only
+  # empties 2s after that.
+  [[ -f "$SIM/slow_stop" ]] && sleep 2
   kill -TERM -- "-$pg" 2>/dev/null
+  [[ -n "$sp" ]] && kill -TERM -- "-$sp" 2>/dev/null
   sleep 0.3
-  [[ -f "$SIM/survive" ]] || kill -KILL -- "-$pg" 2>/dev/null
+  if [[ ! -f "$SIM/survive" && -n "$sp" ]]; then
+    if [[ -f "$SIM/slow_stop" ]]; then
+      (sleep 2; kill -KILL -- "-$sp") </dev/null >/dev/null 2>&1 &
+    else
+      kill -KILL -- "-$sp" 2>/dev/null
+    fi
+  fi
+  [[ -f "$SIM/survive" || -f "$SIM/job_survivor" ]] || kill -KILL -- "-$pg" 2>/dev/null
   echo 143 >"$SIM/last_exit"
-  rm -f "$SIM/running"
+  rm -f "$SIM/running" "$SIM/step"
 }
 sub="${1-}"
 shift
@@ -122,6 +159,7 @@ case "$sub" in
         [[ -f "$SIM/running" ]] && state=running
         echo "${1} = {"
         echo "	state = $state"
+        [[ -f "$SIM/running" ]] && echo "	pid = $(cat "$SIM/running")"
         echo "	last exit code = $(cat "$SIM/last_exit" 2>/dev/null || echo '(never exited)')"
         echo "}"
         exit 0
@@ -162,6 +200,14 @@ EOF
   cat >"$STUBS/ps" <<'EOF'
 #!/bin/bash
 printf 'ps %s\n' "$*" >>"$CALLS"
+if [[ -f "$SIM/ps_error_axo" && "$*" == *-axo* ]]; then
+  echo "ps: simulated failure" >&2
+  exit 1
+fi
+if [[ -f "$SIM/ps_error_pid" && "$*" == *"-p $(cat "$SIM/ps_error_pid")"* ]]; then
+  echo "ps: simulated failure" >&2
+  exit 1
+fi
 exec /bin/ps "$@"
 EOF
   chmod +x "$STUBS/simjob" "$STUBS/launchctl" "$STUBS/ps"
@@ -423,4 +469,60 @@ assert_exact_targets() {
   done <<<"$output"
   run grep -nE 'bootout +"?\$DOMAIN"?( |$)|bootout +gui/[^/]*$' "$SCRIPT"
   assert_failure
+}
+
+# --- observation errors and the remaining oracles ----------------------------
+
+@test "launchd-shutdown-check: a ps failure while listing process groups is a FAIL, never an empty group" {
+  touch "$SIM/ps_error_axo"
+  run_check -- --target gitleaks-audit --run
+  assert_failure 1
+  assert_output --regexp "FAIL: no surviving processes in (job|step) process group [0-9]+ .*cannot observe"
+  refute_output --partial "PASS: no surviving processes"
+  refute_output --partial "result: PASS"
+}
+
+@test "launchd-shutdown-check: a ps failure while checking the lock owner is a FAIL, never reclaimable" {
+  sleep 300 &
+  local holder=$!
+  echo "$holder" >"$SIM/lock_owner"
+  echo "$holder" >"$SIM/ps_error_pid"
+  run_check -- --target cache-prune --run
+  kill "$holder" 2>/dev/null
+  assert_failure 1
+  assert_output --regexp "FAIL: lock released or reclaimable after bootout: .*cannot observe"
+}
+
+@test "launchd-shutdown-check: a lock left with a live owner fails the lock check" {
+  sleep 300 &
+  local holder=$!
+  echo "$holder" >"$SIM/lock_owner"
+  run_check -- --target gitleaks-audit --run
+  kill "$holder" 2>/dev/null
+  assert_failure 1
+  assert_output --partial "FAIL: lock released or reclaimable after bootout"
+}
+
+@test "launchd-shutdown-check: an advanced repo snapshot fails the publication check" {
+  touch "$SIM/snapshot_advance"
+  run_check -- --target gitleaks-audit --run
+  assert_failure 1
+  assert_output --partial "FAIL: repo snapshot not advanced (or publication unsettled) after bootout"
+}
+
+@test "launchd-shutdown-check: a watchdog-like survivor in the job's group (outside the step's group) fails" {
+  touch "$SIM/job_survivor"
+  run_check -- --target gitleaks-audit --run
+  assert_failure 1
+  assert_output --partial "PASS: no surviving processes in step process group"
+  assert_output --regexp "FAIL: no surviving processes in job process group [0-9]+ "
+  run pgrep -f "$TMPD/launchd-shutdown-check"
+  assert_failure
+}
+
+@test "launchd-shutdown-check: the stop deadline counts from the request (a slow synchronous bootout uses it up)" {
+  touch "$SIM/slow_stop"
+  run_check -- --target gitleaks-audit --run
+  assert_failure 1
+  assert_output --regexp "FAIL: no surviving processes in step process group [0-9]+ within 3s of the bootout request"
 }

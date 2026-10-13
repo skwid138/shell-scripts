@@ -45,8 +45,10 @@ cache-prune) writes a per-attempt marker (pid, pgid, attempt), spawns a
 descendant (TERM-ignoring for the audit), and sleeps past the observation
 window. For each target:
   stop (a)  launchctl bootout gui/<uid>/<label> while the step runs: no
-            process may survive in the step's process group within the stop
-            timeout (audit: ExitTimeOut 30 + 5s), the lock must be released
+            process may survive in the step's process group, nor in the
+            job's own process group (the script and, for the audit, its
+            watchdog), within the stop timeout counted from the stop
+            request (audit: ExitTimeOut 30 + 5s), the lock must be released
             or reclaimable, and nothing may be published (audit: the repo
             snapshot not advanced, or the publication unsettled; cache-prune:
             no "finished OK" for that attempt). Re-bootstrap; the next run
@@ -54,7 +56,9 @@ window. For each target:
   stop (b)  launchctl kill TERM gui/<uid>/<label>: a signal only, the
             service stays registered; the same checks, then the next run
             (kickstart) must exit 0.
-A readiness timeout (no marker) is a failure. Every check runs and is
+A readiness timeout (no marker) is a failure, and so is any failure to
+observe processes (ps erroring is never read as "nothing left" or "owner
+gone"). Every check runs and is
 reported BEFORE any rescue cleanup; the EXIT trap then boots out the
 throwaway job (exact service) if it is still loaded, kills only processes
 of this run (argv inside its temp dir), and removes only its temp dir.
@@ -225,10 +229,41 @@ xml() {
   printf '%s' "$v"
 }
 
-alive() { "$PS" -o pid= -p "$1" >/dev/null 2>&1; }
+# alive <pid>: 0 alive, 1 gone, 2 could not observe (PS_ERR set). ps exits
+# 1 with no output and no message for a valid pid that does not exist; any
+# other outcome is an observation failure, never "gone".
+PS_ERR=""
+alive() {
+  local out err rc
+  out="$("$PS" -o pid= -p "$1" 2>"$ROOT/ps.err")"
+  rc=$?
+  err="$(head -c 200 "$ROOT/ps.err" 2>/dev/null)"
+  if [[ $rc -eq 0 && "$(printf '%s' "$out" | tr -d ' ')" == "$1" ]]; then
+    return 0
+  fi
+  if [[ $rc -eq 1 && -z "$out" && -z "$err" ]]; then
+    return 1
+  fi
+  PS_ERR="cannot observe pid $1 (ps exit $rc${err:+: $err})"
+  return 2
+}
 
-# pgid_members <pgid>: pids currently in that process group.
-pgid_members() { "$PS" -axo pid=,pgid= 2>/dev/null | awk -v g="$1" '$2 == g { printf "%s ", $1 }'; }
+# pgid_members <pgid>: pids currently in that process group; returns 2 (and
+# prints the reason) when ps fails or lists nothing (it always lists at
+# least launchd and itself), so a failed observation never reads as empty.
+pgid_members() {
+  local out rc
+  out="$("$PS" -axo pid=,pgid= 2>"$ROOT/ps.err")"
+  rc=$?
+  if [[ $rc -ne 0 || -z "$out" ]]; then
+    printf 'cannot observe processes (ps exit %s%s)' "$rc" "$(head -c 200 "$ROOT/ps.err" 2>/dev/null | sed 's/^/: /')"
+    return 2
+  fi
+  awk -v g="$1" '$2 == g { printf "%s ", $1 }' <<<"$out"
+}
+
+# now_ms: wall clock in milliseconds (stop deadlines count from the request).
+now_ms() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time() * 1000'; }
 
 # resolve <PATH> <tool>: what a job with that PATH runs for <tool>.
 resolve() { env -i PATH="$1" /bin/bash -c 'command -v -- "$1"' _ "$2" 2>/dev/null; }
@@ -463,35 +498,73 @@ wait_ready() {
 }
 
 stub_alive() {
-  DETAIL="pid $M_PID is gone"
+  local rc
   alive "$M_PID"
+  rc=$?
+  [[ $rc -eq 2 ]] && DETAIL="$PS_ERR" || DETAIL="pid $M_PID is gone"
+  [[ $rc -eq 0 ]]
 }
 child_alive() {
+  local rc
   DETAIL="descendant '${M_CHILD}' is gone"
-  [[ "$M_CHILD" =~ ^[0-9]+$ ]] && alive "$M_CHILD"
+  [[ "$M_CHILD" =~ ^[0-9]+$ ]] || return 1
+  alive "$M_CHILD"
+  rc=$?
+  [[ $rc -eq 2 ]] && DETAIL="$PS_ERR"
+  [[ $rc -eq 0 ]]
 }
 
-# group_empties <pgid>: true once no process is left in it (within STOP_TIMEOUT).
+# job_identity: the launchd job's own pid and process group (the audit's
+# watchdog and the script itself live there, outside the step's group).
+JOB_PID=""
+JOB_PGID=""
+job_identity() {
+  local out
+  out="$("$LAUNCHCTL" print "$SERVICE" 2>/dev/null)"
+  JOB_PID="$(sed -n 's/^[[:space:]]*pid = //p' <<<"$out" | head -n1)"
+  DETAIL="launchctl print shows no running pid"
+  [[ "$JOB_PID" =~ ^[1-9][0-9]*$ ]] || return 1
+  JOB_PGID="$("$PS" -o pgid= -p "$JOB_PID" 2>/dev/null | tr -d ' ')"
+  DETAIL="cannot observe the process group of job pid $JOB_PID"
+  [[ "$JOB_PGID" =~ ^[0-9]+$ && "$JOB_PGID" -gt 1 && "$JOB_PGID" != "$(/bin/ps -o pgid= -p $$ | tr -d ' ')" ]] || return 1
+  PGIDS="$PGIDS $JOB_PGID"
+}
+
+# group_empties <pgid>: true once no process is left in it, within
+# STOP_TIMEOUT seconds of the stop REQUEST (STOP_START_MS, taken before the
+# synchronous launchctl call). A failed observation is a failure.
+STOP_START_MS=0
 group_empties() {
-  local pg="$1" i=0 limit=$((STOP_TIMEOUT * 10)) left
+  local pg="$1" left rc
   while :; do
     left="$(pgid_members "$pg")"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+      DETAIL="$left"
+      return 1
+    fi
     [[ -z "$left" ]] && return 0
-    if [[ $i -ge $limit ]]; then
+    if [[ $(($(now_ms) - STOP_START_MS)) -ge $((STOP_TIMEOUT * 1000)) ]]; then
       DETAIL="still alive: $left"
       return 1
     fi
     sleep 0.1
-    i=$((i + 1))
   done
 }
 
 lock_released() {
-  local pid=""
+  local pid="" rc
   [[ -e "$LOCK_PATH" || -L "$LOCK_PATH" ]] || return 0
   pid="$(sed -n 's/^pid=//p' "$LOCK_PATH/owner" 2>/dev/null)"
   DETAIL="$LOCK_PATH is still held (owner pid '${pid}')"
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] && ! alive "$pid"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  alive "$pid"
+  rc=$?
+  if [[ $rc -eq 2 ]]; then
+    DETAIL="$PS_ERR"
+    return 1
+  fi
+  [[ $rc -eq 1 ]]
 }
 
 snapshot_not_advanced() {
@@ -513,7 +586,10 @@ log_has_finished_ok() {
 still_registered() { "$LAUNCHCTL" print "$SERVICE" >/dev/null 2>&1; }
 
 after_stop_checks() { # <n> <how>
-  check "no surviving processes in process group $M_PGID within ${STOP_TIMEOUT}s after $2" group_empties "$M_PGID"
+  check "no surviving processes in step process group $M_PGID within ${STOP_TIMEOUT}s of the $2 request" group_empties "$M_PGID"
+  if [[ "$JOB_PGID" != "$M_PGID" ]]; then
+    check "no surviving processes in job process group $JOB_PGID within ${STOP_TIMEOUT}s of the $2 request" group_empties "$JOB_PGID"
+  fi
   check "lock released or reclaimable after $2" lock_released
   if [[ "$TARGET" == gitleaks-audit ]]; then
     check "repo snapshot not advanced (or publication unsettled) after $2" snapshot_not_advanced
@@ -613,7 +689,9 @@ start_attempt 1 hang
 wait_ready 1
 check "attempt 1 stub is alive before the stop" stub_alive
 check "attempt 1 descendant is alive before the stop" child_alive
+check "attempt 1 job pid and process group observed" job_identity
 gate
+STOP_START_MS="$(now_ms)"
 if "$LAUNCHCTL" bootout "$SERVICE" >/dev/null 2>&1; then
   BOOTSTRAPPED=0
   pass "launchctl bootout $SERVICE"
@@ -631,7 +709,9 @@ start_attempt 3 hang
 wait_ready 3
 check "attempt 3 stub is alive before the stop" stub_alive
 check "attempt 3 descendant is alive before the stop" child_alive
+check "attempt 3 job pid and process group observed" job_identity
 gate
+STOP_START_MS="$(now_ms)"
 if "$LAUNCHCTL" kill TERM "$SERVICE" >/dev/null 2>&1; then
   pass "launchctl kill TERM $SERVICE"
 else

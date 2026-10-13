@@ -422,8 +422,10 @@ production-like plist, after checking each tool's resolution explicitly.
 A stubbed step (`gitleaks git` / `uv cache prune`) marks itself, spawns a
 descendant, and hangs; the exercise stops it with `launchctl bootout` and
 with `launchctl kill TERM` (always the exact service `gui/<uid>/<label>`),
-then checks that the process group empties, the lock is released or
-reclaimable, nothing is published, and the next run exits 0. All checks
+then checks that the step's and the job's process groups empty within the
+stop timeout counted from the stop request, the lock is released or
+reclaimable, nothing is published, and the next run exits 0. A `ps` that
+fails is a failed check, never "nothing left". All checks
 are reported before the cleanup trap, which only touches this run's job,
 processes, and temp dir. The real agents are only read with `launchctl
 print` (before and after; they must match).
