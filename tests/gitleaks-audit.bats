@@ -2793,3 +2793,284 @@ HOOK
   grep -qx "$(fp 3)" "$da/known"
   [[ ! -e "$STATE/pending-announce" ]]
 }
+
+# --- delivered pending entries: --report listing and --prune-delivered -------
+
+# mixed_pending: a pending file with every row form, in a fixed order:
+# legacy count, undelivered new + baselined, and both delivered kinds (one
+# delivered fingerprint is already in alpha's known).
+mixed_pending() {
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
+  {
+    printf 'new\t3\tlegacy repo\n'
+    printf 'baselined\tbeta\t%s\n' "$(fp 21)"
+    printf 'baselined.delivered\talpha\t%s\n' "$(fp 1)"
+    printf 'new\tbeta\t%s\n' "$(fp 22)"
+    printf 'new.delivered\tgamma/sub\t%s\n' "$(fp 31 c)"
+    printf 'baselined.delivered\tgamma/sub\t%s\n' "$(fp 32 c)"
+  } >"$(PENDING)"
+  chmod 600 "$(PENDING)"
+}
+
+# retained_rows: the rows --prune-delivered must keep, in their original order.
+retained_rows() {
+  printf 'new\t3\tlegacy repo\n'
+  printf 'baselined\tbeta\t%s\n' "$(fp 21)"
+  printf 'new\tbeta\t%s\n' "$(fp 22)"
+}
+
+@test "gitleaks-audit: --help documents --prune-delivered and its --dry-run" {
+  run_audit --help
+  assert_success
+  assert_output --partial "--prune-delivered"
+  assert_output --partial "--prune-delivered --dry-run"
+}
+
+@test "gitleaks-audit: --dry-run without --prune-delivered is a usage error" {
+  run_audit --dry-run
+  assert_failure 2
+  run_audit --run --dry-run
+  assert_failure 2
+}
+
+@test "gitleaks-audit: --report lists delivered pending entries (rel, rule, file:line) with counts, marking those already in known" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  mixed_pending
+  run_audit --report
+  assert_success
+  assert_output --partial "Delivered pending announcements: 3 (new 1, baselined 2; 1 already in known)"
+  assert_line --regexp "^  alpha  rule-a  src/f1\.txt:1 \(00000000\) baselined \[already in known: dropped by the next --run\]$"
+  assert_line --regexp "^  gamma/sub  rule-c  src/f31\.txt:31 \(00000000\) new$"
+  assert_line --regexp "^  gamma/sub  rule-c  src/f32\.txt:32 \(00000000\) baselined$"
+  assert_output --partial "--prune-delivered"
+  # Undelivered rows are not listed as delivered.
+  refute_output --partial "src/f21.txt:21"
+  refute_output --partial "src/f22.txt:22"
+  # --report never writes.
+  run diff <(retained_rows) <(grep -v delivered "$(PENDING)")
+  assert_success
+}
+
+@test "gitleaks-audit: --prune-delivered with no, empty, or delivered-only pending file exits 0 (no notification)" {
+  mkrepo alpha
+  run_audit --prune-delivered
+  assert_success
+  assert_output --partial "nothing to prune"
+  [[ ! -e "$(PENDING)" ]]
+  mkdir -p "$STATE"
+  : >"$(PENDING)"
+  run_audit --prune-delivered
+  assert_success
+  assert_output --partial "nothing to prune"
+  printf 'new.delivered\talpha\t%s\nbaselined.delivered\tbeta\t%s\n' "$(fp 1)" "$(fp 2)" >"$(PENDING)"
+  run_audit --prune-delivered
+  assert_success
+  assert_output --partial "removed 2 delivered entries (new 1, baselined 1); kept 0"
+  [[ ! -e "$(PENDING)" ]]
+  run notifies
+  assert_output ""
+  [[ ! -e "$(LOCKD)" ]]
+  grep -q 'prune-delivered' "$LOGF"
+}
+
+@test "gitleaks-audit: --prune-delivered removes both delivered kinds regardless of known; retained rows are unchanged, mode 600, and still delivered by a later --run" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  mixed_pending
+  : >"$CALLS"
+  run_audit --prune-delivered
+  assert_success
+  assert_output --partial "removed 3 delivered entries (new 1, baselined 2); kept 3"
+  run cat "$(PENDING)"
+  assert_output "$(retained_rows)"
+  [[ "$(/usr/bin/stat -f %Lp "$(PENDING)")" == "600" ]]
+  run notifies
+  assert_output ""
+  # A later run announces exactly the retained rows: 3 legacy + 1 new in 2
+  # repos, 1 baselined in 1 repo.
+  run_audit --run
+  assert_success
+  run notifies
+  assert_output --partial "4 NEW finding(s) in 2 repo(s)"
+  assert_output --partial "1 existing findings in 1 repos baselined"
+}
+
+@test "gitleaks-audit: --prune-delivered --dry-run previews and writes nothing (no lock, log, state, or notification)" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  mixed_pending
+  local before h
+  before="$(state_listing)"
+  h="$(shasum "$(PENDING)")"
+  rm -f "$LOGF"
+  : >"$CALLS"
+  local hook="$T/hook-any"
+  printf '#!/bin/bash\necho "$1" >>"%s"\n' "$T/hook.log" >"$hook"
+  chmod +x "$hook"
+  GITLEAKS_AUDIT_TEST_HOOK="$hook" run_audit_env --prune-delivered --dry-run
+  assert_success
+  assert_output --partial "would remove 3 delivered entries (new 1, baselined 2; 1 already in known); keep 3"
+  assert_output --partial "gamma/sub  rule-c  src/f31.txt:31"
+  [[ "$h" == "$(shasum "$(PENDING)")" ]]
+  [[ "$before" == "$(state_listing)" ]]
+  [[ ! -e "$LOGF" ]]
+  [[ ! -e "$(LOCKD)" ]]
+  [[ ! -e "$T/hook.log" ]]
+  run notifies
+  assert_output ""
+}
+
+@test "gitleaks-audit: --prune-delivered while another run holds the lock exits 75 and changes nothing" {
+  mixed_pending
+  local h
+  h="$(shasum "$(PENDING)")"
+  sleep 60 &
+  local holder=$!
+  mkdir -p "$(LOCKD)"
+  printf 'pid=%s\nhost=h\nstarted=%s\n' "$holder" "$(($(/bin/date -u +%s) - 2 * 86400))" >"$(LOCKD)/owner"
+  run_audit --prune-delivered
+  kill "$holder" 2>/dev/null
+  assert_failure 75
+  [[ "$h" == "$(shasum "$(PENDING)")" ]]
+  # Not even the long-held-lock note: prune never notifies.
+  run notifies
+  assert_output ""
+}
+
+@test "gitleaks-audit: --prune-delivered failures exit 1 (never 10), keep the pending file byte-identical, never notify" {
+  mkrepo alpha
+  mixed_pending
+  cp -p "$(PENDING)" "$T/pending.orig"
+  same() { cmp -s "$(PENDING)" "$T/pending.orig" && [[ "$(/usr/bin/stat -f %Lp "$(PENDING)")" == 600 ]]; }
+
+  # Obstructed publication: the temp path is a directory.
+  mkdir "$(PENDING).tmp"
+  run_audit --prune-delivered
+  assert_failure 1
+  assert_output --partial "ERROR: prune-delivered:"
+  same
+  rmdir "$(PENDING).tmp"
+
+  # Rename failure.
+  cat >"$STUBS/mv" <<'STUB'
+#!/bin/bash
+case "${@: -1}" in */pending-announce) exit 1 ;; esac
+exec /bin/mv "$@"
+STUB
+  chmod +x "$STUBS/mv"
+  run_audit --prune-delivered
+  assert_failure 1
+  same
+  rm "$STUBS/mv"
+
+  # chmod failure on the new file.
+  cat >"$STUBS/chmod" <<'STUB'
+#!/bin/bash
+case "${@: -1}" in */pending-announce.tmp) exit 1 ;; esac
+exec /bin/chmod "$@"
+STUB
+  chmod +x "$STUBS/chmod"
+  run_audit --prune-delivered
+  assert_failure 1
+  same
+  rm "$STUBS/chmod"
+  [[ ! -e "$(PENDING).tmp" ]]
+
+  # Read failure.
+  chmod 000 "$(PENDING)"
+  run_audit --prune-delivered
+  chmod 600 "$(PENDING)"
+  assert_failure 1
+  same
+
+  # Log failure (log file unwritable): nothing is touched.
+  mkdir -p "$(dirname "$LOGF")"
+  : >"$LOGF"
+  chmod 000 "$LOGF"
+  run_audit --prune-delivered
+  chmod 600 "$LOGF"
+  assert_failure 1
+  same
+
+  # Lock infrastructure error: exit 1, no notification.
+  mkdir -p "$FAKE_HOME/Library/Caches"
+  : >"$(LOCKD)"
+  run_audit --prune-delivered
+  rm -f "$(LOCKD)"
+  assert_failure 1
+  assert_output --partial "ERROR: lock: cannot create $(LOCKD)"
+  same
+
+  run notifies
+  assert_output ""
+  # And with the obstacles gone it works.
+  run_audit --prune-delivered
+  assert_success
+}
+
+@test "gitleaks-audit: retained entries are not re-announced by a forced scan after --prune-delivered" {
+  mkrepo alpha
+  findings_only alpha 1 2
+  echo 1 >"$FIX/osascript_rc"
+  run_audit --run
+  assert_success
+  # Undelivered baseline of alpha, plus a delivered entry of another repo.
+  printf 'new.delivered\tgone\t%s\n' "$(fp 9)" >>"$(PENDING)"
+  rm "$FIX/osascript_rc"
+  run_audit --prune-delivered
+  assert_success
+  assert_output --partial "removed 1 delivered entries (new 1, baselined 0); kept 2"
+  : >"$CALLS"
+  run_audit --full
+  assert_success
+  run notifies
+  assert_output --partial "2 existing findings in 1 repos baselined"
+  refute_output --partial "NEW"
+  : >"$CALLS"
+  run_audit --full
+  assert_success
+  run notifies
+  assert_output ""
+}
+
+@test "gitleaks-audit: a pruned delivered fingerprint that reappears is NEW when the repo's known exists" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  [[ -f "$(state_dir alpha)/known" ]]
+  printf 'new.delivered\talpha\t%s\n' "$(fp 2)" >"$(PENDING)"
+  run_audit --prune-delivered
+  assert_success
+  commit_in alpha
+  findings_only alpha 1 2
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 10
+  run notifies
+  assert_output --partial "1 NEW finding(s) in 1 repo(s)"
+}
+
+@test "gitleaks-audit: a pruned delivered fingerprint that reappears is baselined when the repo has no known file" {
+  mkrepo alpha
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
+  printf 'baselined.delivered\talpha\t%s\n' "$(fp 1)" >"$(PENDING)"
+  run_audit --prune-delivered
+  assert_success
+  [[ ! -e "$(PENDING)" ]]
+  findings_only alpha 1
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  run notifies
+  assert_output --partial "1 existing findings in 1 repos baselined"
+  refute_output --partial "NEW"
+}

@@ -22,6 +22,7 @@ source "$SCRIPT_DIR/../lib/common.sh"
 usage() {
   cat <<'EOF'
 Usage: gitleaks-audit [--run | --full | --report | --install | --uninstall | --status] [--no-notify]
+       gitleaks-audit --prune-delivered [--dry-run]
 
 Daily gitleaks history audit of git repositories under ~/code.
 
@@ -39,8 +40,26 @@ Modes:
                 Also lists every repo with a private store (even with 0
                 findings; "stale" when the store changed since its last
                 scan, "unsettled" when findings, provenance and snapshot
-                disagree), repos with a repo .gitleaksignore, and every
-                protected entry (present / MISSING).
+                disagree), repos with a repo .gitleaksignore, every
+                protected entry (present / MISSING), and the delivered
+                pending announcements (repo, rule, file:line, with counts;
+                those whose fingerprint is already in known are marked:
+                the next --run drops them).
+  --prune-delivered
+                Remove every delivered pending announcement (new.delivered
+                and baselined.delivered rows, whether or not the
+                fingerprint is in known) under the audit lock. Undelivered
+                rows (including legacy count rows) are kept byte-for-byte
+                and are still announced by the next --run. Never notifies
+                and never settles or rewrites anything else. Afterwards a
+                pruned fingerprint that reappears is NEW if its repo has a
+                known file, or baselined if it has none. Exit 0 (also when
+                there is nothing to prune), 75 when another run holds the
+                lock, 1 on a read/write/chmod/rename/log/lock failure (the
+                pending file is left byte-identical).
+  --prune-delivered --dry-run
+                Preview what --prune-delivered would remove: no lock, log,
+                state, settlement, or notification writes.
   --install     Render the launchd template into
                 ~/Library/LaunchAgents/com.skwid138.gitleaks-audit.plist and
                 bootstrap it (runs --run daily at 11:00; not started now).
@@ -51,6 +70,7 @@ Modes:
 
 Options:
   --no-notify   With --run/--full, skip the macOS notification.
+  --dry-run     Only with --prune-delivered (see above).
 
 What a scan runs (cwd = the repo; GITLEAKS_CONFIG/GITLEAKS_CONFIG_TOML unset,
 so the effective config is the repo's .gitleaks.toml/.gitleaksignore or the
@@ -147,7 +167,8 @@ reach known (its publication failed) stays, marked delivered, so it is
 neither announced again nor reported as NEW; it is dropped once that repo's
 known has it. If it never does (the finding disappeared or was suppressed
 before the repo recovered, or the repo was excluded or removed), it is kept
-indefinitely on purpose, so a later reappearance is not reported as NEW. Dry runs read state (pending
+indefinitely on purpose, so a later reappearance is not reported as NEW
+(--report lists them; --prune-delivered removes them). Dry runs read state (pending
 announcement counts, the last full scan time, repo snapshots) to show what
 --run would do, but never write, merge, or clear it, even when they fail.
 
@@ -197,13 +218,14 @@ EOF
 
 MODE="dry-run"
 NOTIFY=1
+PRUNE_DRY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
       usage
       exit 0
       ;;
-    --run | --full | --report | --install | --uninstall | --status)
+    --run | --full | --report | --install | --uninstall | --status | --prune-delivered)
       [[ "$MODE" == "dry-run" ]] || die_usage "only one mode may be given (see --help)"
       MODE="${1#--}"
       shift
@@ -212,9 +234,16 @@ while [[ $# -gt 0 ]]; do
       NOTIFY=0
       shift
       ;;
+    --dry-run)
+      PRUNE_DRY=1
+      shift
+      ;;
     *) die_usage "unknown argument: $1 (see --help)" ;;
   esac
 done
+if [[ "$PRUNE_DRY" -eq 1 && "$MODE" != "prune-delivered" ]]; then
+  die_usage "--dry-run is only valid with --prune-delivered (the default mode is already a dry run)"
+fi
 
 # --- environment -------------------------------------------------------------
 
@@ -1895,6 +1924,7 @@ do_report() {
     done <"$GLP_PROTECTED"
     echo
   fi
+  report_delivered && any=1
   if [[ "$any" -eq 0 ]]; then
     if [[ -d "$REPOS_DIR" ]]; then
       echo "no findings recorded in $STATE_DIR"
@@ -1920,6 +1950,162 @@ Rotation guidance:
   (<store> = ~/.config/gitleaks-audit/repos/<rel>; pass the flags only for
   files that exist)
 EOF
+}
+
+# delivered_rows <pending-file> <out>: the delivered rows of the pending file,
+# one per line: "<rel>\t<kind>\t<fp>\t<in-known 0|1>". Legacy count rows are
+# never delivered rows. The known sets are read per repo (as in
+# pending_settle). Returns 1 when a known file cannot be read.
+delivered_rows() {
+  local pf="$1" out="$2" rel k
+  printf '\001\t\001\n' >"$WORK/dknown"
+  awk -F'\t' '$1 == "new.delivered" || $1 == "baselined.delivered" { print $2 }' "$pf" 2>/dev/null |
+    LC_ALL=C sort -u >"$WORK/drels" || return 1
+  while IFS= read -r rel; do
+    k="$REPOS_DIR/$(repo_id "$rel")/known"
+    [[ -f "$k" ]] || continue
+    GLA_REL="$rel" awk '{ print ENVIRON["GLA_REL"] "\t" $0 }' "$k" >>"$WORK/dknown" 2>/dev/null || return 1
+  done <"$WORK/drels"
+  awk -F'\t' -v OFS='\t' '
+    FNR == NR { k[$1 "\t" $2] = 1; next }
+    $1 == "new.delivered" || $1 == "baselined.delivered" {
+      kind = $1
+      sub(/\.delivered$/, "", kind)
+      print $2, kind, $3, ((($2 "\t" $3) in k) ? 1 : 0)
+    }' "$WORK/dknown" "$pf" >"$out" 2>/dev/null
+}
+
+# delivered_summary <rows>: "<n> (new <a>, baselined <b>; <k> already in known)".
+# delivered_list <rows>: one line per delivered row
+# ("  <rel>  <rule>  <file>:<line> (<commit8>) <kind>[ note]"), sorted by
+# repo, rule, file, line.
+delivered_summary() {
+  awk -F'\t' '{ n++; if ($2 == "new") a++; else b++; if ($4 == 1) k++ }
+    END { printf "%d (new %d, baselined %d; %d already in known)", n, a, b, k }' "$1"
+}
+delivered_list() {
+  awk -F'\t' '{
+      fp = $3
+      m = split(fp, p, ":")
+      if (m < 4) { file = fp; rule = "?"; line = "?"; c = "?" }
+      else {
+        c = substr(p[1], 1, 8); line = p[m]; rule = p[m - 1]; file = p[2]
+        for (i = 3; i <= m - 2; i++) file = file ":" p[i]
+      }
+      note = ($4 == 1) ? " [already in known: dropped by the next --run]" : ""
+      printf "%s\t%s\t%s\t%012d\t  %s  %s  %s:%s (%s) %s%s\n", $1, rule, file, line + 0, $1, rule, file, line, c, $2, note
+    }' "$1" | LC_ALL=C sort -t$'\t' -k1,1 -k2,2 -k3,3 -k4,4 | cut -f5-
+}
+
+# report_delivered: the --report section for delivered pending entries.
+report_delivered() {
+  [[ -s "$PENDING_FILE" ]] || return 1
+  delivered_rows "$PENDING_FILE" "$WORK/delivered" || {
+    echo "Delivered pending announcements: cannot read $PENDING_FILE or a known file"
+    echo
+    return 0
+  }
+  [[ -s "$WORK/delivered" ]] || return 1
+  echo "Delivered pending announcements: $(delivered_summary "$WORK/delivered")"
+  echo "  (already notified; kept so a reappearance is not reported as NEW. Remove"
+  echo "   them with gitleaks-audit.sh --prune-delivered; preview with --dry-run)"
+  delivered_list "$WORK/delivered"
+  echo
+  return 0
+}
+
+# prune_fail <message>: the --prune-delivered error path. Logs (best effort),
+# removes only its own temp file, and exits 1. It never notifies, settles,
+# or touches the pending file.
+prune_fail() {
+  log "ERROR: $1"
+  rm -f "$PENDING_FILE.tmp" 2>/dev/null
+  EXIT_CODE=1
+}
+
+# do_prune_delivered: remove every delivered pending row (both kinds,
+# regardless of known), keeping every other row byte-for-byte in its
+# original order. --dry-run only reads. The real run holds the audit lock,
+# writes the log only before replacing the pending file, and replaces it
+# atomically (tmp + chmod 600 + rename; removed when nothing is kept).
+do_prune_delivered() {
+  local n_rm n_keep
+  make_work
+  if [[ "$PRUNE_DRY" -eq 0 ]]; then
+    open_log
+    if [[ "$LOG_OK" -ne 1 ]]; then
+      prune_fail "prune-delivered: cannot write the log $LOG_FILE; nothing changed"
+      return
+    fi
+    acquire_lock
+    case $? in
+      0) ;;
+      2)
+        prune_fail "$LOCK_ERR"
+        return
+        ;;
+      *)
+        EXIT_CODE=$LOCK_BUSY_EXIT
+        return
+        ;;
+    esac
+    log "gitleaks-audit prune-delivered starting (pid $$)"
+  fi
+  if [[ ! -e "$PENDING_FILE" && ! -L "$PENDING_FILE" ]]; then
+    log "prune-delivered: no pending announcements ($PENDING_FILE absent); nothing to prune"
+    [[ "$LOG_WRITE_FAILED" -eq 0 ]] || EXIT_CODE=1
+    return
+  fi
+  if ! cat "$PENDING_FILE" >"$WORK/pending.orig" 2>/dev/null; then
+    prune_fail "prune-delivered: cannot read $PENDING_FILE; nothing changed"
+    return
+  fi
+  if ! delivered_rows "$WORK/pending.orig" "$WORK/delivered" ||
+    ! awk -F'\t' '$1 != "new.delivered" && $1 != "baselined.delivered"' "$WORK/pending.orig" >"$WORK/pending.keep" 2>/dev/null; then
+    prune_fail "prune-delivered: cannot process $PENDING_FILE; nothing changed"
+    return
+  fi
+  n_rm="$(grep -c . "$WORK/delivered")"
+  n_keep="$(grep -c . "$WORK/pending.keep")"
+  if [[ "$n_rm" -eq 0 ]]; then
+    log "prune-delivered: no delivered entries in $PENDING_FILE; nothing to prune"
+    [[ "$LOG_WRITE_FAILED" -eq 0 ]] || EXIT_CODE=1
+    return
+  fi
+  if [[ "$PRUNE_DRY" -eq 1 ]]; then
+    echo "prune-delivered --dry-run: would remove $n_rm delivered entries ($(delivered_summary "$WORK/delivered" | sed 's/^[0-9]* (//; s/)$//')); keep $n_keep"
+    delivered_list "$WORK/delivered"
+    return
+  fi
+  if [[ "$n_keep" -gt 0 ]]; then
+    # Exclusive create (noclobber): anything already at the temp path
+    # (a directory, a symlink, a leftover) is a failure, never written into.
+    rm -f "$PENDING_FILE.tmp" 2>/dev/null
+    if ! (set -C && cat "$WORK/pending.keep" >"$PENDING_FILE.tmp") 2>/dev/null; then
+      prune_fail "prune-delivered: cannot write $PENDING_FILE.tmp; nothing changed"
+      return
+    fi
+    if ! chmod 600 "$PENDING_FILE.tmp" 2>/dev/null; then
+      prune_fail "prune-delivered: cannot chmod $PENDING_FILE.tmp; nothing changed"
+      return
+    fi
+  fi
+  log "prune-delivered: removing $n_rm delivered entries ($(delivered_summary "$WORK/delivered" | sed 's/^[0-9]* (//; s/)$//')); keeping $n_keep"
+  if [[ "$LOG_WRITE_FAILED" -ne 0 ]]; then
+    prune_fail "prune-delivered: log write failed; nothing changed"
+    return
+  fi
+  if [[ "$n_keep" -gt 0 ]]; then
+    if ! mv -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null; then
+      prune_fail "prune-delivered: cannot replace $PENDING_FILE; nothing changed"
+      return
+    fi
+  elif ! rm -f "$PENDING_FILE" 2>/dev/null; then
+    prune_fail "prune-delivered: cannot remove $PENDING_FILE; nothing changed"
+    return
+  fi
+  printf 'prune-delivered: removed %s delivered entries (%s); kept %s\n' "$n_rm" \
+    "$(delivered_summary "$WORK/delivered" | sed 's/^[0-9]* (//; s/;.*$//')" "$n_keep"
 }
 
 do_status() {
@@ -2044,6 +2230,10 @@ case "$MODE" in
     exit "$EXIT_CODE"
     ;;
   report) do_report ;;
+  prune-delivered)
+    do_prune_delivered
+    exit "$EXIT_CODE"
+    ;;
   status) do_status ;;
   install) do_install ;;
   uninstall) do_uninstall ;;
