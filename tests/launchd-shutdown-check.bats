@@ -97,7 +97,13 @@ case "$arg" in
     rc=$?
     ;;
   --apply)
-    "$stubs/uv" cache prune
+    # Like cache-prune's run_mutating: the mutating step gets its own
+    # process group.
+    /usr/bin/perl -e 'setpgrp(0, 0) or die; exec @ARGV or die' "$stubs/uv" cache prune &
+    sp=$!
+    echo "$sp" >"$SIM/step"
+    echo "$sp" >"$SIM/pgid.$sp"
+    wait "$sp"
     rc=$?
     if [[ $rc -eq 0 ]]; then
       mkdir -p "$HOME/Library/Logs"
@@ -134,6 +140,12 @@ stop_job() {
   kill -TERM -- "-$pg" 2>/dev/null
   [[ -n "$sp" ]] && kill -TERM -- "-$sp" 2>/dev/null
   sleep 0.3
+  # Record a marked descendant that survived the TERM (it ignores TERM).
+  local fx n child
+  fx="$(/usr/bin/plutil -extract EnvironmentVariables.SHUTDOWN_FIXTURE raw -o - "$(cat "$SIM/plist.path")" 2>/dev/null)"
+  n="$(cat "$fx/attempt" 2>/dev/null)"
+  child="$(sed -n 's/.* child=\([0-9][0-9]*\).*/\1/p' "$fx/marker.$n" 2>/dev/null)"
+  [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null && echo "$n $child" >>"$SIM/term_survivors"
   if [[ ! -f "$SIM/survive" && -n "$sp" ]]; then
     if [[ -f "$SIM/slow_stop" ]]; then
       (sleep 2; kill -KILL -- "-$sp") </dev/null >/dev/null 2>&1 &
@@ -387,19 +399,40 @@ assert_exact_targets() {
   [[ -z "$(roots_left)" ]]
 }
 
-@test "launchd-shutdown-check: cache-prune exercise passes; its plist mirrors production (no ExitTimeOut)" {
+@test "launchd-shutdown-check: cache-prune exercise passes; its plist mirrors production (ExitTimeOut 30)" {
   run_check -- --target cache-prune --run
   assert_success
   assert_output --partial "result: PASS"
   assert_output --partial "finished OK"
   assert_exact_targets
-  run plist_get 0 ExitTimeOut
-  assert_failure
+  [[ "$(plist_get 0 ExitTimeOut)" == 30 ]]
   [[ "$(plist_get 0 ProgramArguments.2)" == --apply ]]
   local h
   h="$(plist_get 0 EnvironmentVariables.HOME)"
   [[ "$(plist_get 0 EnvironmentVariables.CACHE_PRUNE_BASE_PATH)" == "${h%/home}/stubs:/usr/bin:/bin:/usr/sbin:/sbin" ]]
   [[ -z "$(roots_left)" ]]
+}
+
+@test "launchd-shutdown-check: both targets' stubbed steps spawn a TERM-ignoring descendant" {
+  local t
+  for t in gitleaks-audit cache-prune; do
+    rm -f "$SIM/term_survivors"
+    run_check -- --target "$t" --run
+    assert_success
+    # Both stops (attempts 1 and 3) found the descendant alive after TERM.
+    run cut -d' ' -f1 "$SIM/term_survivors"
+    assert_output "$(printf '%s\n' 1 3)"
+  done
+}
+
+@test "launchd-shutdown-check: the default stop window is ExitTimeOut 30 + 5s for both targets" {
+  local t
+  for t in gitleaks-audit cache-prune; do
+    run_check LAUNCHD_CHECK_STOP_TIMEOUT= -- --target "$t" --run
+    assert_success
+    assert_output --partial "within 35s of the bootout request"
+    assert_output --partial "within 35s of the kill TERM request"
+  done
 }
 
 @test "launchd-shutdown-check: command resolution is verified explicitly before bootstrap" {

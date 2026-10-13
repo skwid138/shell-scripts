@@ -30,8 +30,8 @@ The real agents are only read with `launchctl print`, before and after;
 their output must be identical.
 
 The throwaway job runs the real script (personal/<target>.sh, --run or
---apply) with a plist that mirrors production (gitleaks-audit: ExitTimeOut
-30; cache-prune: no ExitTimeOut) and these EnvironmentVariables:
+--apply) with a plist that mirrors production (ExitTimeOut 30 for both) and
+these EnvironmentVariables:
   HOME                      a temp dir (fake repo / fake nvm default inside)
   GITLEAKS_AUDIT_BASE_PATH  <temp>/stubs:/usr/bin:/bin:/usr/sbin:/sbin
   CACHE_PRUNE_BASE_PATH     <temp>/stubs:/usr/bin:/bin:/usr/sbin:/sbin
@@ -42,13 +42,13 @@ that PATH and the fake nvm default bin (absolute npm/pnpm included).
 
 The stubbed step (`gitleaks git` for the audit, `uv cache prune` for
 cache-prune) writes a per-attempt marker (pid, pgid, attempt), spawns a
-descendant (TERM-ignoring for the audit), and sleeps past the observation
-window. For each target:
+TERM-ignoring descendant (so only a KILL of its process group removes it),
+and sleeps past the observation window. For each target:
   stop (a)  launchctl bootout gui/<uid>/<label> while the step runs: no
             process may survive in the step's process group, nor in the
             job's own process group (the script and, for the audit, its
             watchdog), within the stop timeout counted from the stop
-            request (audit: ExitTimeOut 30 + 5s), the lock must be released
+            request (ExitTimeOut 30 + 5s), the lock must be released
             or reclaimable, and nothing may be published (audit: the repo
             snapshot not advanced, or the publication unsettled; cache-prune:
             no "finished OK" for that attempt). Re-bootstrap; the next run
@@ -76,7 +76,7 @@ Environment overrides (tests/advanced use):
   LAUNCHD_CHECK_PS             ps (default /bin/ps)
   LAUNCHD_CHECK_READY_TIMEOUT  seconds to wait for a marker (default 60)
   LAUNCHD_CHECK_STOP_TIMEOUT   seconds for the group to empty after a stop
-                               (default 35 audit, 25 cache-prune)
+                               (default 35: ExitTimeOut 30 + 5s)
   LAUNCHD_CHECK_RUN_TIMEOUT    seconds for a normal run to finish (default 300)
   LAUNCHD_CHECK_SYSTEM_PATH    system dirs after the stubs
                                (default /usr/bin:/bin:/usr/sbin:/sbin)
@@ -112,8 +112,8 @@ case "$TARGET" in
     ;;
   cache-prune)
     JOB_ARG="--apply"
-    EXIT_TIMEOUT=""
-    STOP_DEFAULT=25 # launchd's default exit timeout (20s) + 5s
+    EXIT_TIMEOUT=30
+    STOP_DEFAULT=35
     LOCK_NAME="cache-prune.lock"
     ;;
   "") die_usage "--target gitleaks-audit|cache-prune is required (see --help)" ;;
@@ -335,6 +335,7 @@ exit 0' || return 1
   "cache prune") ;;
   *) exit 0 ;;
 esac
+STEP_CHILD_IGNORES_TERM=1
 '"$STEP_BODY"'
 exit 0' || return 1
   write_stub "$s/osascript" 'exit 0' || return 1

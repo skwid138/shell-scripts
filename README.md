@@ -424,12 +424,13 @@ agent/launchd-shutdown-check.sh --target cache-prune --run
 It bootstraps a throwaway `com.skwid138.shutdowntest.<pid>` job (refusing
 if that label exists) that runs the real script with a temp `HOME`, a
 stub-first base PATH (no Homebrew or OrbStack), a fake nvm default, and a
-production-like plist, after checking each tool's resolution explicitly.
+production-like plist (`ExitTimeOut` 30 for both targets), after checking
+each tool's resolution explicitly.
 A stubbed step (`gitleaks git` / `uv cache prune`) marks itself, spawns a
-descendant, and hangs; the exercise stops it with `launchctl bootout` and
+TERM-ignoring descendant, and hangs; the exercise stops it with `launchctl bootout` and
 with `launchctl kill TERM` (always the exact service `gui/<uid>/<label>`),
 then checks that the step's and the job's process groups empty within the
-stop timeout counted from the stop request, the lock is released or
+stop timeout (35s: ExitTimeOut + 5s) counted from the stop request, the lock is released or
 reclaimable, nothing is published, and the next run exits 0. A `ps` that
 fails is a failed check, never "nothing left". All checks
 are reported before the cleanup trap, which only touches this run's job,
