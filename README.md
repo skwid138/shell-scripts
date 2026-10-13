@@ -200,10 +200,66 @@ A few scripts here are interactive launchers wired up via aliases in
   version changed (everything weekly); `--report` prints the reduced
   findings (rule, file:line, commit — never the secret). Existing findings are
   baselined on first scan; afterwards only new fingerprints or errors notify.
-  An undelivered baseline/NEW notification stays pending and is retried on
+  An undelivered baseline/NEW notification stays pending (one line per
+  fingerprint: repo, commit, file, rule, line — never a secret value — in the
+  600 state dir) and is retried on
   every later run.
   Private excludes live in `~/.config/gitleaks-audit/config`. LaunchAgent
   runs `--run` daily at 11:00. Logs to `~/Library/Logs/gitleaks-audit.log`.
+- **Private gitleaks suppressions** (`lib/gitleaks-private.sh`, shared by the
+  hook and the audit) — per-repo false-positive suppressions that live only
+  on this machine, for repos whose teammates do not run these scripts:
+  `~/.config/gitleaks-audit/repos/<rel>/gitleaks.toml` (passed as
+  `--config`) and `.../gitleaksignore` (passed as `--gitleaks-ignore-path`),
+  where `<rel>` is the repo's path under `~/code` (linked worktrees share the
+  main repo's store; submodules have their own; repos outside `~/code` have
+  none). Every path from `$HOME` down to each file must be a non-symlink
+  owned by you, not group/other writable, with no ACL entry letting anyone
+  else write. `gitleaks.toml` is limited to `[extend] useDefault = true` plus
+  `[[allowlists]]` blocks that each target one rule with `condition = "AND"`,
+  anchored `paths`, and anchored `regexTarget = "line"` regexes (gitleaks'
+  line target starts with a newline except on a fragment's first line, so
+  line regexes begin `^\n?`); `gitleaksignore` holds only full-SHA history
+  fingerprints. A violation blocks the commit (hook) or is a per-repo ERROR
+  (audit). The audit also requires `~/.config/gitleaks-audit/protected`
+  (`<rel> <full fingerprint>` lines: rotate-first findings that must never
+  disappear) whenever the store exists, checks it every run, and records
+  which private files each scan used (`--report` marks stale or unsettled
+  results). Details for one repo with its private files:
+  `gitleaks git --redact=100 -v --config <store>/gitleaks.toml
+  --gitleaks-ignore-path <store>/gitleaksignore .` (add `--pre-commit
+  --staged` for what the hook scans; pass only the flags whose files exist).
+  Regexes use a strict, fail-closed RE2 subset: anchored `^…$` with no
+  quantified or mid-pattern anchor (the only optional prefix is exactly
+  `^\n?`), whitelisted escapes only (no `\Q…\E`, `\p`, `\x`, `\s`, or the
+  negated `\D`/`\S`/`\W`), no wildcards (no unescaped `.`, no negated
+  classes `[^…]`, no `\s` — write `[ \t]`), only `(…)`/`(?:…)` groups, and
+  no top-level `|`. The validator enforces structure; how narrow each path,
+  class, and line shape is remains a review responsibility. Breadth to avoid
+  in review: whole-printable ranges like `[ -~]` or `[!-~]`, `\w+` (or any
+  broad class with `+`/`*`) standing for most of a line, and path regexes
+  that match whole directories instead of named files. Private
+  suppressions require macOS (BSD `stat`, `ls -le` ACLs); elsewhere an
+  existing store blocks the hook with a "require macOS" error. The audit
+  announces each NEW fingerprint once across process crashes and failed
+  state writes, with three exceptions: power loss (no fsync); a crash right
+  after a notification is shown, before the pending file is rewritten
+  (repeats it once); and a failed pending-file write after a notification
+  has been shown (may repeat that announcement once; the run exits 1).
+  A delivered announcement whose fingerprint never reaches that repo's
+  known (finding gone or suppressed before recovery, repo excluded or
+  removed) stays in the pending file, marked delivered, indefinitely, so a
+  later reappearance is not reported as NEW. The audit trusts a repo as
+  unchanged only when its findings, provenance, and
+  snapshot agree, and rescans it as "unsettled" otherwise (the first run
+  after upgrading rescans every repo once, since older state has no
+  provenance). Accepted limitation: validation and use are not atomic. Both
+  the hook and the audit validate the store again after gitleaks returns
+  (a store that no longer validates blocks the commit / publishes nothing,
+  and a mid-scan content change keeps the audit snapshot from advancing),
+  but an accidental edit made and undone entirely within one scan window
+  cannot be seen. The threat model is accidents, not same-user tampering.
+  The store is local-only: back it up yourself.
 
 ## Development
 

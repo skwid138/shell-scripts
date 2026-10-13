@@ -60,6 +60,9 @@ jobs:
           # gitleaks are all bottles, so this is fast. gitleaks lets the
           # real-binary tests in tests/gitleaks-hook.bats run instead of skip.
           brew install shellcheck shfmt gitleaks
+          # GNU tools: tests/gitleaks-private.bats re-runs the store validator
+          # with GNU stat/awk/sed/grep first on PATH (skipped when absent).
+          brew install coreutils gawk gnu-sed grep
           shellcheck --version
           shfmt --version
           gitleaks version
@@ -133,6 +136,8 @@ jobs:
           command -v shfmt >/dev/null 2>&1 || brew install shfmt
           # gitleaks: real-binary tests in tests/gitleaks-hook.bats.
           command -v gitleaks >/dev/null 2>&1 || brew install gitleaks
+          # GNU tools for the GNU-first PATH test in tests/gitleaks-private.bats.
+          brew install coreutils gawk gnu-sed grep
           parallel --version | head -1
           shellcheck --version | head -1
           shfmt --version
