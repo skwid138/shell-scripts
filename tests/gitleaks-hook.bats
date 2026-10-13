@@ -55,6 +55,13 @@ setup() {
   TPATH="$STUBS:$GITBIN:/usr/bin:/bin:/usr/sbin:/sbin"
 }
 
+teardown() {
+  # Restore permissions a failed assertion may have left behind.
+  /bin/chmod -RN "$BATS_TEST_TMPDIR" 2>/dev/null
+  /bin/chmod -R u+rwx "$BATS_TEST_TMPDIR" 2>/dev/null
+  return 0
+}
+
 # The shell text the registration must carry, exactly.
 EXPECTED_COMMAND='h="$HOME/code/scripts/personal/gitleaks-hook.sh"; if [ ! -e "$h" ]; then echo "gitleaks hook: $h not found, skipping" >&2; exit 0; fi; if [ ! -x "$h" ]; then echo "gitleaks hook: $h not executable" >&2; exit 1; fi; exec "$h" --run'
 
@@ -71,6 +78,7 @@ if [[ "${1-}" == "version" ]]; then
   echo "8.30.1"
   exit 0
 fi
+[[ -x "$FIX/during" ]] && "$FIX/during"
 exit "$(cat "$FIX/rc" 2>/dev/null || echo 0)"
 EOF
   chmod +x "$STUBS/gitleaks"
@@ -79,7 +87,8 @@ EOF
 # Feature-detect git config hooks (hook.<name>.command); skip if unsupported.
 require_config_hooks() {
   local d="$T/probe"
-  "$REAL_GIT" init -q "$d" 2>/dev/null || skip "git init failed"
+  env -i PATH="$GITBIN:/usr/bin:/bin" HOME="$FAKE_HOME" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    "$REAL_GIT" init -q "$d" 2>/dev/null || skip "git init failed"
   local out
   # `|| true`: bats runs tests under `set -e`; an old git fails `hook run`
   # (or ignores hook.<name>.*) and must skip, not error.
@@ -517,4 +526,523 @@ assert_no_secret() {
   run g commit -q -m x
   assert_failure
   [[ "$(commit_count)" -eq "$before" ]]
+}
+
+# --- private, per-repo suppressions (lib/gitleaks-private.sh) -----------------
+#
+# Store: $HOME/.config/gitleaks-audit/repos/<rel>/{gitleaks.toml,gitleaksignore}
+# where <rel> is the repo's path under ~/code. Test fixtures use synthetic
+# paths only.
+
+PR_REL="wp/my app"
+
+# The store validator needs BSD stat and `ls -le` ACLs (macOS only); off macOS
+# an existing store fails closed (tested below on Linux runners).
+require_darwin() {
+  [[ "$(uname -s)" == "Darwin" ]] || skip "private suppression validation is macOS-only"
+}
+
+# pstore <rel> [toml] [ignore]: a valid (700/600) private store entry.
+pstore() {
+  local base="$FAKE_HOME/.config/gitleaks-audit" d p
+  d="$base/repos/$1"
+  mkdir -p "$d"
+  /bin/chmod 700 "$FAKE_HOME/.config" "$base" "$base/repos"
+  p="$d"
+  while [[ "$p" != "$base/repos" ]]; do
+    /bin/chmod 700 "$p"
+    p="$(dirname "$p")"
+  done
+  if [[ -n "${2-}" ]]; then
+    printf '%s\n' "$2" >"$d/gitleaks.toml"
+    /bin/chmod 600 "$d/gitleaks.toml"
+  fi
+  if [[ -n "${3-}" ]]; then
+    printf '%s\n' "$3" >"$d/gitleaksignore"
+    /bin/chmod 600 "$d/gitleaksignore"
+  fi
+}
+pstore_dir() { printf '%s' "$FAKE_HOME/.config/gitleaks-audit/repos/$1"; }
+
+# A repo under ~/code (the default $R is outside it).
+init_code_repo() {
+  R="$FAKE_HOME/code/$PR_REL"
+  init_repo
+}
+
+SHAPES_TOML='[extend]
+useDefault = true
+
+[[allowlists]]
+description = '"'"'design tokens: a JSON "key" member holding 40 lowercase hex'"'"'
+targetRules = ['"'"'generic-api-key'"'"']
+condition = "AND"
+paths = ['"'"'^tools/themes/json/tokens\.json$'"'"']
+regexTarget = "line"
+regexes = ['"'"'^\n?[ \t]*"key": "[0-9a-f]{40}",?$'"'"']
+
+[[allowlists]]
+description = '"'"'schema field metadata data_key names'"'"'
+targetRules = ['"'"'generic-api-key'"'"']
+condition = "AND"
+paths = ['"'"'^src/app(_dsp)?/schema/(models|sb_models)\.py$'"'"']
+regexTarget = "line"
+regexes = ['"'"'^\n? +(?:[a-z0-9_]+: [A-Za-z\[\]]+ = field\(metadata=\{"data_key": "[A-Za-z0-9]+"\}\)|(?:default=None, )?metadata=\{"data_key": "[A-Za-z0-9]+"\})$'"'"']'
+
+argv_line() { grep '^argv:' "$CALLS" | tail -n1; }
+
+@test "gitleaks-hook: validated private files of a repo under ~/code are passed as --config / --gitleaks-ignore-path" {
+  require_darwin
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML" "$(printf '%040d' 7):a.txt:jwt:1"
+  run_hook --run
+  assert_success
+  run argv_line
+  assert_output "argv:git --pre-commit --staged --redact=100 --no-banner --exit-code=10 --config $(pstore_dir "$PR_REL")/gitleaks.toml --gitleaks-ignore-path $(pstore_dir "$PR_REL")/gitleaksignore ."
+}
+
+@test "gitleaks-hook: only private files that exist are passed; no store means the original argv" {
+  require_darwin
+  init_code_repo
+  run_hook --run
+  run argv_line
+  assert_output "argv:git --pre-commit --staged --redact=100 --no-banner --exit-code=10 ."
+  pstore "$PR_REL"
+  run_hook --run
+  run argv_line
+  assert_output "argv:git --pre-commit --staged --redact=100 --no-banner --exit-code=10 ."
+  pstore "$PR_REL" "" "$(printf '%040d' 7):a.txt:jwt:1"
+  run_hook --run
+  run argv_line
+  assert_output "argv:git --pre-commit --staged --redact=100 --no-banner --exit-code=10 --gitleaks-ignore-path $(pstore_dir "$PR_REL")/gitleaksignore ."
+  # Another repo's store is never used.
+  rm -f "$(pstore_dir "$PR_REL")/gitleaksignore"
+  pstore "wp/other" "$SHAPES_TOML"
+  run_hook --run
+  run argv_line
+  assert_output "argv:git --pre-commit --staged --redact=100 --no-banner --exit-code=10 ."
+}
+
+@test "gitleaks-hook: an unsafe private store blocks (exit 1) with a store error, never secret guidance, and does not scan" {
+  require_darwin
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  /bin/chmod g+w "$(pstore_dir "$PR_REL")/gitleaks.toml"
+  : >"$CALLS"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"private suppression store error"* ]]
+  [[ "$stderr" == *"writable"* ]]
+  [[ "$stderr" != *"otate"* && "$stderr" != *"gitleaks:allow"* ]]
+  run grep -c '^argv:' "$CALLS"
+  assert_output "0"
+  # A grammar violation blocks the same way.
+  /bin/chmod 600 "$(pstore_dir "$PR_REL")/gitleaks.toml"
+  pstore "$PR_REL" "" "deadbeef:a.txt:jwt:1"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"gitleaksignore"* ]]
+}
+
+@test "gitleaks-hook: an unsafe store blocks a real git commit" {
+  require_darwin
+  require_config_hooks
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  /bin/chmod o+w "$FAKE_HOME/.config"
+  echo x >"$R/a.txt"
+  g add a.txt
+  local before
+  before="$(commit_count)"
+  run g commit -q -m x
+  assert_failure
+  assert_output --partial "private suppression store error"
+  [[ "$(commit_count)" -eq "$before" ]]
+}
+
+@test "gitleaks-hook: a repo outside ~/code never consults the store, even a broken one" {
+  require_darwin
+  init_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  /bin/chmod 777 "$FAKE_HOME/.config/gitleaks-audit"
+  run_hook --run
+  assert_success
+  run argv_line
+  assert_output "argv:git --pre-commit --staged --redact=100 --no-banner --exit-code=10 ."
+}
+
+@test "gitleaks-hook: a repo .gitleaks.toml (untracked or only in the index) plus a private gitleaks.toml is a collision error" {
+  require_darwin
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  echo 'title = "repo"' >"$R/.gitleaks.toml"
+  : >"$CALLS"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *".gitleaks.toml"* ]]
+  run grep -c '^argv:' "$CALLS"
+  assert_output "0"
+  g add .gitleaks.toml
+  rm "$R/.gitleaks.toml"
+  run_hook --run
+  assert_failure 1
+  # A private gitleaksignore alone is fine next to a repo config.
+  g rm -q --cached .gitleaks.toml
+  echo 'title = "repo"' >"$R/.gitleaks.toml"
+  rm "$(pstore_dir "$PR_REL")/gitleaks.toml"
+  pstore "$PR_REL" "" "$(printf '%040d' 7):a.txt:jwt:1"
+  run_hook --run
+  assert_success
+}
+
+@test "gitleaks-hook: a linked worktree uses its main repo's private store" {
+  require_darwin
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  g worktree add -q "$FAKE_HOME/code/wp/app-wt" -b wt
+  HOOK_CWD="$FAKE_HOME/code/wp/app-wt" run_hook --run
+  assert_success
+  run argv_line
+  assert_output --partial "--config $(pstore_dir "$PR_REL")/gitleaks.toml ."
+  run grep '^pwd:' "$CALLS"
+  assert_line "pwd:$(cd "$FAKE_HOME/code/wp/app-wt" && pwd -P)"
+}
+
+@test "gitleaks-hook: finding guidance's details command carries the private flags" {
+  require_darwin
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML" "$(printf '%040d' 7):a.txt:jwt:1"
+  echo 10 >"$FIX/rc"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"gitleaks git --pre-commit --staged --redact=100 --verbose --config "*"gitleaks.toml --gitleaks-ignore-path "*"gitleaksignore ."* ]]
+  [[ "$stderr" == *"private"* ]]
+}
+
+@test "gitleaks-hook: --status reports the private store state for the current repo" {
+  require_darwin
+  init_code_repo
+  run_hook --status
+  assert_success
+  assert_output --partial "private suppressions: none"
+  pstore "$PR_REL" "$SHAPES_TOML"
+  run_hook --status
+  assert_output --partial "private suppressions: $PR_REL: gitleaks.toml"
+  /bin/chmod g+w "$(pstore_dir "$PR_REL")/gitleaks.toml"
+  run_hook --status
+  assert_success
+  assert_output --partial "private suppressions: ERROR"
+}
+
+# --- private suppressions with the real gitleaks binary ----------------------
+
+# A fixed 40-hex id, derived at runtime (no literal in this public file);
+# random hex sometimes falls under generic-api-key's entropy threshold.
+hex40() { printf 'plan-f-fixture-1' | shasum | cut -c1-40; }
+alnum() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$1"; }
+# Fixed data_key names: synthetic, and verified to trip generic-api-key
+# (random letter runs often fall under its entropy/stopword filters). The
+# control halves of the tests prove they still fire.
+DK1=fixtureColumnKqzVw7d
+DK2=fixtureColumnPmxRt9d
+DK3=fixtureColumnBvzQs4d
+
+# Every synthetic value written by a test is remembered so none can leak.
+SECRETS=()
+remember() { SECRETS+=("$1"); }
+assert_no_secrets() {
+  local s
+  for s in ${SECRETS[@]+"${SECRETS[@]}"}; do
+    if grep -qF -- "$s" <<<"$output$stderr"; then
+      echo "synthetic secret leaked into hook output" >&2
+      return 1
+    fi
+  done
+}
+
+# stage <path> <content>: write and stage one file in $R.
+stage() {
+  mkdir -p "$(dirname "$R/$1")"
+  printf '%s\n' "$2" >"$R/$1"
+  g add -- "$1"
+}
+
+# hook_blocks / hook_allows: run the real hook on the staged index.
+hook_blocks() {
+  run_hook --run
+  assert_no_secrets
+  [[ "$status" -eq 1 && "$stderr" == *"potential secret(s) in the changes being committed"* &&
+    "$stderr" != *"scan error"* && "$stderr" != *"private suppression store error"* ]] || {
+    echo "expected the hook to block on a finding, not an error (status=$status)" >&2
+    return 1
+  }
+}
+hook_allows() {
+  run_hook --run
+  assert_no_secrets
+  [[ "$status" -eq 0 ]] || {
+    echo "expected the hook to allow (status=$status)" >&2
+    return 1
+  }
+}
+
+reset_index() { g reset -q; }
+
+@test "gitleaks-hook (real gitleaks): each content shape is suppressed only with the private store (control: blocked without)" {
+  require_darwin
+  require_real_gitleaks
+  init_code_repo
+  local h store
+  h="$(hex40)"
+  remember "$h"
+  remember "$DK1"
+  remember "$DK2"
+  remember "$DK3"
+  store="$(pstore_dir "$PR_REL")"
+  local -a cases=(
+    "tools/themes/json/tokens.json|{
+  \"color\": {
+        \"key\": \"$h\",
+        \"name\": \"primary\"
+  }
+}"
+    "src/app/schema/models.py|class M:
+    clicks_14d: Optional[Decimal] = field(metadata={\"data_key\": \"$DK1\"})"
+    "src/app_dsp/schema/sb_models.py|class M:
+    other: int = field(
+        metadata={\"data_key\": \"$DK2\"}
+    )"
+    "src/app/schema/models.py|class M:
+    third: int = field(
+        default=None, metadata={\"data_key\": \"$DK3\"}
+    )"
+  )
+  local c
+  for c in "${cases[@]}"; do
+    rm -rf "$store"
+    stage "${c%%|*}" "${c#*|}"
+    hook_blocks
+    pstore "$PR_REL" "$SHAPES_TOML"
+    hook_allows
+    reset_index
+    rm -f "$R/${c%%|*}"
+  done
+}
+
+@test "gitleaks-hook (real gitleaks): default rules still fire with a private config" {
+  require_darwin
+  require_real_gitleaks
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  KEY="$(new_key)"
+  remember "$KEY"
+  stage creds.txt "aws_access_key_id = $KEY"
+  hook_blocks
+}
+
+@test "gitleaks-hook (real gitleaks): another rule in an allowed path, and a non-matching line in an allowed file, still fire" {
+  require_darwin
+  require_real_gitleaks
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  KEY="$(new_key)"
+  remember "$KEY"
+  stage tools/themes/json/tokens.json "{\"aws\": \"$KEY\"}"
+  hook_blocks
+  reset_index
+  local a
+  a="$(alnum 32)"
+  remember "$a"
+  stage tools/themes/json/tokens.json "{
+        \"api_key\": \"$a\",
+}"
+  hook_blocks
+  reset_index
+  # The allowed member shape, but not alone on its line.
+  local h
+  h="$(hex40)"
+  remember "$h"
+  stage tools/themes/json/tokens.json "{\"key\": \"$h\"}"
+  hook_blocks
+}
+
+@test "gitleaks-hook (real gitleaks): a second credential on an allowed-shape line still fires (both shapes)" {
+  require_darwin
+  require_real_gitleaks
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  local h a
+  h="$(hex40)" a="$(alnum 32)"
+  remember "$h"
+  remember "$a"
+  remember "$DK1"
+  stage tools/themes/json/tokens.json "{
+        \"key\": \"$h\", \"api_key\": \"$a\",
+}"
+  hook_blocks
+  reset_index
+  stage src/app/schema/models.py "class M:
+    clicks: int = field(metadata={\"data_key\": \"$DK1\"}); api_key = \"$a\""
+  hook_blocks
+}
+
+@test "gitleaks-hook (real gitleaks): a near-miss file name is not covered by the allowlist" {
+  require_darwin
+  require_real_gitleaks
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  local h f
+  h="$(hex40)"
+  remember "$h"
+  # Control: the exact allowed file name is suppressed.
+  stage tools/themes/json/tokens.json "{
+        \"key\": \"$h\",
+}"
+  hook_allows
+  reset_index
+  rm -f "$R/tools/themes/json/tokens.json"
+  for f in tools/themes/json/tokens.json.bak xtools/themes/json/tokens.json tools/themes/json/tokensXjson tools/themes/json/sub/tokens.json; do
+    stage "$f" "{
+        \"key\": \"$h\",
+}"
+    hook_blocks
+    reset_index
+  done
+}
+
+@test "gitleaks-hook (real gitleaks): the repo .gitleaksignore still suppresses alongside a private config" {
+  require_darwin
+  require_real_gitleaks
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  KEY="$(new_key)"
+  remember "$KEY"
+  stage creds.txt "aws_access_key_id = $KEY"
+  hook_blocks
+  echo "creds.txt:aws-access-token:1" >"$R/.gitleaksignore"
+  hook_allows
+}
+
+@test "gitleaks-hook (real gitleaks): store identity - linked worktree shares, submodule is separate, outside ~/code has none" {
+  require_darwin
+  require_real_gitleaks
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  local h
+  h="$(hex40)"
+  remember "$h"
+  local content="{
+        \"key\": \"$h\",
+}"
+  # Linked worktree: the main repo's store applies.
+  g worktree add -q "$FAKE_HOME/code/wp/app-wt" -b wt
+  local main_r="$R"
+  R="$FAKE_HOME/code/wp/app-wt"
+  stage tools/themes/json/tokens.json "$content"
+  HOOK_CWD="$R" hook_allows
+  # Submodule: its own identity, so the superproject's store does not apply.
+  R="$main_r"
+  mkdir -p "$T/subsrc"
+  (cd "$T/subsrc" && env -i HOME="$FAKE_HOME" PATH="$TPATH" GIT_CONFIG_GLOBAL="$GCFG" GIT_CONFIG_NOSYSTEM=1 \
+    git init -q . && env -i HOME="$FAKE_HOME" PATH="$TPATH" GIT_CONFIG_GLOBAL="$GCFG" GIT_CONFIG_NOSYSTEM=1 \
+    git commit -q --no-verify --allow-empty -m init)
+  g -c protocol.file.allow=always submodule -q add "$T/subsrc" mods/sub
+  R="$main_r/mods/sub"
+  stage tools/themes/json/tokens.json "$content"
+  HOOK_CWD="$R" hook_blocks
+  pstore "$PR_REL/mods/sub" "$SHAPES_TOML"
+  HOOK_CWD="$R" hook_allows
+  # Outside ~/code: no private lookup at all.
+  R="$T/outside repo"
+  init_repo
+  stage tools/themes/json/tokens.json "$content"
+  hook_blocks
+}
+
+@test "gitleaks-hook: a store that stops validating during the scan blocks (re-validated after gitleaks returns)" {
+  require_darwin
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  printf '#!/bin/bash\n/bin/chmod g+w "%s"\n' "$(pstore_dir "$PR_REL")/gitleaks.toml" >"$FIX/during"
+  chmod +x "$FIX/during"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"private suppression store"*"changed during the scan"* ]]
+  [[ "$stderr" == *"writable"* ]]
+  # A private file appearing mid-scan (the scan ran without it) blocks too.
+  /bin/chmod 600 "$(pstore_dir "$PR_REL")/gitleaks.toml"
+  printf '#!/bin/bash\nprintf "%%s\\n" "%s" >"%s"\n/bin/chmod 600 "%s"\n' \
+    "$(printf '%040d' 7):a.txt:jwt:1" "$(pstore_dir "$PR_REL")/gitleaksignore" "$(pstore_dir "$PR_REL")/gitleaksignore" >"$FIX/during"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"changed during the scan"* ]]
+  # Without a mid-scan change the same store passes.
+  rm -f "$FIX/during" "$(pstore_dir "$PR_REL")/gitleaksignore"
+  run_hook --run
+  assert_success
+}
+
+@test "gitleaks-hook: off macOS an existing private store blocks with a macOS-only error (Linux runners)" {
+  [[ "$(uname -s)" != "Darwin" ]] || skip "Linux-only; covered on macOS via an OSTYPE override in tests/gitleaks-private.bats"
+  init_code_repo
+  mkdir -p "$FAKE_HOME/.config/gitleaks-audit/repos/$PR_REL"
+  chmod 700 "$FAKE_HOME/.config" "$FAKE_HOME/.config/gitleaks-audit"
+  : >"$CALLS"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"require macOS"* ]]
+  run grep -c '^argv:' "$CALLS"
+  assert_output "0"
+  # Repos outside ~/code are unaffected.
+  R="$T/outside repo"
+  init_repo
+  run_hook --run
+  assert_success
+}
+
+@test "gitleaks-hook: a same-path content change of a private file during the scan blocks (content hashes compared)" {
+  require_darwin
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML" "$(printf '%040d' 7):a.txt:jwt:1"
+  # Still valid afterwards, same paths: only the content differs.
+  printf '#!/bin/bash\necho "# edited mid-scan" >>"%s"\n' "$(pstore_dir "$PR_REL")/gitleaks.toml" >"$FIX/during"
+  chmod +x "$FIX/during"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"changed during the scan"* ]]
+  printf '#!/bin/bash\necho "# edited mid-scan" >>"%s"\n' "$(pstore_dir "$PR_REL")/gitleaksignore" >"$FIX/during"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"changed during the scan"* ]]
+  rm -f "$FIX/during"
+  run_hook --run
+  assert_success
+}
+
+@test "gitleaks-hook: an md5 failure before or after the scan blocks with a 'could not hash' message" {
+  require_darwin
+  init_code_repo
+  pstore "$PR_REL" "$SHAPES_TOML"
+  printf '#!/bin/bash\nexit 1\n' >"$T/bad-md5"
+  chmod +x "$T/bad-md5"
+  EXTRA_ENV=(GITLEAKS_MD5="$T/bad-md5")
+  : >"$CALLS"
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"could not hash the private files"* ]]
+  run grep -c '^argv:' "$CALLS"
+  assert_output "0"
+  # Works before the scan, fails after it: still "could not hash", not "changed".
+  cat >"$T/flaky-md5" <<EOF
+#!/bin/bash
+if [[ -e "$T/md5.used" ]]; then exit 1; fi
+: >"$T/md5.used"
+exec /sbin/md5 "\$@"
+EOF
+  chmod +x "$T/flaky-md5"
+  EXTRA_ENV=(GITLEAKS_MD5="$T/flaky-md5")
+  run_hook --run
+  assert_failure 1
+  [[ "$stderr" == *"could not hash the private files after the scan"* ]]
+  [[ "$stderr" != *"content differs"* ]]
 }

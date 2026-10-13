@@ -32,10 +32,12 @@ setup() {
   LOGF="$FAKE_HOME/Library/Logs/gitleaks-audit.log"
   CONFIG="$FAKE_HOME/.config/gitleaks-audit/config"
   MARKER="SYNTHETIC-SECRET-MARKER-7f3a9c"
-  mkdir -p "$CODE" "$STUBS" "$FIX" "$TMPD"
+  mkdir -p "$CODE" "$STUBS" "$FIX" "$TMPD" "$T/fixture-home"
   : >"$CALLS"
 
-  REAL_GIT="$(command -v git)"
+  # The real binary (type -P ignores the git() fixture wrapper below).
+  REAL_GIT="$(type -P git)"
+  [[ "$REAL_GIT" == /* ]] || skip "no git binary on PATH"
   REAL_JQ="$(command -v jq || echo /usr/bin/jq)"
   ln -s "$REAL_GIT" "$STUBS/git"
   ln -s "$REAL_JQ" "$STUBS/jq"
@@ -52,6 +54,9 @@ teardown() {
   for f in "$FIX/gc.pid" "$FIX/leader.pid"; do
     [[ -s "$f" ]] && kill -KILL "$(cat "$f")" 2>/dev/null
   done
+  # Restore permissions/ACLs a failed assertion may have left behind.
+  /bin/chmod -RN "$BATS_TEST_TMPDIR" 2>/dev/null
+  /bin/chmod -R u+rwx "$BATS_TEST_TMPDIR" 2>/dev/null
   return 0
 }
 
@@ -75,6 +80,7 @@ echo "$MARKER on stderr" >&2
 if [[ -f "$FIX/mutate.$repo" ]]; then
   git update-ref refs/heads/midscan HEAD
 fi
+[[ -x "$FIX/during.$repo" ]] && "$FIX/during.$repo"
 if [[ -f "$FIX/hang.$repo" ]]; then
   sh -c 'trap "" TERM; echo $$ >"$FIX/gc.pid"; exec sleep 300' </dev/null >/dev/null 2>&1 3>&- &
   echo $$ >"$FIX/leader.pid"
@@ -97,7 +103,10 @@ EOF
   cat >"$STUBS/osascript" <<'EOF'
 #!/bin/bash
 printf 'osascript %s\n' "$*" >>"$CALLS"
-exit "$(cat "$FIX/osascript_rc" 2>/dev/null || echo 0)"
+rc="$(cat "$FIX/osascript_rc" 2>/dev/null || echo 0)"
+# Test seam: runs after a (successful) delivery, e.g. to obstruct the state.
+[[ "$rc" -eq 0 && -x "$FIX/after_notify" ]] && "$FIX/after_notify"
+exit "$rc"
 EOF
   chmod +x "$STUBS/osascript"
   cat >"$STUBS/launchctl" <<'EOF'
@@ -134,16 +143,24 @@ run_audit() {
     /bin/bash "$SCRIPT" "$@" </dev/null 3>&-
 }
 
+# git: fixture git never sees the real HOME, global/system config, or the
+# real global gitleaks config hook (commits also pass --no-verify).
+git() {
+  HOME="$T/fixture-home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@e GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@e \
+    command git "$@"
+}
+
 # mkrepo <rel>: real git repo with one commit under ~/code.
 mkrepo() {
   local d="$CODE/$1"
   mkdir -p "$d"
   git -C "$d" init -q -b main
-  git -C "$d" -c user.name=t -c user.email=t@e commit -q --allow-empty -m init
+  git -C "$d" commit -q --no-verify --allow-empty -m init
 }
 
 commit_in() { # <rel> [branch]
-  git -C "$CODE/$1" -c user.name=t -c user.email=t@e commit -q --allow-empty -m "c $RANDOM"
+  git -C "$CODE/$1" commit -q --no-verify --allow-empty -m "c $RANDOM"
 }
 
 # findings <repo-basename> <n> [tag]: stub returns rc 10 + n findings.
@@ -414,10 +431,10 @@ assert_no_marker() {
   mkrepo alpha
   echo v1 >"$CODE/alpha/f"
   git -C "$CODE/alpha" add f
-  git -C "$CODE/alpha" -c user.name=t -c user.email=t@e commit -q -m f
+  git -C "$CODE/alpha" commit -q --no-verify -m f
   run_audit --run
   echo v2 >"$CODE/alpha/f"
-  git -C "$CODE/alpha" -c user.name=t -c user.email=t@e stash -q
+  git -C "$CODE/alpha" stash -q
   : >"$CALLS"
   run_audit --run
   run scanned_repos
@@ -464,7 +481,7 @@ assert_no_marker() {
   run_audit
   assert_line --regexp '^ *skip +alpha +\(unchanged\)'
   # No ref and no main-worktree HEAD moves: only the linked worktree's HEAD.
-  git -C "$T/wt alpha" -c user.name=t -c user.email=t@e commit -q --allow-empty -m detached
+  git -C "$T/wt alpha" commit -q --no-verify --allow-empty -m detached
   run_audit
   assert_line --regexp '^ *scan +alpha +\(worktree HEADs changed\)'
   : >"$CALLS"
@@ -884,6 +901,7 @@ PENDING() { printf '%s' "$STATE/pending-announce"; }
   assert_success
   assert_no_marker
   [[ -s "$(PENDING)" ]]
+  [[ "$(/usr/bin/stat -f %Lp "$(PENDING)")" == "600" ]]
   grep -q 'pending' "$LOGF"
   run cat "$(PENDING)"
   assert_output --partial "baselined"
@@ -1560,4 +1578,1014 @@ EOF
   [[ "$stderr" == *"refusing to run as root"* ]]
   run grep -c '^launchctl' "$CALLS"
   assert_output "0"
+}
+
+# --- private, per-repo suppressions (lib/gitleaks-private.sh) -----------------
+
+PBASE() { printf '%s' "$FAKE_HOME/.config/gitleaks-audit"; }
+PSTORE() { printf '%s' "$(PBASE)/repos/$1"; }
+MANIFEST() { printf '%s' "$(PBASE)/protected"; }
+state_dir() { dirname "$(grep -lx "$1" "$STATE"/repos/*/path)"; }
+
+PTOML='[extend]
+useDefault = true
+
+[[allowlists]]
+targetRules = ['"'"'generic-api-key'"'"']
+condition = "AND"
+paths = ['"'"'^src/x\.json$'"'"']
+regexTarget = "line"
+regexes = ['"'"'^\n?[ \t]*"key": "[0-9a-f]{40}",?$'"'"']'
+
+# pstore <rel> [toml] [ignore]: a valid (700/600) private store entry, plus
+# an (empty) protected manifest unless one exists already.
+pstore() {
+  local d p
+  d="$(PSTORE "$1")"
+  /bin/chmod 755 "$FAKE_HOME"
+  mkdir -p "$d"
+  /bin/chmod 700 "$FAKE_HOME/.config" "$(PBASE)" "$(PBASE)/repos"
+  p="$d"
+  while [[ "$p" != "$(PBASE)/repos" ]]; do
+    /bin/chmod 700 "$p"
+    p="$(dirname "$p")"
+  done
+  if [[ -n "${2-}" ]]; then
+    printf '%s\n' "$2" >"$d/gitleaks.toml"
+    /bin/chmod 600 "$d/gitleaks.toml"
+  fi
+  if [[ -n "${3-}" ]]; then
+    printf '%s\n' "$3" >"$d/gitleaksignore"
+    /bin/chmod 600 "$d/gitleaksignore"
+  fi
+  [[ -e "$(MANIFEST)" ]] || manifest
+}
+
+# manifest [lines...]: (re)write the protected manifest.
+manifest() {
+  mkdir -p "$(PBASE)"
+  /bin/chmod 700 "$FAKE_HOME/.config" "$(PBASE)"
+  {
+    echo "# <rel> <full fingerprint>"
+    [[ $# -gt 0 ]] && printf '%s\n' "$@"
+  } >"$(MANIFEST)"
+  /bin/chmod 600 "$(MANIFEST)"
+}
+
+# fp <i> [tag]: the stub's fingerprint for finding i (see findings()).
+fp() { printf '%040d:src/f%d.txt:rule-%s:%d' "$1" "$1" "${2:-a}" "$1"; }
+
+# findings_only <repo> <i...>: stub returns rc 10 + exactly findings i...
+findings_only() {
+  local repo="$1" i sep=""
+  shift
+  {
+    printf '['
+    for i in "$@"; do
+      printf '%s{"RuleID":"%s","File":"src/f%d.txt","Commit":"%040d","StartLine":%d,"Fingerprint":"%s","Secret":"%s","Match":"m","Line":"l","Description":"d"}' \
+        "$sep" "$([[ $((i % 2)) -eq 0 ]] && echo generic-api-key || echo aws-access-token)" "$i" "$i" "$i" "$(fp "$i")" "$MARKER"
+      sep=","
+    done
+    printf ']\n'
+  } >"$FIX/json.$repo"
+  if [[ $# -gt 0 ]]; then echo 10 >"$FIX/rc.$repo"; else echo 0 >"$FIX/rc.$repo"; fi
+}
+
+scan_argv() { grep "^gitleaks git .* | pwd=$CODE/$1 | " "$CALLS" | tail -n1; }
+
+@test "gitleaks-audit: validated private files are passed to the scan as --config / --gitleaks-ignore-path (existing files only)" {
+  mkrepo alpha
+  mkrepo beta
+  mkrepo gamma
+  pstore alpha "$PTOML" "$(printf '%040d' 9):src/x.json:generic-api-key:3"
+  pstore gamma "" "$(printf '%040d' 9):src/x.json:generic-api-key:3"
+  run_audit --run
+  assert_success
+  run scan_argv alpha
+  assert_output --regexp "^gitleaks git --redact=100 --no-banner --exit-code=10 --report-format=json --report-path=[^ ]+ --config $(PSTORE alpha)/gitleaks.toml --gitleaks-ignore-path $(PSTORE alpha)/gitleaksignore \. \| "
+  run scan_argv gamma
+  assert_output --regexp "^gitleaks git --redact=100 --no-banner --exit-code=10 --report-format=json --report-path=[^ ]+ --gitleaks-ignore-path $(PSTORE gamma)/gitleaksignore \. \| "
+  run scan_argv beta
+  assert_output --regexp "^gitleaks git --redact=100 --no-banner --exit-code=10 --report-format=json --report-path=[^ ]+ \. \| "
+}
+
+@test "gitleaks-audit: --help documents the private store, protected manifest, and flags" {
+  run_audit --help
+  assert_success
+  assert_output --partial ".config/gitleaks-audit/repos/<rel>/gitleaks.toml"
+  assert_output --partial "--gitleaks-ignore-path"
+  assert_output --partial ".config/gitleaks-audit/protected"
+  assert_output --partial "GITLEAKS_SUPPRESS_DIR"
+}
+
+@test "gitleaks-audit: a repo with an unsafe store is a repo ERROR: others are scanned, exit 1, no state written for it" {
+  mkrepo alpha
+  mkrepo beta
+  pstore alpha "$PTOML"
+  /bin/chmod g+w "$(PSTORE alpha)/gitleaks.toml"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR alpha: private suppression store"
+  assert_output --partial "writable"
+  run scanned_repos
+  assert_output "beta"
+  run ! grep -qx alpha "$STATE"/repos/*/path
+  run notifies
+  assert_output --partial "error"
+  assert_no_marker
+}
+
+@test "gitleaks-audit: store validation runs before the unchanged skip (a chmod-only change is caught)" {
+  mkrepo alpha
+  pstore alpha "$PTOML"
+  run_audit --run
+  assert_success
+  run_audit
+  assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+  local d p
+  d="$(state_dir alpha)"
+  cp "$d/snapshot" "$T/snap.before"
+  # Parent-dir changes are not part of the snapshot: only validation that
+  # runs before the unchanged check can catch them.
+  for p in "$(PSTORE alpha)" "$FAKE_HOME/.config"; do
+    /bin/chmod g+w "$p"
+    : >"$CALLS"
+    run_audit --run
+    /bin/chmod g-w "$p"
+    assert_failure 1
+    assert_output --partial "ERROR alpha: private suppression store"
+    refute_output --regexp 'skip +alpha'
+    [[ "$(scans)" -eq 0 ]]
+    cmp -s "$d/snapshot" "$T/snap.before"
+  done
+  /bin/chmod +a "group:everyone allow write" "$(PSTORE alpha)/gitleaks.toml" || skip "no ACL support"
+  run_audit --run
+  /bin/chmod -N "$(PSTORE alpha)/gitleaks.toml"
+  assert_failure 1
+  assert_output --partial "ACL"
+  run_audit --run
+  assert_success
+  assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+  # The file's own mode too.
+  /bin/chmod 640 "$(PSTORE alpha)/gitleaks.toml"
+  /bin/chmod g+w "$(PSTORE alpha)/gitleaks.toml"
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR alpha: private suppression store"
+  [[ "$(scans)" -eq 0 ]]
+  cmp -s "$d/snapshot" "$T/snap.before"
+  # A mode change that is still valid is a snapshot change: rescanned.
+  /bin/chmod 400 "$(PSTORE alpha)/gitleaks.toml"
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(private suppressions changed\)'
+}
+
+@test "gitleaks-audit: a repaired store is re-detected without any ref change" {
+  mkrepo alpha
+  run_audit --run
+  assert_success
+  pstore alpha "$PTOML"
+  /bin/chmod o+w "$(PSTORE alpha)"
+  run_audit --run
+  assert_failure 1
+  /bin/chmod 700 "$(PSTORE alpha)"
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(private suppressions changed\)'
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  run scanned_repos
+  assert_output "alpha"
+}
+
+@test "gitleaks-audit: a store error during the weekly full pass keeps last_full; the repaired run completes it" {
+  mkrepo alpha
+  mkrepo beta
+  run_audit --run
+  grep -qx "last_full=$NOW" "$STATE/meta"
+  pstore beta "$PTOML"
+  /bin/chmod g+w "$(PSTORE beta)/gitleaks.toml"
+  NOW=$((2000000000 + 7 * 86400))
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "full pass incomplete"
+  grep -qx "last_full=2000000000" "$STATE/meta"
+  /bin/chmod 600 "$(PSTORE beta)/gitleaks.toml"
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(scans)" -eq 2 ]]
+  grep -qx "last_full=$NOW" "$STATE/meta"
+}
+
+@test "gitleaks-audit: the protected manifest is required while repos/ exists (run ERROR, scans still run)" {
+  mkrepo alpha
+  pstore alpha "$PTOML"
+  rm "$(MANIFEST)"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "protected manifest"
+  assert_output --partial "missing"
+  run scanned_repos
+  assert_output "alpha"
+  run notifies
+  assert_output --partial "error"
+  # An invalid manifest is the same kind of error.
+  manifest "alpha deadbeef:src/f1.txt:rule-a:1"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "protected manifest"
+  # Both absent: the feature is off and the run is clean.
+  rm -rf "$(PBASE)"
+  run_audit --run
+  assert_success
+}
+
+@test "gitleaks-audit: a protected fingerprint missing from a scan is an ERROR and the snapshot is not advanced" {
+  mkrepo alpha
+  findings_only alpha 1 2
+  pstore alpha "$PTOML"
+  manifest "alpha $(fp 1)"
+  run_audit --run
+  assert_success
+  local d
+  d="$(state_dir alpha)"
+  cp "$d/snapshot" "$T/snap.before"
+  # The protected finding disappears (as if suppressed).
+  commit_in alpha
+  findings_only alpha 2
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "protected fingerprint $(fp 1)"
+  cmp -s "$d/snapshot" "$T/snap.before"
+  run_audit
+  assert_line --regexp '^ *scan +alpha +'
+  run_audit --report
+  assert_output --partial "MISSING"
+}
+
+@test "gitleaks-audit: protected entries are checked every run, also for unchanged repos (against the accepted findings)" {
+  mkrepo alpha
+  findings_only alpha 1 2
+  pstore alpha "$PTOML"
+  manifest "alpha $(fp 1)"
+  run_audit --run
+  assert_success
+  # The accepted findings lose the protected fingerprint without any input
+  # change (e.g. state written by an older version): still an error daily.
+  local d
+  d="$(state_dir alpha)"
+  grep -v "$(fp 1)" "$d/findings.tsv" >"$T/f" && cp "$T/f" "$d/findings.tsv"
+  # Keep the state self-consistent (as an older or buggy writer could have
+  # left it): only settled findings are trusted without a rescan.
+  sed "s/^findings .*/findings $(shasum -a 256 <"$d/findings.tsv" | cut -d' ' -f1)/" "$d/provenance" >"$T/p" &&
+    cp "$T/p" "$d/provenance"
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 1
+  [[ "$(scans)" -eq 0 ]]
+  assert_output --partial "protected fingerprint $(fp 1)"
+  run_audit --run
+  assert_failure 1
+}
+
+@test "gitleaks-audit: a protected manifest change on an unchanged repo is detected and checked" {
+  mkrepo alpha
+  findings_only alpha 1 2
+  pstore alpha "$PTOML"
+  run_audit --run
+  assert_success
+  manifest "alpha $(fp 1)"
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(private suppressions changed\)'
+  run_audit --run
+  assert_success
+  manifest "alpha $(fp 1)" "alpha $(fp 7)"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "protected fingerprint $(fp 7)"
+}
+
+@test "gitleaks-audit: a protected entry for an excluded, missing, or undiscovered repo is an ERROR" {
+  mkrepo alpha
+  mkrepo buzz
+  pstore alpha "$PTOML"
+  mkdir -p "$(dirname "$CONFIG")"
+  echo buzz >"$CONFIG"
+  manifest "buzz $(fp 1)" "ghost/repo $(fp 2)"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "protected manifest lists buzz"
+  assert_output --partial "protected manifest lists ghost/repo"
+  run scanned_repos
+  assert_output "alpha"
+}
+
+@test "gitleaks-audit: a repo .gitleaks.toml plus a private gitleaks.toml is a repo ERROR" {
+  mkrepo alpha
+  pstore alpha "$PTOML"
+  echo 'title = "repo"' >"$CODE/alpha/.gitleaks.toml"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR alpha: private suppression store"
+  assert_output --partial ".gitleaks.toml"
+  [[ "$(scans)" -eq 0 ]]
+}
+
+@test "gitleaks-audit: suppress then unsuppress: the findings come back as known, never NEW" {
+  mkrepo alpha
+  findings_only alpha 1 2 3
+  run_audit --run
+  assert_success
+  # Suppressed via the private store: fewer findings, nothing new.
+  pstore alpha "$PTOML"
+  findings_only alpha 1
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(grep -c . "$(state_dir alpha)/findings.tsv")" -eq 1 ]]
+  # Unsuppressed again: the same fingerprints return as known.
+  rm -rf "$(PSTORE alpha)"
+  findings_only alpha 1 2 3
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(scans)" -eq 1 ]]
+  run notifies
+  assert_output ""
+  refute_output --partial "NEW"
+}
+
+@test "gitleaks-audit: provenance is published with the findings before the snapshot; a provenance write failure keeps the old snapshot" {
+  mkrepo alpha
+  findings_only alpha 1
+  pstore alpha "$PTOML"
+  run_audit --run
+  assert_success
+  local d
+  d="$(state_dir alpha)"
+  [[ -f "$d/provenance" ]]
+  grep -q "^private gitleaks.toml $(shasum -a 256 <"$(PSTORE alpha)/gitleaks.toml" | cut -d' ' -f1)$" "$d/provenance"
+  grep -q '^private gitleaksignore absent$' "$d/provenance"
+  grep -q "^findings $(shasum -a 256 <"$d/findings.tsv" | cut -d' ' -f1)$" "$d/provenance"
+  run_audit --report
+  assert_line --regexp '^== alpha \(1 findings\)'
+  refute_output --partial "unsettled"
+  refute_output --partial "stale"
+  cp "$d/snapshot" "$T/snap.before"
+  # The store changes; publishing the provenance fails.
+  printf '# edited\n' >>"$(PSTORE alpha)/gitleaks.toml"
+  mkdir "$d/provenance.tmp"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "state write failed"
+  cmp -s "$d/snapshot" "$T/snap.before"
+  rmdir "$d/provenance.tmp"
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(scans)" -eq 1 ]]
+  run_audit --report
+  refute_output --partial "unsettled"
+  refute_output --partial "stale"
+}
+
+# crash_hook <phase>: a test hook that SIGKILLs the audit at <phase>.
+# crash_hook <phase>: a test hook that, at <phase>, writes the sentinel
+# $T/crashed.<phase> and SIGKILLs the audit (assert_crashed checks both).
+crash_hook() {
+  rm -f "$T/crashed.$1"
+  cat >"$T/hook-crash" <<HOOK
+#!/bin/bash
+if [[ "\$1" == "$1" ]]; then
+  : >"$T/crashed.$1"
+  kill -KILL "\$PPID"
+fi
+exit 0
+HOOK
+  chmod +x "$T/hook-crash"
+}
+# assert_crashed <phase>: the last run died by SIGKILL at exactly <phase>.
+assert_crashed() {
+  [[ -e "$T/crashed.$1" && "$status" -eq 137 ]] || {
+    echo "the run did not die at $1 (status $status)" >&3
+    return 1
+  }
+}
+
+@test "gitleaks-audit: a crash after findings.tsv is replaced, with UNCHANGED inputs, is rescanned (unsettled), not skipped" {
+  mkrepo alpha
+  findings_only alpha 1
+  pstore alpha "$PTOML"
+  run_audit --run
+  assert_success
+  local d
+  d="$(state_dir alpha)"
+  cp "$d/snapshot" "$T/snap.before"
+  # Nothing about the inputs changes; a forced scan sees a new finding and
+  # dies between replacing findings.tsv and the provenance.
+  findings_only alpha 1 3
+  crash_hook publish-findings
+  GITLEAKS_AUDIT_TEST_HOOK="$T/hook-crash" run_audit_env --full
+  assert_crashed publish-findings
+  cmp -s "$d/snapshot" "$T/snap.before"
+  [[ "$(grep -c . "$d/findings.tsv")" -eq 2 ]]
+  run_audit --report
+  assert_line --regexp '^== alpha \(2 findings\).*unsettled'
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(unsettled'
+  # known was merged before the crash point, so the rescan finds nothing
+  # new; the NEW announcement recorded before the merge is delivered (a run
+  # that only retries a pending announcement exits 0).
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(scans)" -eq 1 ]]
+  run notifies
+  assert_output --partial "1 NEW finding(s) in 1 repo(s)"
+  run_audit --report
+  refute_output --partial "unsettled"
+  run_audit --run
+  assert_success
+  assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+}
+
+@test "gitleaks-audit: a crash between the provenance and the snapshot is unsettled and rescanned (HEAD, protected entries, or file mode changed)" {
+  local variant d
+  for variant in head protected mode; do
+    rm -rf "$CODE/alpha" "$STATE" "$(PBASE)" "$FAKE_HOME/Library/Caches/gitleaks-audit.lock"
+    mkrepo alpha
+    findings_only alpha 1
+    pstore alpha "$PTOML"
+    run_audit --run
+    assert_success
+    d="$(state_dir alpha)"
+    case "$variant" in
+      head) commit_in alpha ;;
+      protected) manifest "alpha $(fp 1)" ;;
+      mode) /bin/chmod 400 "$(PSTORE alpha)/gitleaks.toml" ;;
+    esac
+    cp "$d/snapshot" "$T/snap.before"
+    crash_hook publish-provenance
+    GITLEAKS_AUDIT_TEST_HOOK="$T/hook-crash" run_audit_env --run
+    assert_crashed publish-provenance
+    cmp -s "$d/snapshot" "$T/snap.before"
+    run_audit --report
+    assert_line --regexp '^== alpha \(1 findings\).*unsettled'
+    run_audit
+    assert_line --regexp '^ *scan +alpha +\('
+    : >"$CALLS"
+    run_audit --run
+    assert_success
+    [[ "$(scans)" -eq 1 ]]
+    run_audit --report
+    refute_output --partial "unsettled"
+  done
+}
+
+@test "gitleaks-audit: --report lists a repo whose store was removed after a scan used it (stale), even with 0 findings" {
+  mkrepo alpha
+  pstore alpha "$PTOML"
+  run_audit --run
+  assert_success
+  rm -rf "$(PSTORE alpha)"
+  run_audit --report
+  assert_success
+  assert_line --regexp '^== alpha \(0 findings\).*stale'
+}
+
+@test "gitleaks-audit: --report before any audit run lists private stores and protected entries as not yet scanned" {
+  mkrepo alpha
+  pstore alpha "$PTOML"
+  manifest "alpha $(fp 1)"
+  [[ ! -e "$STATE" ]]
+  run_audit --report
+  assert_success
+  assert_line --regexp '^== alpha \(not scanned yet\).*private: gitleaks\.toml'
+  assert_line --regexp "^  alpha +src/f1\.txt:1 rule-a \(00000000\) not scanned yet$"
+  [[ ! -e "$STATE" ]]
+}
+
+@test "gitleaks-audit: a protected manifest edited during a scan keeps that scan's snapshot from advancing" {
+  mkrepo alpha
+  findings_only alpha 1
+  pstore alpha "$PTOML"
+  run_audit --run
+  assert_success
+  local d
+  d="$(state_dir alpha)"
+  commit_in alpha
+  cp "$d/snapshot" "$T/snap.before"
+  printf '#!/bin/bash\necho "# edited mid-scan" >>"%s"\n' "$(MANIFEST)" >"$FIX/during.alpha"
+  chmod +x "$FIX/during.alpha"
+  run_audit --run
+  assert_success
+  assert_output --partial "protected manifest changed during the scan"
+  cmp -s "$d/snapshot" "$T/snap.before"
+  rm "$FIX/during.alpha"
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(scans)" -eq 1 ]]
+  ! cmp -s "$d/snapshot" "$T/snap.before"
+}
+
+@test "gitleaks-audit: a store that stops validating during the scan is a repo ERROR and nothing is published" {
+  mkrepo alpha
+  findings_only alpha 1
+  pstore alpha "$PTOML"
+  run_audit --run
+  assert_success
+  local d f
+  d="$(state_dir alpha)"
+  commit_in alpha
+  findings_only alpha 1 3
+  for f in snapshot findings.tsv provenance known; do cp "$d/$f" "$T/$f.before"; done
+  # A parent dir turns group-writable mid-scan (not part of the snapshot).
+  printf '#!/bin/bash\n/bin/chmod g+w "%s"\n' "$(PSTORE alpha)" >"$FIX/during.alpha"
+  chmod +x "$FIX/during.alpha"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR alpha: private suppression store changed during the scan"
+  for f in snapshot findings.tsv provenance known; do cmp -s "$d/$f" "$T/$f.before"; done
+  run notifies
+  refute_output --partial "NEW"
+}
+
+@test "gitleaks-audit: protected rels are matched literally (no escape decoding)" {
+  fn_src protected_fps >"$T/fn.sh"
+  [[ -s "$T/fn.sh" ]]
+  printf '%s\t%s\n' 'dir\name' "$(fp 1)" 'dir' "$(fp 2)" >"$T/prot"
+  run env PROT_FILE="$T/prot" /bin/bash -c '. "$1"; protected_fps "$2"' _ "$T/fn.sh" 'dir\name'
+  assert_output "$(fp 1)"
+}
+
+@test "gitleaks-audit: protected manifest rels with a backslash or control character are a run ERROR" {
+  mkrepo alpha
+  pstore alpha "$PTOML"
+  local bad
+  for bad in 'we\ird' "$(printf 'ta\tb')" "$(printf 'c\001r')"; do
+    manifest "$bad $(fp 1)"
+    run_audit --run
+    assert_failure 1
+    assert_output --partial "backslash or control character"
+  done
+}
+
+@test "gitleaks-audit: --report lists every repo with a private store (0 findings too), marks stale stores, flags repo .gitleaksignore, lists protected" {
+  mkrepo alpha
+  mkrepo beta
+  mkrepo gamma
+  findings_only beta 1 2
+  pstore alpha "$PTOML"
+  manifest "beta $(fp 1)"
+  echo "$(fp 2)" >"$CODE/beta/.gitleaksignore"
+  run_audit --run
+  assert_success
+  run_audit --report
+  assert_success
+  assert_line --regexp '^== alpha \(0 findings\).*private: gitleaks\.toml'
+  assert_line --regexp '^== beta \(2 findings\).*repo \.gitleaksignore'
+  refute_output --regexp '== gamma'
+  assert_output --partial "Protected"
+  assert_line --regexp "^  beta +src/f1\.txt:1 rule-a \(00000000\) present$"
+  refute_output --partial "stale"
+  printf '# edited\n' >>"$(PSTORE alpha)/gitleaks.toml"
+  run_audit --report
+  assert_line --regexp '^== alpha \(0 findings\).*stale'
+  assert_no_marker
+}
+
+@test "gitleaks-audit: a dry run reports a store error and writes nothing" {
+  mkrepo alpha
+  pstore alpha "$PTOML"
+  /bin/chmod g+w "$(PSTORE alpha)/gitleaks.toml"
+  run_audit
+  assert_success
+  assert_line --regexp '^ *error +alpha +\(private suppression store'
+  [[ ! -e "$STATE" ]]
+  [[ ! -e "$LOGF" ]]
+}
+
+# --- private suppressions with the real gitleaks binary (history) ---------------
+
+use_real_gitleaks() {
+  local real
+  real="$(command -v gitleaks 2>/dev/null)" || skip "gitleaks not installed"
+  [[ -n "$real" && "$real" != "$STUBS/gitleaks" ]] || skip "gitleaks not installed"
+  rm -f "$STUBS/gitleaks"
+  ln -s "$real" "$STUBS/gitleaks"
+}
+
+# rcommit <rel> <path> <content>: commit a file (no hooks).
+rcommit() {
+  mkdir -p "$(dirname "$CODE/$1/$2")"
+  printf '%s\n' "$3" >"$CODE/$1/$2"
+  git -C "$CODE/$1" add -- "$2"
+  git -C "$CODE/$1" commit -q --no-verify -m "add $2"
+}
+findings_tsv() { cat "$(state_dir "$1")/findings.tsv"; }
+
+@test "gitleaks-audit (real gitleaks): a full-SHA private fingerprint suppresses a history finding; a short SHA is rejected" {
+  use_real_gitleaks
+  mkrepo alpha
+  local key
+  key="AKIA$(LC_ALL=C tr -dc 'A-Z2-7' </dev/urandom | head -c 16)"
+  rcommit alpha creds.txt "aws_access_key_id = $key"
+  run_audit --run
+  assert_success
+  local f
+  f="$(cut -f5 "$(state_dir alpha)/findings.tsv")"
+  [[ "$f" =~ ^[0-9a-f]{40}:creds\.txt:aws-access-token:1$ ]]
+  # Short SHA: a store error (gitleaks would silently not match it).
+  pstore alpha "" "${f:0:12}${f:40}"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "gitleaksignore"
+  # Full SHA: suppressed.
+  pstore alpha "" "$f"
+  run_audit --run
+  assert_success
+  [[ ! -s "$(state_dir alpha)/findings.tsv" ]]
+  ! grep -rqF "$key" "$STATE" "$LOGF"
+}
+
+@test "gitleaks-audit (real gitleaks): a short-SHA fingerprint does not suppress in gitleaks itself (why the grammar requires full SHAs)" {
+  [[ -n "$(command -v gitleaks)" ]] || skip "gitleaks not installed"
+  mkrepo alpha
+  local key full
+  key="AKIA$(LC_ALL=C tr -dc 'A-Z2-7' </dev/urandom | head -c 16)"
+  rcommit alpha creds.txt "aws_access_key_id = $key"
+  full="$(git -C "$CODE/alpha" rev-parse HEAD):creds.txt:aws-access-token:1"
+  echo "${full:0:12}${full:40}" >"$T/short.ignore"
+  echo "$full" >"$T/full.ignore"
+  local gl
+  gl="$(command -v gitleaks)"
+  # Hermetic: no ambient GITLEAKS_CONFIG*, HOME, or PATH.
+  run env -i HOME="$FAKE_HOME" PATH="$STUBS:/usr/bin:/bin" "$gl" git --no-banner --redact=100 --exit-code=10 \
+    --gitleaks-ignore-path "$T/short.ignore" "$CODE/alpha"
+  [[ "$status" -eq 10 ]]
+  run env -i HOME="$FAKE_HOME" PATH="$STUBS:/usr/bin:/bin" "$gl" git --no-banner --redact=100 --exit-code=10 \
+    --gitleaks-ignore-path "$T/full.ignore" "$CODE/alpha"
+  [[ "$status" -eq 0 ]]
+}
+
+@test "gitleaks-audit (real gitleaks): content-shaped allowlists suppress in history, but a second credential on the line still fires (both shapes)" {
+  use_real_gitleaks
+  mkrepo alpha
+  local h a toml
+  # Fixed (derived at runtime): random hex can fall under the entropy threshold.
+  h="$(printf 'plan-f-fixture-1' | shasum | cut -c1-40)"
+  a="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
+  toml='[extend]
+useDefault = true
+
+[[allowlists]]
+targetRules = ['"'"'generic-api-key'"'"']
+condition = "AND"
+paths = ['"'"'^tools/tokens\.json$'"'"']
+regexTarget = "line"
+regexes = ['"'"'^\n?[ \t]*"key": "[0-9a-f]{40}",?$'"'"']
+
+[[allowlists]]
+targetRules = ['"'"'generic-api-key'"'"']
+condition = "AND"
+paths = ['"'"'^src/schema/models\.py$'"'"']
+regexTarget = "line"
+regexes = ['"'"'^\n? +(?:[a-z0-9_]+: [A-Za-z\[\]]+ = field\(metadata=\{"data_key": "[A-Za-z0-9]+"\}\)|(?:default=None, )?metadata=\{"data_key": "[A-Za-z0-9]+"\})$'"'"']'
+  rcommit alpha tools/tokens.json "{
+        \"key\": \"$h\",
+        \"name\": \"x\"
+}"
+  rcommit alpha src/schema/models.py "class M:
+    clicks: int = field(metadata={\"data_key\": \"fixtureColumnKqzVw7d\"})
+    other: int = field(
+        default=None, metadata={\"data_key\": \"fixtureColumnPmxRt9d\"}
+    )"
+  # Control: both shapes are findings without the store.
+  run_audit --run
+  assert_success
+  run findings_tsv alpha
+  assert_output --partial "tools/tokens.json"
+  assert_output --partial "src/schema/models.py"
+  pstore alpha "$toml"
+  run_audit --run
+  assert_success
+  [[ ! -s "$(state_dir alpha)/findings.tsv" ]]
+  # Same-line second credentials (both shapes) still fire in history.
+  rcommit alpha tools/tokens.json "{
+        \"key\": \"$h\", \"api_key\": \"$a\",
+}"
+  rcommit alpha src/schema/models.py "class M:
+    clicks: int = field(metadata={\"data_key\": \"fixtureColumnKqzVw7d\"}); api_key = \"$a\""
+  run_audit --run
+  assert_failure 10
+  run findings_tsv alpha
+  assert_output --partial "tools/tokens.json"
+  assert_output --partial "src/schema/models.py"
+  run ! grep -rqF "$a" "$STATE" "$LOGF"
+  ! grep -rqF "$h" "$STATE" "$LOGF"
+}
+
+@test "gitleaks-audit: a NEW finding from an interrupted publication (unchanged inputs) is announced exactly once, whatever the crash point" {
+  local phase n
+  for phase in publish-start publish-pending publish-known publish-findings publish-provenance publish-snapshot; do
+    rm -rf "$CODE/alpha" "$STATE" "$(PBASE)" "$FAKE_HOME/Library/Caches/gitleaks-audit.lock"
+    mkrepo alpha
+    findings_only alpha 1
+    run_audit --run
+    assert_success
+    # Same inputs, one extra fingerprint; the forced scan dies mid-publication.
+    findings_only alpha 1 3
+    crash_hook "$phase"
+    GITLEAKS_AUDIT_TEST_HOOK="$T/hook-crash" run_audit_env --full
+    assert_crashed "$phase"
+    : >"$CALLS"
+    # First recovery run: the open publication forces a rescan. Before the
+    # pending write the rescan itself finds the NEW fingerprint (exit 10);
+    # afterwards it is already pending and only delivered (exit 0).
+    run_audit --run
+    assert_line --regexp '^ *scan +alpha +\(unsettled'
+    if [[ "$phase" == publish-start ]]; then
+      assert_failure 10
+    else
+      assert_success
+    fi
+    run notifies
+    assert_output --partial "1 NEW finding(s) in 1 repo(s)"
+    run_audit --run
+    assert_success
+    run_audit --full
+    assert_success
+    n="$(grep -c 'NEW' "$CALLS" || true)"
+    if [[ "$n" -ne 1 ]] || ! grep -q '1 NEW finding(s) in 1 repo(s)' "$CALLS"; then
+      echo "$phase: NEW announced $n times" >&3
+      false
+    fi
+    grep -qx "$(fp 3)" "$(state_dir alpha)/known"
+    [[ ! -e "$STATE/pending-announce" ]]
+    run_audit
+    assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+  done
+}
+
+@test "gitleaks-audit: pending announcements are per fingerprint (idempotent) and the legacy count format is still read" {
+  mkrepo alpha
+  findings_only alpha 1 2
+  echo 1 >"$FIX/osascript_rc"
+  run_audit --run
+  assert_success
+  run cat "$STATE/pending-announce"
+  assert_line "baselined	alpha	$(fp 1)"
+  assert_line "baselined	alpha	$(fp 2)"
+  # A pending file in the older "<kind> <count> <rel>" form still counts.
+  printf 'new\t3\tlegacy repo\n' >>"$STATE/pending-announce"
+  rm "$FIX/osascript_rc"
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  run notifies
+  assert_output --partial "3 NEW finding(s) in 1 repo(s)"
+  assert_output --partial "2 existing findings in 1 repos baselined"
+}
+
+@test "gitleaks-audit: migration: state without provenance (older version, no store) is rescanned once, silently, then skipped" {
+  mkrepo alpha
+  findings_only alpha 1 2
+  run_audit --run
+  assert_success
+  local d
+  d="$(state_dir alpha)"
+  rm -f "$d/provenance" "$d/publishing"
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(scans)" -eq 1 ]]
+  run notifies
+  assert_output ""
+  [[ -f "$d/provenance" ]]
+  : >"$CALLS"
+  run_audit --run
+  assert_success
+  [[ "$(scans)" -eq 0 ]]
+  run notifies
+  assert_output ""
+}
+
+@test "gitleaks-audit: --report lists a private store directory that holds no files, before and after a scan" {
+  mkrepo alpha
+  pstore alpha
+  run_audit --report
+  assert_success
+  assert_line --regexp '^== alpha \(not scanned yet\).*private store dir: no files'
+  run_audit --run
+  assert_success
+  run_audit --report
+  assert_line --regexp '^== alpha \(0 findings\).*private store dir: no files'
+}
+
+@test "gitleaks-audit: findings from inputs that moved and then reverted are not trusted (provenance snapshot identity forces a rescan)" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  local d
+  d="$(state_dir alpha)"
+  cp "$d/snapshot" "$T/snap.before"
+  # Inputs move (a new ref), and move back while gitleaks is scanning: the
+  # snapshot is held back at the old inputs, which are current again.
+  git -C "$CODE/alpha" branch tmp
+  findings_only alpha 1 3
+  printf '#!/bin/bash\ngit update-ref -d refs/heads/tmp\n' >"$FIX/during.alpha"
+  chmod +x "$FIX/during.alpha"
+  run_audit --run
+  assert_output --partial "snapshot not advanced"
+  cmp -s "$d/snapshot" "$T/snap.before"
+  rm "$FIX/during.alpha"
+  # Inputs equal the stored snapshot, but the published findings came from
+  # other inputs: rescan, never skip.
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(unsettled'
+  run_audit --report
+  assert_line --regexp '^== alpha .*unsettled'
+}
+
+# new_notifications: how many notifications so far announced NEW findings.
+new_notifications() { grep -c '^osascript .*NEW' "$CALLS" || true; }
+
+@test "gitleaks-audit: a known write failure after the NEW finding was recorded announces it exactly once" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  local d
+  d="$(state_dir alpha)"
+  commit_in alpha
+  findings_only alpha 1 3
+  mkdir "$d/known.tmp"
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "state write failed"
+  run notifies
+  assert_output --partial "1 NEW finding(s) in 1 repo(s)"
+  # Delivered but not yet in known: kept (marked delivered), never re-counted.
+  [[ -s "$STATE/pending-announce" ]]
+  [[ "$(/usr/bin/stat -f %Lp "$STATE/pending-announce")" == "600" ]]
+  rmdir "$d/known.tmp"
+  run_audit --run
+  assert_success
+  run_audit --run
+  assert_success
+  run_audit --full
+  assert_success
+  [[ "$(new_notifications)" -eq 1 ]]
+  grep -qx "$(fp 3)" "$d/known"
+  [[ ! -e "$STATE/pending-announce" ]]
+}
+
+@test "gitleaks-audit: a pending-announcement write failure announces nothing yet, and the NEW finding exactly once later" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  commit_in alpha
+  findings_only alpha 1 3
+  mkdir "$STATE/pending-announce.tmp"
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 1
+  [[ "$(new_notifications)" -eq 0 ]]
+  run ! grep -qx "$(fp 3)" "$(state_dir alpha)/known"
+  rmdir "$STATE/pending-announce.tmp"
+  run_audit --run
+  assert_failure 10
+  run_audit --run
+  assert_success
+  run_audit --full
+  assert_success
+  [[ "$(new_notifications)" -eq 1 ]]
+}
+
+@test "gitleaks-audit: a marker-removal failure is an incomplete publication: error, rescan, no repeated NEW" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  local d
+  d="$(state_dir alpha)"
+  commit_in alpha
+  findings_only alpha 1 3
+  cat >"$T/hook-lockdir" <<HOOK
+#!/bin/bash
+[[ "\$1" == publish-snapshot ]] && /bin/chmod 500 "$d"
+exit 0
+HOOK
+  chmod +x "$T/hook-lockdir"
+  : >"$CALLS"
+  GITLEAKS_AUDIT_TEST_HOOK="$T/hook-lockdir" run_audit_env --run
+  /bin/chmod 700 "$d"
+  assert_failure 1
+  assert_output --partial "publication incomplete"
+  refute_output --partial "old snapshot kept"
+  [[ -e "$d/publishing" ]]
+  run_audit
+  assert_line --regexp '^ *scan +alpha +\(unsettled'
+  run_audit --run
+  assert_success
+  run_audit --run
+  assert_success
+  assert_line --regexp '^ *skip +alpha +\(unchanged\)'
+  [[ "$(new_notifications)" -eq 1 ]]
+}
+
+@test "gitleaks-audit: a known write failure during the first (baseline) scan announces the baseline exactly once" {
+  mkrepo alpha
+  findings_only alpha 1 2
+  local d
+  d="$STATE/repos/$(printf '%s' alpha | shasum -a 256 | cut -c1-16)"
+  mkdir -p "$d/known.tmp"
+  /bin/chmod 700 "$FAKE_HOME/Library" "$FAKE_HOME/Library/Application Support" "$STATE" "$STATE/repos" "$d"
+  run_audit --run
+  assert_failure 1
+  run notifies
+  assert_output --partial "2 existing findings in 1 repos baselined"
+  rmdir "$d/known.tmp"
+  run_audit --run
+  assert_success
+  run_audit --full
+  assert_success
+  [[ "$(grep -c '^osascript .*baselined' "$CALLS")" -eq 1 ]]
+  [[ "$(grep -c '^osascript .*NEW' "$CALLS" || true)" -eq 0 ]]
+  [[ "$(grep -c . "$d/known")" -eq 2 ]]
+  [[ ! -e "$STATE/pending-announce" ]]
+}
+
+@test "gitleaks-audit: a pending rewrite failure after delivery is an ERROR (exit 1); the announcement repeats at most once, then settles" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  commit_in alpha
+  findings_only alpha 1 3
+  # Delivery succeeds, then the pending temp path is obstructed.
+  printf '#!/bin/bash\nmkdir -p "%s"\n' "$STATE/pending-announce.tmp" >"$FIX/after_notify"
+  chmod +x "$FIX/after_notify"
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 1
+  assert_output --partial "ERROR: notification delivered but $STATE/pending-announce could not be updated"
+  grep -q 'ERROR: notification delivered but' "$LOGF"
+  grep -q 'exit=1' "$STATE/last-run"
+  [[ "$(new_notifications)" -eq 1 ]]
+  rm -f "$FIX/after_notify"
+  rmdir "$STATE/pending-announce.tmp"
+  # Documented exception: repeated once, then settled.
+  run_audit --run
+  assert_success
+  [[ "$(new_notifications)" -eq 2 ]]
+  [[ ! -e "$STATE/pending-announce" ]]
+  run_audit --run
+  assert_success
+  run_audit --full
+  assert_success
+  [[ "$(new_notifications)" -eq 2 ]]
+}
+
+@test "gitleaks-audit: delivered status and pruning are per repo when two repos share a fingerprint" {
+  mkrepo alpha
+  mkrepo beta
+  findings_only alpha 1
+  findings_only beta 1
+  run_audit --run
+  assert_success
+  commit_in alpha
+  commit_in beta
+  findings_only alpha 1 3
+  findings_only beta 1 3
+  local da db
+  da="$(state_dir alpha)"
+  db="$(state_dir beta)"
+  mkdir "$da/known.tmp"
+  : >"$CALLS"
+  run_audit --run
+  assert_failure 1
+  run notifies
+  assert_output --partial "2 NEW finding(s) in 2 repo(s)"
+  # beta's fingerprint reached beta's known: settled and dropped. alpha's
+  # identical fingerprint did not reach alpha's known: kept as delivered.
+  run cat "$STATE/pending-announce"
+  assert_output "new.delivered	alpha	$(fp 3)"
+  grep -qx "$(fp 3)" "$db/known"
+  run ! grep -qx "$(fp 3)" "$da/known"
+  rmdir "$da/known.tmp"
+  run_audit --run
+  assert_success
+  run_audit --full
+  assert_success
+  [[ "$(new_notifications)" -eq 1 ]]
+  grep -qx "$(fp 3)" "$da/known"
+  [[ ! -e "$STATE/pending-announce" ]]
 }

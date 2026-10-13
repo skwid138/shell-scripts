@@ -36,6 +36,11 @@ Modes:
   --full        Like --run, but scan every repo regardless of changes.
   --report      Print current findings (reduced fields only), grouped
                 repo -> rule -> file:line (commit), plus rotation guidance.
+                Also lists every repo with a private store (even with 0
+                findings; "stale" when the store changed since its last
+                scan, "unsettled" when findings, provenance and snapshot
+                disagree), repos with a repo .gitleaksignore, and every
+                protected entry (present / MISSING).
   --install     Render the launchd template into
                 ~/Library/LaunchAgents/com.skwid138.gitleaks-audit.plist and
                 bootstrap it (runs --run daily at 11:00; not started now).
@@ -51,7 +56,10 @@ What a scan runs (cwd = the repo; GITLEAKS_CONFIG/GITLEAKS_CONFIG_TOML unset,
 so the effective config is the repo's .gitleaks.toml/.gitleaksignore or the
 gitleaks default):
   gitleaks git --redact=100 --no-banner --exit-code=10 \
-    --report-format=json --report-path=<private tmp> .
+    --report-format=json --report-path=<private tmp> \
+    [--config <store>/gitleaks.toml] [--gitleaks-ignore-path <store>/gitleaksignore] .
+The bracketed flags are added only for private store files that exist and
+pass validation (see Private suppressions).
 Each scan runs in its own process group under a watchdog; on timeout or
 interruption the whole group gets TERM, then KILL.
 
@@ -62,7 +70,8 @@ and .gitleaksignore (or "absent") and of each file in its [extend] path chain
 (depth <= 5; relative paths resolve against the repo; "missing" recorded; a
 path that is not a simple one-line string without backslashes is never
 decoded: the repo is logged with a WARNING and rescanned every run),
-and the gitleaks version. The snapshot is persisted only after a complete scan (rc 0 or 10,
+the sha256, owner and mode of each private store file and the repo's
+protected manifest entries (when present), and the gitleaks version. The snapshot is persisted only after a complete scan (rc 0 or 10,
 report parsed and reduced, state written) whose refs did not move mid-scan.
 
 Discovery: directories named .git up to 3 levels below ~/code (node_modules
@@ -73,13 +82,72 @@ Excludes: ~/.config/gitleaks-audit/config — one repo path per line, relative
 to ~/code (# comments and blank lines ignored). Absent = no excludes. Present
 but unreadable = error (nothing scanned).
 
+Private suppressions (this machine only; shared with gitleaks-hook.sh, never
+committed to the scanned repos):
+  ~/.config/gitleaks-audit/repos/<rel>/gitleaks.toml   -> --config
+  ~/.config/gitleaks-audit/repos/<rel>/gitleaksignore  -> --gitleaks-ignore-path
+  ~/.config/gitleaks-audit/protected                   rotate-first findings
+<rel> is the repo's path under ~/code. Every run validates each repo's store
+BEFORE deciding whether the repo is unchanged: every path from $HOME down to
+each file must be a real (non-symlink) directory/file owned by you, not
+group/other writable, with no ACL entry letting anyone else write (deny
+entries are fine; unrecognized ACL lines fail closed; paths above $HOME are
+not checked). gitleaks.toml must be `[extend] useDefault = true` plus
+[[allowlists]] blocks that each target exactly one rule with condition "AND",
+one-line arrays of fully anchored single-quoted paths and line regexes (a
+strict RE2 subset: ^...$ with no quantified or mid-pattern anchor and only
+the exact optional prefix ^\n?, whitelisted escapes only (no \Q..\E), no
+unescaped . or negated [^...] classes, only (...) and (?:...) groups, no
+top-level |; how narrow a pattern is stays a review responsibility), and
+regexTarget "line"; gitleaksignore may hold only full-SHA history
+fingerprints (<40-hex commit>:<file>:<rule>:<line>). A repo with its own
+.gitleaks.toml cannot also have a private gitleaks.toml. Any violation is an
+ERROR for that repo: it is not scanned, none of its state is written, other
+repos continue, and the run exits 1 (daily, until fixed; it also keeps a
+weekly full pass incomplete). A repaired store is rescanned without any ref
+change. The repo's own .gitleaksignore and inline `gitleaks:allow` stay
+trusted (--report flags repos with a repo .gitleaksignore).
+The protected manifest lists `<rel> <full fingerprint>` per line (# comments
+and blank lines ignored). It is required whenever repos/ exists (missing or
+invalid = a run ERROR; scans still run) and is validated like the store.
+Every run checks every entry: against the fresh results of a scanned repo,
+or the accepted findings of an unchanged one. A protected fingerprint that
+is missing (e.g. suppressed) is an ERROR and keeps that repo's snapshot from
+advancing; an entry whose repo is excluded, missing, or not discovered is an
+ERROR. Each scan publishes a provenance file (the findings hash, the hash of
+the input snapshot it read, and the private file hashes it used) together
+with its findings, before the snapshot. A repo counts as unchanged only when
+findings, provenance and snapshot agree and no publication is open (each
+publication is bracketed by a `publishing` marker); otherwise (an
+interrupted publication, a held-back snapshot, or state from before
+provenance existed) it is rescanned as "unsettled". Baselined/NEW
+fingerprints are recorded in the pending announcement file before they are
+merged into known, and NEW means "in neither known nor pending", so a
+process crash or a failed state write never loses or repeats one. Limits:
+a crash after a notification is shown but before the pending file is
+rewritten re-announces it once; a failed pending-file write after a
+notification has been shown may repeat that announcement once (the run
+exits 1); state files are not fsync'ed, so a power loss can lose or repeat
+an announcement. After each scan the store is
+validated again:
+if it no longer validates, nothing is published for that repo (ERROR); a
+protected manifest edited during the scan keeps the snapshot from advancing.
+Private suppressions require macOS (BSD stat and ACLs).
+
 Baseline: the first complete scan of a repo records its findings as known and
 the notification says "N existing findings in M repos baselined — run
 `gitleaks-audit.sh --report`". Afterwards only NEW fingerprints and errors
 notify; clean or known-only runs are silent. A baseline/NEW announcement
 whose notification is not delivered (osascript missing or failing, or
---no-notify) is kept in the state dir (counts and repo names only) and
-retried by every later --run until delivered. Dry runs read state (pending
+--no-notify) is kept in the state dir and retried by every later --run until
+delivered. The pending file (600, in the 700 state dir) holds one line per
+fingerprint: kind, repo path, and the fingerprint (commit, file path, rule,
+line; never a secret value). A delivered entry whose fingerprint did not
+reach known (its publication failed) stays, marked delivered, so it is
+neither announced again nor reported as NEW; it is dropped once that repo's
+known has it. If it never does (the finding disappeared or was suppressed
+before the repo recovered, or the repo was excluded or removed), it is kept
+indefinitely on purpose, so a later reappearance is not reported as NEW. Dry runs read state (pending
 announcement counts, the last full scan time, repo snapshots) to show what
 --run would do, but never write, merge, or clear it, even when they fail.
 
@@ -99,7 +167,8 @@ Exit codes:
   0   clean, or only known findings
   10  new findings (and no errors)
   1   any error (scan error/timeout, malformed report, state or log write
-      failure, discovery or config failure, or a lock infrastructure
+      failure, discovery or config failure, a private store or protected
+      manifest error, a missing protected fingerprint, or a lock infrastructure
       failure: lock parent not a writable directory, a non-directory at the
       lock path, reclaim mutex file unopenable or its perl helper or flock
       failing, or a stale lock that cannot be removed); new findings are
@@ -119,6 +188,8 @@ Environment overrides (tests/advanced use):
                              owner pid is reclaimed (default 21600 = 6h)
   GITLEAKS_AUDIT_RECLAIM_WAIT  seconds to wait for the reclaim mutex (default 10)
   GITLEAKS_AUDIT_TEST_HOOK   test-only: command run at lock decision points
+  GITLEAKS_SUPPRESS_DIR      tests only: private store base dir instead of
+                             ~/.config/gitleaks-audit (not a security boundary)
 EOF
 }
 
@@ -157,6 +228,8 @@ NOTIFIER="${GITLEAKS_AUDIT_NOTIFIER:-osascript}"
 PERL="${GITLEAKS_AUDIT_PERL:-/usr/bin/perl}"
 [[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die_usage "GITLEAKS_AUDIT_TIMEOUT must be a positive integer"
 [[ "$GRACE" =~ ^[0-9]+$ ]] || die_usage "GITLEAKS_AUDIT_KILL_GRACE must be a non-negative integer"
+# shellcheck source=../lib/gitleaks-private.sh
+source "$SCRIPT_DIR/../lib/gitleaks-private.sh"
 
 ROOT="$HOME/code"
 MAX_DEPTH=3
@@ -808,6 +881,7 @@ snapshot() {
       fi
     done
     snapshot_extends "$abs" "$abs/.gitleaks.toml" || return 1
+    snapshot_private || return 1
     if head="$(git -C "$abs" rev-parse --verify -q HEAD 2>/dev/null)"; then
       printf 'head %s\n' "$head"
     else
@@ -820,6 +894,28 @@ snapshot() {
     git -C "$abs" worktree list --porcelain 2>/dev/null |
       awk '/^worktree /{ n++; w = substr($0, 10) } /^HEAD / && n > 1 { print "worktree " $2 " " w }' || return 1
   } >"$out"
+}
+
+# snapshot_private: the private store inputs of the current repo (CUR_PRIV
+# is its store dir, empty when the feature is off): sha256, owner and mode of
+# each private file that exists, and the hash of the repo's protected
+# manifest entries. Nothing is printed when there is neither, so snapshots of
+# repos without a store keep their pre-store form.
+snapshot_private() {
+  local f h rc
+  if [[ -n "$CUR_PRIV" ]]; then
+    for f in gitleaks.toml gitleaksignore; do
+      glp_lstat "$CUR_PRIV/$f"
+      rc=$?
+      [[ $rc -eq 1 ]] && continue
+      [[ $rc -eq 0 ]] || return 1
+      h="$(sha256_file "$CUR_PRIV/$f")"
+      [[ -n "$h" ]] || return 1
+      printf 'private %s %s uid=%s mode=%s\n' "$f" "$h" "$GLP_ST_UID" "$GLP_ST_MODE"
+    done
+  fi
+  [[ -n "$CUR_PROT_HASH" ]] && printf 'protected %s\n' "$CUR_PROT_HASH"
+  return 0
 }
 
 # change_reason <old> <new>: comma list of what changed; empty = unchanged.
@@ -835,6 +931,7 @@ change_reason() {
   [[ "$(grep '^head ' "$old")" == "$(grep '^head ' "$new")" ]] || r="$r, HEAD moved"
   [[ "$(grep '^ref ' "$old")" == "$(grep '^ref ' "$new")" ]] || r="$r, refs changed"
   [[ "$(grep '^worktree ' "$old")" == "$(grep '^worktree ' "$new")" ]] || r="$r, worktree HEADs changed"
+  [[ "$(grep -E '^(private|protected) ' "$old")" == "$(grep -E '^(private|protected) ' "$new")" ]] || r="$r, private suppressions changed"
   [[ -n "$r" ]] || r=", inputs changed"
   echo "${r#, }"
 }
@@ -864,6 +961,198 @@ meta_set() {
   } >"$tmp" 2>/dev/null && mv -f "$tmp" "$META_FILE" 2>/dev/null
 }
 
+# --- private suppressions -------------------------------------------------------
+
+PRIV_ON=0    # 1 when the private store or the protected manifest exists
+PROT_OK=0    # 1 when the protected manifest was validated and loaded
+PROT_FILE="" # "<rel>\t<fingerprint>" lines (sorted, unique)
+PROT_SEEN="" # rels evaluated this run (scanned, skipped, or errored)
+PRIV_INIT_ERR=""
+CUR_PRIV="" # the current repo's store dir ($GLP_REPOS/<rel>) when PRIV_ON
+CUR_TOML="" # validated private files of the current repo (or empty)
+CUR_IGNORE=""
+CUR_PROT_HASH="" # hash of the current repo's protected entries (or empty)
+
+# priv_init: detect the feature and load the protected manifest. Both the
+# store (repos/) and the manifest absent = feature off. Returns 1 (with
+# PRIV_INIT_ERR) when repos/ exists without a manifest, or the manifest fails
+# validation; protected checks are then skipped for this run (a run error).
+priv_init() {
+  local rc line n=0 re
+  PROT_FILE="$WORK/protected"
+  PROT_SEEN="$WORK/prot-seen"
+  : >"$PROT_FILE"
+  : >"$PROT_SEEN"
+  PRIV_ON=0
+  PROT_OK=0
+  glp_store_present || return 0
+  PRIV_ON=1
+  glp_lstat "$GLP_PROTECTED"
+  if [[ $? -eq 1 ]]; then
+    PRIV_INIT_ERR="protected manifest $GLP_PROTECTED is missing (required whenever $GLP_REPOS exists; it may hold only comments)"
+    return 1
+  fi
+  glp_check_base
+  rc=$?
+  [[ $rc -eq 0 ]] && {
+    glp_check_node "$GLP_PROTECTED" file
+    rc=$?
+  }
+  if [[ $rc -ne 0 ]]; then
+    PRIV_INIT_ERR="protected manifest: ${GLP_ERR:-$GLP_PROTECTED is missing}"
+    return 1
+  fi
+  if ! { : <"$GLP_PROTECTED"; } 2>/dev/null; then
+    PRIV_INIT_ERR="protected manifest $GLP_PROTECTED is not readable"
+    return 1
+  fi
+  re='^(.+) ([0-9a-f]{40}:[^: ]+:[a-z0-9-]+:[0-9]+)$'
+  : >"$WORK/protected.raw"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ $re ]] && glp_bad_rel "${BASH_REMATCH[1]}"; then
+      PRIV_INIT_ERR="protected manifest $GLP_PROTECTED line $n: the repo path contains a backslash or control character"
+      return 1
+    fi
+    if [[ "$line" =~ $re ]] && [[ "${BASH_REMATCH[1]}" != /* && "${BASH_REMATCH[1]}" != ./* &&
+      "${BASH_REMATCH[1]}" != */ ]]; then
+      printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >>"$WORK/protected.raw"
+    else
+      PRIV_INIT_ERR="protected manifest $GLP_PROTECTED line $n: expected '<rel> <40-hex-commit>:<file>:<rule>:<line>'"
+      return 1
+    fi
+  done <"$GLP_PROTECTED"
+  LC_ALL=C sort -u "$WORK/protected.raw" >"$PROT_FILE" || return 1
+  PROT_MANIFEST_SHA="$(manifest_sha)"
+  PROT_OK=1
+  return 0
+}
+
+# manifest_sha: the protected manifest's current content hash ("absent").
+PROT_MANIFEST_SHA=""
+manifest_sha() {
+  local h
+  if [[ -f "$GLP_PROTECTED" ]]; then
+    h="$(sha256_file "$GLP_PROTECTED")"
+    printf '%s' "${h:-unreadable}"
+  else
+    printf 'absent'
+  fi
+}
+
+# protected_fps <rel>: the repo's protected fingerprints. The rel is passed
+# through the environment (awk -v would decode backslash escapes).
+protected_fps() {
+  GLP_PROT_REL="$1" awk -F'\t' '$1 == ENVIRON["GLP_PROT_REL"] { print $2 }' "$PROT_FILE" 2>/dev/null
+}
+
+protected_hash() {
+  local fps
+  fps="$(protected_fps "$1")"
+  [[ -n "$fps" ]] || return 0
+  printf '%s\n' "$fps" | shasum -a 256 | awk '{print $1}'
+}
+
+# priv_repo <abs> <rel>: validate the repo's private store (identity, chain,
+# files, grammar, collision with a repo .gitleaks.toml) and set CUR_*.
+# Returns 1 with GLP_ERR on any problem. Runs BEFORE the unchanged check.
+priv_repo() {
+  local abs="$1" rel="$2"
+  CUR_PRIV=""
+  CUR_TOML=""
+  CUR_IGNORE=""
+  CUR_PROT_HASH=""
+  [[ "$PRIV_ON" -eq 1 ]] || return 0
+  if ! glp_identity "$abs"; then
+    GLP_ERR="cannot resolve the repo identity under $ROOT"
+    return 1
+  fi
+  if [[ "$GLP_REL" != "$rel" ]]; then
+    GLP_ERR="store identity '$GLP_REL' differs from the discovered path '$rel'"
+    return 1
+  fi
+  glp_resolve "$rel" || return 1
+  glp_collision "$abs" || return 1
+  CUR_PRIV="$GLP_REPOS/$rel"
+  CUR_TOML="$GLP_TOML"
+  CUR_IGNORE="$GLP_IGNORE"
+  [[ "$PROT_OK" -eq 1 ]] && CUR_PROT_HASH="$(protected_hash "$rel")"
+  return 0
+}
+
+# protected_check <rel> <sorted-fps-file> <what>: an ERROR for each of the
+# repo's protected fingerprints missing from the file. 1 if any is missing.
+protected_check() {
+  local rel="$1" fps="$2" what="$3" f missing=0
+  [[ "$PROT_OK" -eq 1 ]] || return 0
+  protected_fps "$rel" >"$WORK/prot.want"
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if ! grep -qxF -- "$f" "$fps" 2>/dev/null; then
+      record_error "$rel" "protected fingerprint $f is missing from the $what (rotate first; never suppress a protected finding)"
+      missing=1
+    fi
+  done <"$WORK/prot.want"
+  return $missing
+}
+
+# protected_check_accepted <rel>: an unchanged repo is checked against the
+# findings accepted by its last complete scan.
+protected_check_accepted() {
+  local d
+  d="$REPOS_DIR/$(repo_id "$1")"
+  cut -f5 "$d/findings.tsv" 2>/dev/null | LC_ALL=C sort -u >"$WORK/accepted.fps"
+  protected_check "$1" "$WORK/accepted.fps" "accepted findings of its last complete scan"
+}
+
+# protected_unseen: every manifest entry must belong to a repo this run
+# evaluated; excluded, missing, or undiscovered repos are errors.
+protected_unseen() {
+  local rel
+  [[ "$PROT_OK" -eq 1 ]] || return 0
+  cut -f1 "$PROT_FILE" | LC_ALL=C sort -u >"$WORK/prot.rels"
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    grep -qxF -- "$rel" "$PROT_SEEN" 2>/dev/null && continue
+    record_error "$rel" "protected manifest lists $rel, but that repo is excluded, missing, or not discovered under $ROOT (its protected findings cannot be checked)"
+  done <"$WORK/prot.rels"
+}
+
+# provenance_body <reduced> <pre-snapshot>: the findings hash, the identity
+# (sha256) of the complete input snapshot this scan read, and the hash of
+# each private file it used ("absent" when there was none).
+provenance_body() {
+  local h s f v
+  h="$(sha256_file "$1")"
+  s="$(sha256_file "$2")"
+  [[ -n "$h" && -n "$s" ]] || return 1
+  printf 'findings %s\n' "$h"
+  printf 'snapshot %s\n' "$s"
+  for f in gitleaks.toml gitleaksignore; do
+    v="$(awk -v f="$f" '$1 == "private" && $2 == f { print $3; exit }' "$2")"
+    printf 'private %s %s\n' "$f" "${v:-absent}"
+  done
+}
+
+# state_settled <state-dir>: 0 only when no publication is open (no
+# `publishing` marker) and the published artifacts agree: provenance names
+# the hash of findings.tsv AND of the stored snapshot. A
+# crash or failure between replacing them (or a scan whose snapshot was held
+# back) leaves them disagreeing, and such a repo is rescanned rather than
+# trusted as unchanged. State without provenance (written before provenance
+# existed) is unsettled too: one rescan settles it.
+state_settled() {
+  local d="$1" ph sh
+  [[ ! -e "$d/publishing" ]] || return 1
+  [[ -f "$d/provenance" && -f "$d/findings.tsv" && -f "$d/snapshot" ]] || return 1
+  ph="$(sed -n 's/^findings //p' "$d/provenance")"
+  sh="$(sed -n 's/^snapshot //p' "$d/provenance")"
+  [[ -n "$ph" && "$ph" == "$(sha256_file "$d/findings.tsv")" ]] || return 1
+  [[ -n "$sh" && "$sh" == "$(sha256_file "$d/snapshot")" ]] || return 1
+  return 0
+}
+
 # --- scanning ------------------------------------------------------------------
 
 N_SCANNED=0
@@ -887,7 +1176,10 @@ record_error() {
 # scan_repo <abs> <rel> <pre-snapshot>
 scan_repo() {
   local abs="$1" rel="$2" pre="$3" id dir report out err rc reduced n started post settled=1
-  local fps newfps n_new known_existed=0
+  local fps newfps n_new known_existed=0 prot_missing=0
+  local -a priv=()
+  [[ -n "$CUR_TOML" ]] && priv+=(--config "$CUR_TOML")
+  [[ -n "$CUR_IGNORE" ]] && priv+=(--gitleaks-ignore-path "$CUR_IGNORE")
   id="$(repo_id "$rel")"
   dir="$REPOS_DIR/$id"
   report="$WORK/report.json"
@@ -898,7 +1190,7 @@ scan_repo() {
   started=$SECONDS
   run_group "$abs" "$out" "$err" \
     gitleaks git --redact=100 --no-banner --exit-code=10 \
-    --report-format=json --report-path="$report" .
+    --report-format=json --report-path="$report" ${priv[@]+"${priv[@]}"} .
   rc=$?
   # Raw gitleaks output may contain secret material: never read, just drop.
   rm -f "$out" "$err"
@@ -932,35 +1224,76 @@ scan_repo() {
     return
   fi
 
+  # Re-validate the private store: if it no longer validates, the scan may
+  # have read files we would refuse, so nothing is published.
+  if [[ "$PRIV_ON" -eq 1 ]] && ! priv_repo "$abs" "$rel"; then
+    rm -f "$reduced"
+    record_error "$rel" "private suppression store changed during the scan and no longer validates: $GLP_ERR (nothing published)"
+    return
+  fi
+
   # Did any input move while gitleaks was reading history?
   post="$WORK/post.snap"
   if ! snapshot "$abs" "$post" || ! cmp -s "$pre" "$post"; then
     settled=0
   fi
+  local manifest_moved=0
+  if [[ "$PROT_OK" -eq 1 && "$(manifest_sha)" != "$PROT_MANIFEST_SHA" ]]; then
+    settled=0
+    manifest_moved=1
+  fi
 
   fps="$WORK/fps"
   cut -f5 "$reduced" | LC_ALL=C sort -u >"$fps"
+  # Observed = known + pending (announced or about to be): a fingerprint is
+  # announced once even when an earlier publication recorded it as pending
+  # but failed or crashed before merging it into known.
   newfps="$WORK/newfps"
+  local pend="$WORK/pend.rel" basefps="$WORK/basefps" n_base=0
+  pending_fps "$rel" >"$pend"
+  : >"$basefps"
   if [[ -f "$dir/known" ]]; then
     known_existed=1
-    LC_ALL=C comm -23 "$fps" "$dir/known" >"$newfps"
+    LC_ALL=C comm -23 "$fps" "$dir/known" | LC_ALL=C comm -23 - "$pend" >"$newfps"
   else
     : >"$newfps"
+    LC_ALL=C comm -23 "$fps" "$pend" >"$basefps"
   fi
   n_new="$(grep -c . "$newfps")"
+  n_base="$(grep -c . "$basefps")"
+  protected_check "$rel" "$fps" "scan results" || prot_missing=1
 
-  # Persist: findings and known first, the snapshot last (and only when the
-  # inputs held still), so any failure leaves the old snapshot -> rescan.
+  # Publication. A `publishing` marker opens it and is removed only as the
+  # very last step, so a crash or failure anywhere in between leaves the
+  # repo unsettled (state_settled) and it is rescanned. Order:
+  #   1. marker
+  #   2. announcements (baselined / NEW fingerprints) recorded durably in the
+  #      pending file, per fingerprint and deduplicated, BEFORE known is
+  #      merged: after a crash either the rescan still sees them as new (and
+  #      re-records the same entries) or they are already pending
+  #   3. known (cumulative union)
+  #   4. findings.tsv, then provenance (findings hash + snapshot identity)
+  #   5. snapshot (only when the inputs held still and no protected
+  #      fingerprint is missing)
+  #   6. marker removed
   local ok=1
   # New dirs are 700 via umask 077. Existing dirs are never chmod'ed here: a
   # write failure must surface as an error, not be papered over.
   mkdir -p "$dir" 2>/dev/null || ok=0
   if [[ $ok -eq 1 ]]; then
+    { : >"$dir/publishing"; } 2>/dev/null || ok=0
+  fi
+  [[ $ok -eq 1 ]] && test_hook publish-start
+  if [[ $ok -eq 1 ]]; then
     { printf '%s\n' "$rel" >"$dir/path.tmp" && mv -f "$dir/path.tmp" "$dir/path"; } 2>/dev/null || ok=0
   fi
-  if [[ $ok -eq 1 ]]; then
-    { cp "$reduced" "$dir/findings.tsv.tmp" && mv -f "$dir/findings.tsv.tmp" "$dir/findings.tsv"; } 2>/dev/null || ok=0
+  if [[ $ok -eq 1 && "$n_base" -gt 0 ]]; then
+    announce_record baselined "$rel" "$basefps" || ok=0
   fi
+  if [[ $ok -eq 1 && "$n_new" -gt 0 ]]; then
+    announce_record new "$rel" "$newfps" || ok=0
+  fi
+  [[ $ok -eq 1 ]] && test_hook publish-pending
   if [[ $ok -eq 1 ]]; then
     if [[ -f "$dir/known" ]]; then
       LC_ALL=C sort -u "$fps" "$dir/known" >"$dir/known.tmp" 2>/dev/null || ok=0
@@ -969,32 +1302,51 @@ scan_repo() {
     fi
     [[ $ok -eq 1 ]] && { mv -f "$dir/known.tmp" "$dir/known" 2>/dev/null || ok=0; }
   fi
-  if [[ $ok -eq 1 && $settled -eq 1 ]]; then
+  [[ $ok -eq 1 ]] && test_hook publish-known
+  if [[ $ok -eq 1 ]]; then
+    { cp "$reduced" "$dir/findings.tsv.tmp" && provenance_body "$reduced" "$pre" >"$dir/provenance.tmp"; } 2>/dev/null || ok=0
+  fi
+  if [[ $ok -eq 1 ]]; then
+    mv -f "$dir/findings.tsv.tmp" "$dir/findings.tsv" 2>/dev/null || ok=0
+    if [[ $ok -eq 1 ]]; then
+      test_hook publish-findings
+      mv -f "$dir/provenance.tmp" "$dir/provenance" 2>/dev/null || ok=0
+      [[ $ok -eq 1 ]] && test_hook publish-provenance
+    fi
+  fi
+  if [[ $ok -eq 1 && $settled -eq 1 && $prot_missing -eq 0 ]]; then
     { cp "$pre" "$dir/snapshot.tmp" && mv -f "$dir/snapshot.tmp" "$dir/snapshot"; } 2>/dev/null || ok=0
   fi
-  rm -f "$dir/path.tmp" "$dir/findings.tsv.tmp" "$dir/known.tmp" "$dir/snapshot.tmp" 2>/dev/null
+  [[ $ok -eq 1 ]] && test_hook publish-snapshot
+  if [[ $ok -eq 1 ]]; then
+    rm -f "$dir/publishing" 2>/dev/null || ok=0
+  fi
+  rm -f "$dir/path.tmp" "$dir/findings.tsv.tmp" "$dir/provenance.tmp" "$dir/known.tmp" "$dir/snapshot.tmp" 2>/dev/null
 
   local tag=""
-  if [[ $known_existed -eq 0 && "$n" -gt 0 ]]; then
-    N_BASELINED=$((N_BASELINED + n))
+  if [[ "$n_base" -gt 0 ]]; then
+    N_BASELINED=$((N_BASELINED + n_base))
     N_BASELINED_REPOS=$((N_BASELINED_REPOS + 1))
-    printf 'baselined\t%s\t%s\n' "$n" "$rel" >>"$WORK/announce"
     tag=" (baselined)"
   fi
   if [[ "$n_new" -gt 0 ]]; then
     N_NEW=$((N_NEW + n_new))
     N_NEW_REPOS=$((N_NEW_REPOS + 1))
-    printf 'new\t%s\t%s\n' "$n_new" "$rel" >>"$WORK/announce"
     tag=" (NEW)"
   fi
   log "  scanned $rel: rc=$rc findings=$n new=$n_new$tag $((SECONDS - started))s"
   if [[ "$n" -gt 0 ]]; then
     printf '%s: %s\n' "$rel" "$(cut -f1 "$reduced" | LC_ALL=C sort | uniq -c | awk '{printf "%s%s=%s", sep, $2, $1; sep = " "}')" >>"$RULES_FILE"
   fi
-  [[ $settled -eq 1 ]] || log "  note $rel: refs/HEAD/config changed during the scan; snapshot not advanced (rescans next run)"
+  if [[ $manifest_moved -eq 1 ]]; then
+    log "  note $rel: the protected manifest changed during the scan; snapshot not advanced (rescans next run)"
+  elif [[ $settled -ne 1 ]]; then
+    log "  note $rel: refs/HEAD/config changed during the scan; snapshot not advanced (rescans next run)"
+  fi
+  [[ $prot_missing -eq 0 ]] || log "  note $rel: a protected fingerprint is missing; snapshot not advanced (rescans next run)"
   if [[ $ok -ne 1 ]]; then
     STATE_OK=0
-    record_error "$rel" "state write failed in $dir (old snapshot kept)"
+    record_error "$rel" "state write failed in $dir (publication incomplete; rescanned next run)"
   fi
 }
 
@@ -1009,9 +1361,89 @@ send_notify() {
     "$NOTIFIER" -e "display notification \"$1\" with title \"gitleaks-audit\""
 }
 
-# announce_counts <kind> <file>: "<total> <distinct repos>" for that kind.
+# announce_record <kind> <rel> <fps-file>: durably add one pending entry
+# "<kind>\t<rel>\t<fingerprint>" per fingerprint (sorted, unique, so
+# recording the same announcement twice after a crash is a no-op). Also
+# kept in $WORK/announce for this run. 1 if the pending file can't be written.
+announce_record() {
+  [[ -s "$3" ]] || return 0
+  GLA_KIND="$1" GLA_REL="$2" awk '{ print ENVIRON["GLA_KIND"] "\t" ENVIRON["GLA_REL"] "\t" $0 }' "$3" \
+    >"$WORK/announce.add" 2>/dev/null || return 1
+  if [[ -f "$PENDING_FILE" ]]; then
+    LC_ALL=C sort -u "$WORK/announce.add" "$PENDING_FILE" >"$PENDING_FILE.tmp" 2>/dev/null || return 1
+  else
+    LC_ALL=C sort -u "$WORK/announce.add" >"$PENDING_FILE.tmp" 2>/dev/null || return 1
+  fi
+  mv -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null || {
+    rm -f "$PENDING_FILE.tmp" 2>/dev/null
+    return 1
+  }
+  # Only a durably recorded announcement is announced by this run.
+  cat "$WORK/announce.add" >>"$WORK/announce"
+}
+
+# Pending entry forms (tab-separated):
+#   <kind> <rel> <fp>            recorded, not yet delivered (kind: new|baselined)
+#   <kind>.delivered <rel> <fp>  delivered, but <fp> was not yet in that repo's
+#                                known (its publication failed): never counted
+#                                again, still "observed" for NEW classification
+#   <kind> <count> <rel>         legacy (older versions), counted, then dropped
+PENDING_LEGACY_AWK='function legacy() { return ($2 ~ /^[0-9]+$/ && $3 !~ /^[0-9a-f]+:.*:[0-9]+$/) }'
+
+# pending_fps <rel>: every fingerprint pending for <rel> (delivered or not).
+pending_fps() {
+  [[ -s "$PENDING_FILE" ]] || return 0
+  GLA_REL="$1" awk -F'\t' "$PENDING_LEGACY_AWK"' !legacy() && $2 == ENVIRON["GLA_REL"] { print $3 }' \
+    "$PENDING_FILE" 2>/dev/null | LC_ALL=C sort -u
+}
+
+# pending_settle <delivered>: rewrite the pending file. An entry whose
+# fingerprint is in its repo's known is dropped once delivered (now, with
+# delivered=1, or earlier: <kind>.delivered). With delivered=1 every other
+# entry becomes <kind>.delivered, and legacy entries are dropped. Returns 1
+# when the file cannot be rewritten.
+pending_settle() {
+  local rel k
+  [[ -s "$PENDING_FILE" ]] || return 0
+  printf '\001\t\001\n' >"$WORK/knownset"
+  awk -F'\t' "$PENDING_LEGACY_AWK"' !legacy() { print $2 }' "$PENDING_FILE" 2>/dev/null | LC_ALL=C sort -u >"$WORK/pend.rels"
+  while IFS= read -r rel; do
+    k="$REPOS_DIR/$(repo_id "$rel")/known"
+    [[ -f "$k" ]] || continue
+    GLA_REL="$rel" awk '{ print ENVIRON["GLA_REL"] "\t" $0 }' "$k" >>"$WORK/knownset" 2>/dev/null || return 1
+  done <"$WORK/pend.rels"
+  GLA_MARK="$1" awk -F'\t' -v OFS='\t' "$PENDING_LEGACY_AWK"'
+    FNR == NR { k[$1 "\t" $2] = 1; next }
+    {
+      mark = (ENVIRON["GLA_MARK"] == "1")
+      if (legacy()) { if (!mark) print; next }
+      done = ($1 ~ /\.delivered$/)
+      if (($2 "\t" $3) in k) { if (!done && !mark) print; next }
+      if (mark && !done) $1 = $1 ".delivered"
+      print
+    }' "$WORK/knownset" "$PENDING_FILE" 2>/dev/null | LC_ALL=C sort -u >"$PENDING_FILE.tmp" || {
+    rm -f "$PENDING_FILE.tmp" 2>/dev/null
+    return 1
+  }
+  if [[ -s "$PENDING_FILE.tmp" ]]; then
+    mv -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null || return 1
+  else
+    rm -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null || return 1
+  fi
+}
+
+# announce_counts <kind> <file>: "<distinct findings> <distinct repos>" for
+# that kind. Entries are "<kind>\t<rel>\t<fingerprint>"; the older
+# "<kind>\t<count>\t<rel>" form (pending files from before) still counts.
 announce_counts() {
-  awk -F'\t' -v k="$1" '$1 == k { n += $2; if (!($3 in r)) { r[$3] = 1; c++ } } END { print n + 0, c + 0 }' "$2" 2>/dev/null
+  LC_ALL=C sort -u "$2" 2>/dev/null | awk -F'\t' -v k="$1" '
+    $1 != k { next }
+    {
+      if ($2 ~ /^[0-9]+$/ && $3 !~ /^[0-9a-f]+:.*:[0-9]+$/) { n += $2; rel = $3 }
+      else { n++; rel = $2 }
+      if (!(rel in r)) { r[rel] = 1; c++ }
+    }
+    END { print n + 0, c + 0 }'
 }
 
 # notify: one notification for this run's announcements (baselined / NEW
@@ -1026,6 +1458,11 @@ notify() {
   # --run/--full that holds the lock. Dry runs (including their fatal paths)
   # and runs that never got the lock never touch state.
   [[ "$LOCK_HELD" -eq 1 ]] && persist=1
+  # Drop delivered entries whose fingerprints have reached known since.
+  if [[ $persist -eq 1 ]] && ! pending_settle 0; then
+    log "  ERROR: could not update $PENDING_FILE"
+    RUN_ERRORS=$((RUN_ERRORS + 1))
+  fi
   : >"$all"
   [[ $persist -eq 1 && -s "$PENDING_FILE" ]] && cat "$PENDING_FILE" >>"$all" 2>/dev/null
   [[ -s "$WORK/announce" ]] && cat "$WORK/announce" >>"$all"
@@ -1044,13 +1481,19 @@ notify() {
   fi
   [[ -n "$msg" ]] || return 0
   if send_notify "$msg"; then
-    if [[ $persist -eq 1 && -e "$PENDING_FILE" ]] && ! rm -f "$PENDING_FILE" 2>/dev/null; then
-      log "  ERROR: notification delivered but $PENDING_FILE could not be removed (it will be re-announced)"
+    # Delivered: settled entries are dropped; entries whose fingerprint is
+    # not in known yet stay as <kind>.delivered (never announced again). If
+    # this rewrite fails nothing can record the delivery, so the next run
+    # repeats the announcement once (a documented exception to
+    # exactly-once); the failed write is an ERROR and the run exits 1.
+    if [[ $persist -eq 1 ]] && ! pending_settle 1; then
+      RUN_ERRORS=$((RUN_ERRORS + 1))
+      log "  ERROR: notification delivered but $PENDING_FILE could not be updated (the announcement may repeat once next run)"
     fi
     return 0
   fi
   [[ $persist -eq 1 && -s "$all" ]] || return 0
-  if [[ -d "$STATE_DIR" ]] && { cp "$all" "$PENDING_FILE.tmp" && mv -f "$PENDING_FILE.tmp" "$PENDING_FILE"; } 2>/dev/null; then
+  if [[ -d "$STATE_DIR" ]] && { LC_ALL=C sort -u "$all" >"$PENDING_FILE.tmp" && mv -f "$PENDING_FILE.tmp" "$PENDING_FILE"; } 2>/dev/null; then
     log "  notification not delivered; announcement pending, retried next run ($nn new in $rn repos, $nb baselined in $rb repos)"
   else
     rm -f "$PENDING_FILE.tmp" 2>/dev/null
@@ -1157,6 +1600,10 @@ do_scan_mode() { # dry-run | run | full
       return
     fi
   fi
+  if ! priv_init; then
+    log "ERROR: $PRIV_INIT_ERR"
+    [[ "$mode" == "dry-run" ]] || RUN_ERRORS=$((RUN_ERRORS + 1))
+  fi
 
   pre="$WORK/pre.snap"
   while IFS= read -r rel; do
@@ -1184,6 +1631,17 @@ do_scan_mode() { # dry-run | run | full
         continue
         ;;
     esac
+    printf '%s\n' "$rel" >>"$PROT_SEEN"
+    # Private store validation comes BEFORE the unchanged check, so a store
+    # that became unsafe is an error even when nothing else changed.
+    if ! priv_repo "$abs" "$rel"; then
+      if [[ "$mode" == "dry-run" ]]; then
+        log "$(printf '  %-9s %s  (private suppression store: %s)' error "$rel" "$GLP_ERR")"
+      else
+        record_error "$rel" "private suppression store: $GLP_ERR"
+      fi
+      continue
+    fi
     if ! snapshot "$abs" "$pre"; then
       if [[ "$mode" == "dry-run" ]]; then
         log "$(printf '  %-9s %s  (cannot read refs)' error "$rel")"
@@ -1197,9 +1655,14 @@ do_scan_mode() { # dry-run | run | full
     fi
     old="$REPOS_DIR/$(repo_id "$rel")/snapshot"
     reason="$(change_reason "$old" "$pre")"
+    # Unchanged inputs are trusted only when the published state is settled.
+    if [[ -z "$reason" ]] && ! state_settled "$REPOS_DIR/$(repo_id "$rel")"; then
+      reason="unsettled: findings, provenance and snapshot disagree"
+    fi
     if [[ -z "$reason" && -z "$forced" ]]; then
       N_SKIPPED=$((N_SKIPPED + 1))
       log "$(printf '  %-9s %s  (unchanged)' skip "$rel")"
+      [[ "$mode" == "dry-run" ]] || protected_check_accepted "$rel"
       continue
     fi
     [[ -n "$reason" ]] || reason="unchanged"
@@ -1213,6 +1676,7 @@ do_scan_mode() { # dry-run | run | full
   done <"$WORK/candidates"
 
   [[ "$mode" == "dry-run" ]] && return
+  protected_unseen
   RUN_ERRORS=$((RUN_ERRORS + N_ERRORS))
   summarize "$forced"
 }
@@ -1274,35 +1738,150 @@ summarize() {
   log "gitleaks-audit finished: exit $EXIT_CODE"
 }
 
+# private_hashes <store-dir>: "<name> <sha256|absent>" for both private files
+# as they are now (informational: --report does not trust or use them).
+private_hashes() {
+  local f h
+  for f in gitleaks.toml gitleaksignore; do
+    if [[ -n "$1" && (-e "$1/$f" || -L "$1/$f") ]]; then
+      h="$(sha256_file "$1/$f")"
+      printf '%s %s\n' "$f" "${h:-unreadable}"
+    else
+      printf '%s absent\n' "$f"
+    fi
+  done
+}
+
+# recorded_hashes <file> <prefix-fields>: "<name> <sha256|absent>" for both
+# private files from a snapshot or provenance file (missing lines = absent).
+recorded_hashes() {
+  local f v
+  for f in gitleaks.toml gitleaksignore; do
+    v="$(awk -v f="$f" '$1 == "private" && $2 == f { print $3; exit }' "$1" 2>/dev/null)"
+    printf '%s %s\n' "$f" "${v:-absent}"
+  done
+}
+
+# report_flags <rel> <state-dir>: the bracketed annotations of a repo header.
+# "stale": the private files now differ from the ones the last published scan
+# used (per provenance; no provenance = none used). "unsettled": findings,
+# provenance and snapshot disagree (state_settled), so the next run rescans.
+report_flags() {
+  local rel="$1" d="$2" store="$GLP_REPOS/$1" files="" flags="" cur prov
+  [[ -e "$store/gitleaks.toml" || -L "$store/gitleaks.toml" ]] && files="gitleaks.toml"
+  [[ -e "$store/gitleaksignore" || -L "$store/gitleaksignore" ]] && files="${files:+$files, }gitleaksignore"
+  if [[ -n "$files" ]]; then
+    flags=" [private: $files]"
+    if ! glp_resolve "$rel" >/dev/null 2>&1; then
+      flags="$flags [store ERROR: $GLP_ERR]"
+    fi
+  elif [[ -d "$store" ]]; then
+    flags=" [private store dir: no files]"
+  fi
+  if [[ -f "$d/findings.tsv" || -f "$d/snapshot" || -f "$d/provenance" ]]; then
+    cur="$(private_hashes "$store")"
+    prov="$(recorded_hashes "$d/provenance")"
+    [[ "$cur" == "$prov" ]] || flags="$flags [stale: the private store differs from what the last published scan used]"
+    if ! state_settled "$d"; then
+      if [[ -f "$d/provenance" ]]; then
+        flags="$flags [unsettled: findings, provenance and snapshot disagree; rescanned next run]"
+      else
+        flags="$flags [unsettled: no provenance (scanned by an older version or interrupted); rescanned next run]"
+      fi
+    fi
+  fi
+  [[ -e "$ROOT/$rel/.gitleaksignore" ]] && flags="$flags [repo .gitleaksignore: trusted, not private]"
+  printf '%s' "$flags"
+}
+
 do_report() {
-  local d any=0 rel
-  if [[ ! -d "$REPOS_DIR" ]]; then
-    echo "no audit state yet ($STATE_DIR); run: gitleaks-audit.sh --run"
-    return 0
+  local d any=0 rel n fp c rest line rule file status flags
+  make_work
+  : >"$WORK/rels"
+  if [[ -d "$REPOS_DIR" ]]; then
+    for d in "$REPOS_DIR"/*/; do
+      [[ -f "$d/path" ]] || continue
+      head -n1 "$d/path" >>"$WORK/rels"
+    done
   fi
-  for d in "$REPOS_DIR"/*/; do
-    [[ -s "$d/findings.tsv" && -f "$d/path" ]] || continue
-    rel="$(head -n1 "$d/path")"
-    printf '%s\t%s\n' "$rel" "$d"
-  done | LC_ALL=C sort | while IFS=$'\t' read -r rel d; do
-    printf '== %s (%s findings)\n' "$rel" "$(grep -c . "$d/findings.tsv")"
-    LC_ALL=C sort -t$'\t' -k1,1 -k2,2 -k4,4n "$d/findings.tsv" | awk -F'\t' '
-      { rule[NR] = $1; loc[NR] = $2 ":" $4 " (" substr($3, 1, 8) ")"; cnt[$1]++ }
-      END {
-        for (i = 1; i <= NR; i++) {
-          if (rule[i] != prev) { printf "  %s (%d)\n", rule[i], cnt[rule[i]]; prev = rule[i] }
-          printf "    %s\n", loc[i]
-        }
-      }'
+  if [[ -d "$GLP_REPOS" ]]; then
+    # Every repo store dir: dirs holding a private file, and leaf dirs (a
+    # store dir with no files at all is listed too).
+    {
+      find "$GLP_REPOS" -mindepth 2 \( -name gitleaks.toml -o -name gitleaksignore \) 2>/dev/null |
+        while IFS= read -r line; do printf '%s\n' "${line%/*}"; done
+      find "$GLP_REPOS" -mindepth 1 -type d 2>/dev/null | while IFS= read -r line; do
+        [[ -z "$(find "$line" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]] && printf '%s\n' "$line"
+      done
+    } | while IFS= read -r line; do
+      printf '%s\n' "${line#"$GLP_REPOS"/}"
+    done >>"$WORK/rels"
+  fi
+  LC_ALL=C sort -u "$WORK/rels" | while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    d="$REPOS_DIR/$(repo_id "$rel")"
+    flags="$(report_flags "$rel" "$d")"
+    if [[ ! -f "$d/findings.tsv" ]]; then
+      # Never published (no audit run yet, or never scanned): list it only
+      # when it has a private store.
+      [[ -n "$flags" ]] || continue
+      printf '== %s (not scanned yet)%s\n\n' "$rel" "$flags"
+      continue
+    fi
+    n=0
+    [[ -s "$d/findings.tsv" ]] && n="$(grep -c . "$d/findings.tsv")"
+    # Flags first: a repo with 0 findings is still listed when it has a
+    # store, a repo .gitleaksignore, or stale/unsettled state.
+    [[ "$n" -gt 0 || -n "$flags" ]] || continue
+    printf '== %s (%s findings)%s\n' "$rel" "$n" "$flags"
+    if [[ "$n" -gt 0 ]]; then
+      LC_ALL=C sort -t$'\t' -k1,1 -k2,2 -k4,4n "$d/findings.tsv" | awk -F'\t' '
+        { rule[NR] = $1; loc[NR] = $2 ":" $4 " (" substr($3, 1, 8) ")"; cnt[$1]++ }
+        END {
+          for (i = 1; i <= NR; i++) {
+            if (rule[i] != prev) { printf "  %s (%d)\n", rule[i], cnt[rule[i]]; prev = rule[i] }
+            printf "    %s\n", loc[i]
+          }
+        }'
+    fi
     echo
-  done
-  for d in "$REPOS_DIR"/*/; do
-    [[ -s "$d/findings.tsv" ]] && any=1
-  done
+  done >"$WORK/report"
+  [[ -s "$WORK/report" ]] && any=1
+  cat "$WORK/report"
+  if [[ -f "$GLP_PROTECTED" ]] && grep -qv '^[[:space:]]*\(#\|$\)' "$GLP_PROTECTED" 2>/dev/null; then
+    any=1
+    echo "Protected (rotate first; never suppress) from $GLP_PROTECTED:"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+      rel="${line% *}"
+      fp="${line##* }"
+      c="${fp%%:*}"
+      rest="${fp#*:}"
+      n="${rest##*:}"
+      rest="${rest%:*}"
+      rule="${rest##*:}"
+      file="${rest%:*}"
+      d="$REPOS_DIR/$(repo_id "$rel")"
+      if [[ ! -f "$d/findings.tsv" ]]; then
+        status="not scanned yet"
+      elif cut -f5 "$d/findings.tsv" | grep -qxF -- "$fp"; then
+        status="present"
+      else
+        status="MISSING"
+      fi
+      printf '  %s  %s:%s %s (%s) %s\n' "$rel" "$file" "$n" "$rule" "${c:0:8}" "$status"
+    done <"$GLP_PROTECTED"
+    echo
+  fi
   if [[ "$any" -eq 0 ]]; then
-    echo "no findings recorded in $STATE_DIR"
+    if [[ -d "$REPOS_DIR" ]]; then
+      echo "no findings recorded in $STATE_DIR"
+    else
+      echo "no audit state yet ($STATE_DIR); run: gitleaks-audit.sh --run"
+    fi
     return 0
   fi
+  [[ -d "$REPOS_DIR" ]] || echo "no audit state yet ($STATE_DIR); run: gitleaks-audit.sh --run"
   cat <<'EOF'
 Rotation guidance:
   1. Treat every real secret above as exposed: rotate/revoke it at the
@@ -1311,8 +1890,13 @@ Rotation guidance:
      hygiene, not remediation (clones, forks, and caches keep old commits).
   3. Only for verified false positives: add the finding's fingerprint
      (<commit>:<file>:<rule>:<line>) to the repo's .gitleaksignore, or mark
-     the line `gitleaks:allow`.
-  Details for one repo (redacted): cd <repo> && gitleaks git --redact=100 -v .
+     the line `gitleaks:allow`; or, privately (this machine only), add the
+     full fingerprint to ~/.config/gitleaks-audit/repos/<rel>/gitleaksignore.
+     Never suppress an entry of the protected manifest.
+  Details for one repo (redacted): cd <repo> && gitleaks git --redact=100 -v
+    [--config <store>/gitleaks.toml] [--gitleaks-ignore-path <store>/gitleaksignore] .
+  (<store> = ~/.config/gitleaks-audit/repos/<rel>; pass the flags only for
+  files that exist)
 EOF
 }
 
