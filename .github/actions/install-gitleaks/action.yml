@@ -1,0 +1,45 @@
+name: Install gitleaks (Linux x64, checksum-pinned)
+description: >-
+  Download the gitleaks release tarball for linux x64, verify its SHA256
+  against the pinned value BEFORE extracting, and install the binary to
+  /usr/local/bin. Version and checksum come from the workflow-level env
+  (GITLEAKS_VERSION / GITLEAKS_SHA256) so every job shares one pin.
+inputs:
+  version:
+    description: gitleaks version without the leading v (e.g. 8.30.1)
+    required: true
+  sha256:
+    description: SHA256 of gitleaks_<version>_linux_x64.tar.gz
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Download, verify, install gitleaks
+      shell: bash
+      env:
+        GL_VERSION: ${{ inputs.version }}
+        GL_SHA256: ${{ inputs.sha256 }}
+      run: |
+        set -uo pipefail
+        tarball="gitleaks_${GL_VERSION}_linux_x64.tar.gz"
+        dir="$(mktemp -d)"
+        for attempt in 1 2 3; do
+          if curl -fsSL -o "$dir/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/${tarball}"; then
+            break
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            echo "gitleaks download failed after 3 attempts" >&2
+            exit 1
+          fi
+          sleep $((5 * attempt))
+        done
+        # Verify before anything reads the archive.
+        (cd "$dir" && printf '%s  %s\n' "$GL_SHA256" "$tarball" | sha256sum -c -) || {
+          echo "gitleaks tarball checksum mismatch; refusing to extract" >&2
+          exit 1
+        }
+        tar -xzf "$dir/$tarball" -C "$dir" gitleaks || exit 1
+        sudo install -m 0755 "$dir/gitleaks" /usr/local/bin/gitleaks || exit 1
+        rm -rf "$dir"
+        gitleaks version

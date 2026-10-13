@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# One gitleaks pin shared by every job that installs it on Linux (the
+# install-gitleaks composite action verifies the tarball against this
+# SHA256 before extracting). Source of the checksum: the official release
+# checksums file
+# https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
+# (line for gitleaks_8.30.1_linux_x64.tar.gz). Bump both together.
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
 jobs:
   lint-test-serial:
     name: lint-test-serial (${{ matrix.os }})
@@ -53,6 +63,14 @@ jobs:
           shellcheck --version
           shfmt --version
 
+      - name: Install gitleaks (Linux)
+        # Real-binary tests in tests/gitleaks-hook.bats run instead of skip.
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/install-gitleaks
+        with:
+          version: ${{ env.GITLEAKS_VERSION }}
+          sha256: ${{ env.GITLEAKS_SHA256 }}
+
       - name: Install shellcheck, shfmt, gitleaks (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -75,7 +93,15 @@ jobs:
         run: make fmt-check
 
       - name: Run tests
-        run: make test-serial
+        # Explicit `shell: bash` runs with -eo pipefail, so tee keeps the
+        # bats exit status. bats writes TAP when stdout is not a TTY.
+        shell: bash
+        run: make test-serial 2>&1 | tee "$RUNNER_TEMP/bats.tap"
+
+      - name: Require the real-gitleaks hook tests to have run (not skipped)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: .github/scripts/require-real-gitleaks-tests.sh "$RUNNER_TEMP/bats.tap"
 
   lint-test-parallel:
     name: lint-test-parallel (${{ matrix.os }})
@@ -126,6 +152,14 @@ jobs:
           shellcheck --version | head -1
           shfmt --version
 
+      - name: Install gitleaks (Linux)
+        # Real-binary tests in tests/gitleaks-hook.bats run instead of skip.
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/install-gitleaks
+        with:
+          version: ${{ env.GITLEAKS_VERSION }}
+          sha256: ${{ env.GITLEAKS_SHA256 }}
+
       - name: Ensure GNU parallel, shellcheck, shfmt, gitleaks (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -151,7 +185,13 @@ jobs:
         run: make fmt-check
 
       - name: Run tests in parallel
-        run: make test-parallel
+        shell: bash
+        run: make test-parallel 2>&1 | tee "$RUNNER_TEMP/bats.tap"
+
+      - name: Require the real-gitleaks hook tests to have run (not skipped)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: .github/scripts/require-real-gitleaks-tests.sh "$RUNNER_TEMP/bats.tap"
 
   gitleaks:
     name: gitleaks (secret scan)
@@ -166,20 +206,16 @@ jobs:
           fetch-depth: 0
 
       - name: Install gitleaks CLI
-        # Self-hosted CLI install (instead of gitleaks/gitleaks-action@v2)
-        # because that action is pinned to Node 20, which GitHub is
-        # deprecating. The CLI is a single Go binary; pin via env var.
-        env:
-          GITLEAKS_VERSION: "8.30.1"
-        run: |
-          curl -fsSL -o /tmp/gitleaks.tar.gz \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
-          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
-          gitleaks version
+        # Self-hosted CLI install (instead of gitleaks/gitleaks-action@v2,
+        # which is pinned to a deprecated Node runtime). Same checksum-pinned
+        # composite action and version as the test jobs.
+        uses: ./.github/actions/install-gitleaks
+        with:
+          version: ${{ env.GITLEAKS_VERSION }}
+          sha256: ${{ env.GITLEAKS_SHA256 }}
 
       - name: Run gitleaks
-        # `detect` scans the full git history (matches gitleaks-action default
-        # on push). --redact prevents secrets from appearing in CI logs.
-        # --exit-code 1 (default) fails the job on any finding.
-        run: gitleaks detect --source . --redact --no-banner --verbose
+        # `gitleaks git` scans the full git history (`detect` is deprecated).
+        # --redact prevents secrets from appearing in CI logs. Exit code 1
+        # (default) fails the job on any finding.
+        run: gitleaks git --redact --no-banner --verbose .
