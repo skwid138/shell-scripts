@@ -36,6 +36,10 @@ setup() {
 }
 
 teardown() {
+  # Nothing to clean when setup skipped (off macOS) before TMPD was set: an
+  # empty TMPD would turn the pkill pattern into one that matches this very
+  # bats run (its argv names tests/launchd-shutdown-check.bats).
+  [[ -n "${TMPD:-}" && "$TMPD" == "$BATS_TEST_TMPDIR"/* ]] || return 0
   # Never leave a simulated job behind (they live in their own groups).
   local pg
   for pg in "$SIM"/pgid.*; do
