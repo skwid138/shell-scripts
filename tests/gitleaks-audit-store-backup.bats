@@ -1169,3 +1169,74 @@ HOOK
   [[ -z "$(restore_dirs)" ]]
   [[ -z "$(ls -A "$TMPD")" ]]
 }
+
+@test "store backup: export checks gzip's exit status in its self-check (a damaged trailer publishes nothing)" {
+  mkstore
+  # After tar writes the archive, damage the gzip CRC trailer: the data
+  # still decompresses in full, but gzip exits nonzero (as the import sees).
+  cat >"$T/hook" <<'HOOK'
+#!/bin/bash
+[[ "$1" == archive-built ]] || exit 0
+n="$(wc -c <"$2" | tr -d ' ')"
+printf '\xff\xff\xff\xff' | dd of="$2" bs=1 seek=$((n - 8)) conv=notrunc 2>/dev/null
+HOOK
+  chmod +x "$T/hook"
+  HOOK="$T/hook" run_audit --export-store "$DEST" --plain
+  assert_failure 1
+  says "does not decompress cleanly"
+  [[ -z "$(ls -A "$DEST")" ]]
+  [[ -z "$(ls -A "$TMPD")" ]]
+}
+
+@test "store backup: a failing enumeration of the restored tree fails the import (no restore dir)" {
+  good_plain_archive
+  cat >"$STUBS/find" <<'EOF2'
+#!/bin/bash
+case "$*" in
+  *"/restore-"*"-print0"*)
+    echo "find: simulated failure" >&2
+    exit 1
+    ;;
+esac
+exec /usr/bin/find "$@"
+EOF2
+  chmod +x "$STUBS/find"
+  run_audit --import-store "$ARCH"
+  assert_failure 1
+  says "is not private"
+  [[ -z "$(restore_dirs)" ]]
+  [[ -z "$(ls -A "$TMPD")" ]]
+}
+
+@test "store backup: an extended attribute on the fresh archive file (e.g. com.apple.provenance) is not mistaken for an ACL" {
+  mkstore
+  # Every file the writer creates gets a synthetic xattr, as macOS does when
+  # it tags provenance: `ls -led` then shows -rw-------@ (an xattr), which
+  # is not an ACL (+ and extra lines).
+  mkdir -p "$T/perl5"
+  cat >"$T/perl5/AddXattr.pm" <<'PM'
+package AddXattr;
+BEGIN {
+  *CORE::GLOBAL::sysopen = sub (*$$;$) {
+    my $r = @_ > 3 ? CORE::sysopen($_[0], $_[1], $_[2], $_[3]) : CORE::sysopen($_[0], $_[1], $_[2]);
+    system("/usr/bin/xattr", "-w", "com.example.synthetic", "1", $_[1]) if $r;
+    return $r;
+  };
+}
+1;
+PM
+  cat >"$T/xattr-perl" <<EOF2
+#!/bin/bash
+case "\$*" in *"sysopen("*) exec /usr/bin/perl -I"$T/perl5" -MAddXattr "\$@" ;; esac
+exec /usr/bin/perl "\$@"
+EOF2
+  chmod +x "$T/xattr-perl"
+  PERL_OVR="$T/xattr-perl" run_audit --export-store "$DEST" --plain
+  assert_success
+  local a
+  a="$(published)"
+  /usr/bin/xattr "$a" | grep -qx com.example.synthetic
+  no_acl "$a"
+  run_audit --import-store "$a"
+  assert_success
+}

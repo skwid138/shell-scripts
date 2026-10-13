@@ -397,6 +397,7 @@ LOCK_HELD=0
 CUR_PGID=""
 WD_PID=""
 # Store export/import artifacts this run created (removed on failure only).
+PRUNE_TMP=""
 EXPORT_TMPFILE=""
 EXPORT_SUBDIR=""
 RESTORE_DIR=""
@@ -439,6 +440,9 @@ cleanup() {
     reap_group "$CUR_PGID"
     CUR_PGID=""
   fi
+  # The prune temp file, only if this invocation created it under the lock
+  # (PRUNE_TMP is set only then), removed before the lock is released.
+  [[ -n "$PRUNE_TMP" && "$LOCK_HELD" -eq 1 ]] && rm -f "$PRUNE_TMP"
   if [[ "$LOCK_HELD" -eq 1 ]]; then
     local owner_pid=""
     owner_pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
@@ -2135,7 +2139,6 @@ report_delivered() {
 # removes nothing but the invocation-unique temp file this run created while
 # holding the lock (PRUNE_TMP): never the shared pending-announce.tmp of a
 # concurrent --run, and nothing at all from a preview.
-PRUNE_TMP=""
 prune_fail() {
   log "ERROR: $1"
   if [[ -n "$PRUNE_TMP" && "$LOCK_HELD" -eq 1 ]]; then
@@ -2219,6 +2222,7 @@ do_prune_delivered() {
       prune_fail "prune-delivered: cannot chmod $tmp; nothing changed"
       return
     fi
+    test_hook prune-created "$tmp"
   fi
   log "prune-delivered: removing $n_rm delivered entries ($(delivered_summary "$WORK/delivered" | sed 's/^[0-9]* (//; s/)$//')); keeping $n_keep"
   if [[ "$LOG_WRITE_FAILED" -ne 0 ]]; then
@@ -2711,7 +2715,10 @@ sysopen(my $out, $dst, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600) or die "c
 open(my $ls, "-|", "/bin/ls", "-led", "--", $dst) or die "ls $dst: $!\n";
 my @l = <$ls>;
 close($ls);
-die "$dst carries an ACL or an unexpected mode right after creation\n" unless @l == 1 && $l[0] =~ /\A-rw------- /;
+# One line (no ACL entries) and mode -rw-------, followed by a space or the
+# "@" extended-attribute marker (macOS may attach com.apple.provenance to
+# new files; that is not an ACL), never the "+" ACL marker.
+die "$dst carries an ACL or an unexpected mode right after creation\n" unless @l == 1 && $l[0] =~ /\A-rw-------[ @]/;
 seam("file-created");
 open(my $in, "<", $src) or die "read $src: $!\n";
 binmode $in;
@@ -2934,6 +2941,7 @@ do_export_store() {
     store_fail "tar failed: $(head -n1 "$WORK/tar.err"); nothing exported"
     return
   fi
+  test_hook archive-built "$WORK/store.tar.gz"
   # Self-check: whatever is published must pass the import's own checks:
   # the same size caps (the compressed archive below STORE_MAX_BYTES, the
   # tar at most STORE_MAX_BYTES) and the reader accepting exactly these
@@ -2944,10 +2952,18 @@ do_export_store() {
     store_fail "the compressed archive is ${size:-?} bytes; the import accepts less than $STORE_MAX_BYTES (exceeds limit); nothing exported"
     return
   fi
-  /usr/bin/gzip -dc <"$WORK/store.tar.gz" 2>/dev/null | head -c "$((STORE_MAX_BYTES + 1))" >"$WORK/check.tar"
+  local -a ps=()
+  /usr/bin/gzip -dc <"$WORK/store.tar.gz" 2>"$WORK/gzip.err" | head -c "$((STORE_MAX_BYTES + 1))" >"$WORK/check.tar"
+  ps=("${PIPESTATUS[@]}")
   size="$(wc -c <"$WORK/check.tar" | tr -d ' ')"
   if [[ "$size" -gt "$STORE_MAX_BYTES" ]]; then
     store_fail "the archive is larger than $STORE_MAX_BYTES bytes uncompressed, which the import rejects (exceeds limit); nothing exported"
+    return
+  fi
+  # Like the import: gzip itself must succeed (a damaged trailer still
+  # decompresses in full but exits nonzero), and so must the copy.
+  if [[ "${ps[0]}" -ne 0 || "${ps[1]}" -ne 0 ]]; then
+    store_fail "the archive does not decompress cleanly (gzip exit ${ps[0]}, head exit ${ps[1]}: $(head -n1 "$WORK/gzip.err" | cut -c1-160)); nothing exported"
     return
   fi
   if ! ustar_check "$WORK/check.tar" "$WORK/check.members" ||
@@ -3062,6 +3078,11 @@ restore_base_ok() {
 # file (600) without ACL entries.
 restore_tree_private() {
   local p
+  # Enumerate into a file so a failing find is an error, never an empty
+  # (and so vacuously private) tree.
+  if ! find "$1" -print0 >"$WORK/restore.list" 2>/dev/null || [[ ! -s "$WORK/restore.list" ]]; then
+    return 1
+  fi
   while IFS= read -r -d '' p; do
     if [[ -L "$p" ]]; then
       return 1
@@ -3072,7 +3093,7 @@ restore_tree_private() {
     else
       return 1
     fi
-  done < <(find "$1" -print0 2>/dev/null)
+  done <"$WORK/restore.list"
 }
 
 do_import_store() {

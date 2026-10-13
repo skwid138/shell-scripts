@@ -3132,3 +3132,28 @@ STUB
   assert_success
   cmp "$(PENDING)" "$T/expected"
 }
+
+@test "gitleaks-audit: TERM between creating and renaming the prune temp file leaves no orphan, the pending file unchanged, the lock released" {
+  mkrepo alpha
+  mixed_pending
+  cp -p "$(PENDING)" "$T/pending.orig"
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == prune-created ]] || exit 0
+[[ -e "\$2" ]] && touch "$T/tmp.seen"
+touch "$FIX/paused"
+while [[ ! -e "$FIX/go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+  bg_audit "$T/p" GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --prune-delivered
+  wait_for test -e "$FIX/paused"
+  [[ -e "$T/tmp.seen" ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/go"
+  local rc=0
+  wait "$BG_PID" || rc=$?
+  [[ $rc -ne 0 ]]
+  [[ -z "$(find "$STATE" -name 'pending-announce.prune.*')" ]]
+  cmp -s "$(PENDING)" "$T/pending.orig"
+  [[ ! -e "$(LOCKD)" ]]
+}
