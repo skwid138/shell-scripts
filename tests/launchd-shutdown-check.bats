@@ -121,6 +121,16 @@ stop_job() {
   # A slow stop: the request itself takes 2s, and the step's group only
   # empties 2s after that.
   [[ -f "$SIM/slow_stop" ]] && sleep 2
+  if [[ -f "$SIM/slow_stop_empty" ]]; then
+    # Over budget inside the synchronous call, but everything is gone by
+    # the time it returns.
+    kill -KILL -- "-$pg" 2>/dev/null
+    [[ -n "$sp" ]] && kill -KILL -- "-$sp" 2>/dev/null
+    sleep 4
+    echo 143 >"$SIM/last_exit"
+    rm -f "$SIM/running" "$SIM/step"
+    return 0
+  fi
   kill -TERM -- "-$pg" 2>/dev/null
   [[ -n "$sp" ]] && kill -TERM -- "-$sp" 2>/dev/null
   sleep 0.3
@@ -159,7 +169,19 @@ case "$sub" in
         [[ -f "$SIM/running" ]] && state=running
         echo "${1} = {"
         echo "	state = $state"
-        [[ -f "$SIM/running" ]] && echo "	pid = $(cat "$SIM/running")"
+        if [[ -f "$SIM/running" ]]; then
+          if [[ -f "$SIM/print_no_pid" ]]; then
+            :
+          elif [[ -f "$SIM/print_bad_pid" ]]; then
+            echo "	pid = 12x"
+          else
+            echo "	pid = $(cat "$SIM/running")"
+          fi
+          [[ -f "$SIM/print_rc_running" ]] && {
+            echo "}"
+            exit 5
+          }
+        fi
         echo "	last exit code = $(cat "$SIM/last_exit" 2>/dev/null || echo '(never exited)')"
         echo "}"
         exit 0
@@ -202,6 +224,10 @@ EOF
 printf 'ps %s\n' "$*" >>"$CALLS"
 if [[ -f "$SIM/ps_error_axo" && "$*" == *-axo* ]]; then
   echo "ps: simulated failure" >&2
+  exit 1
+fi
+if [[ -f "$SIM/ps_pgid_rc" && "$*" == "-o pgid= -p "* ]]; then
+  /bin/ps "$@"
   exit 1
 fi
 if [[ -f "$SIM/ps_error_pid" && "$*" == *"-p $(cat "$SIM/ps_error_pid")"* ]]; then
@@ -525,4 +551,46 @@ assert_exact_targets() {
   run_check -- --target gitleaks-audit --run
   assert_failure 1
   assert_output --regexp "FAIL: no surviving processes in step process group [0-9]+ within 3s of the bootout request"
+}
+
+@test "launchd-shutdown-check: a stop request that overruns the budget fails even if the groups are empty when it returns" {
+  touch "$SIM/slow_stop_empty"
+  run_check -- --target gitleaks-audit --run
+  assert_failure 1
+  assert_output --regexp "FAIL: no surviving processes in step process group [0-9]+ within 3s of the bootout request: .*after [0-9]+ms"
+  refute_output --partial "PASS: no surviving processes in step process group"
+}
+
+# fails_before_stop: the job-identity check failed and no stop request
+# (bootout/kill) was issued before it; only the trap's rescue bootout.
+fails_before_stop() {
+  assert_failure 1
+  assert_output --regexp "FAIL: attempt 1 job pid and process group observed: $1"
+  refute_output --partial "PASS: launchctl bootout"
+  run grep -c '^launchctl kill ' "$CALLS"
+  assert_output "0"
+  run grep -c '^launchctl bootout ' "$CALLS"
+  assert_output "1"
+}
+
+@test "launchd-shutdown-check: a missing or malformed job pid in launchctl print fails before any stop request" {
+  touch "$SIM/print_no_pid"
+  run_check -- --target gitleaks-audit --run
+  fails_before_stop ".*no running pid"
+  rm "$SIM/print_no_pid"
+  touch "$SIM/print_bad_pid"
+  : >"$CALLS"
+  run_check -- --target gitleaks-audit --run
+  fails_before_stop ".*no running pid"
+}
+
+@test "launchd-shutdown-check: a failing launchctl print or ps fails the job identity even with parseable output" {
+  touch "$SIM/print_rc_running"
+  run_check -- --target gitleaks-audit --run
+  fails_before_stop "launchctl print .* failed \\(exit 5\\)"
+  rm "$SIM/print_rc_running"
+  touch "$SIM/ps_pgid_rc"
+  : >"$CALLS"
+  run_check -- --target gitleaks-audit --run
+  fails_before_stop "cannot observe the process group of job pid [0-9]+ \\(ps exit 1"
 }

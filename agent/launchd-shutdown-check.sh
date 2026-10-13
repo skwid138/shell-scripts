@@ -519,35 +519,63 @@ child_alive() {
 JOB_PID=""
 JOB_PGID=""
 job_identity() {
-  local out
+  local out rc pids
+  JOB_PID=""
+  JOB_PGID=""
   out="$("$LAUNCHCTL" print "$SERVICE" 2>/dev/null)"
-  JOB_PID="$(sed -n 's/^[[:space:]]*pid = //p' <<<"$out" | head -n1)"
-  DETAIL="launchctl print shows no running pid"
-  [[ "$JOB_PID" =~ ^[1-9][0-9]*$ ]] || return 1
-  JOB_PGID="$("$PS" -o pgid= -p "$JOB_PID" 2>/dev/null | tr -d ' ')"
-  DETAIL="cannot observe the process group of job pid $JOB_PID"
-  [[ "$JOB_PGID" =~ ^[0-9]+$ && "$JOB_PGID" -gt 1 && "$JOB_PGID" != "$(/bin/ps -o pgid= -p $$ | tr -d ' ')" ]] || return 1
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    DETAIL="launchctl print $SERVICE failed (exit $rc)"
+    return 1
+  fi
+  # Exactly one well-formed "pid = N" line, or fail closed.
+  pids="$(sed -n 's/^[[:space:]]*pid = //p' <<<"$out")"
+  if [[ ! "$pids" =~ ^[1-9][0-9]*$ ]]; then
+    DETAIL="launchctl print shows no running pid (missing or malformed: '${pids//$'\n'/ }')"
+    return 1
+  fi
+  JOB_PID="$pids"
+  out="$("$PS" -o pgid= -p "$JOB_PID" 2>"$ROOT/ps.err")"
+  rc=$?
+  out="$(printf '%s' "$out" | tr -d ' ')"
+  if [[ $rc -ne 0 || ! "$out" =~ ^[0-9]+$ ]]; then
+    DETAIL="cannot observe the process group of job pid $JOB_PID (ps exit $rc$(head -c 200 "$ROOT/ps.err" 2>/dev/null | sed 's/^/: /'))"
+    return 1
+  fi
+  if [[ "$out" -le 1 || "$out" == "$(/bin/ps -o pgid= -p $$ | tr -d ' ')" ]]; then
+    DETAIL="job pid $JOB_PID is in an unexpected process group ($out)"
+    return 1
+  fi
+  JOB_PGID="$out"
   PGIDS="$PGIDS $JOB_PGID"
 }
 
-# group_empties <pgid>: true once no process is left in it, within
-# STOP_TIMEOUT seconds of the stop REQUEST (STOP_START_MS, taken before the
-# synchronous launchctl call). A failed observation is a failure.
+# group_empties <pgid>: true only if the group is first OBSERVED empty
+# within STOP_TIMEOUT seconds of the stop REQUEST (STOP_START_MS, taken
+# before the synchronous launchctl call). The deadline applies to the
+# moment emptiness is seen: a request that itself overruns the budget fails
+# even if everything is gone when it returns (it cannot show the group
+# emptied in time). A failed observation is a failure.
 STOP_START_MS=0
 group_empties() {
-  local pg="$1" left rc
+  local pg="$1" left rc elapsed
   while :; do
     left="$(pgid_members "$pg")"
     rc=$?
+    elapsed=$(($(now_ms) - STOP_START_MS))
     if [[ $rc -ne 0 ]]; then
       DETAIL="$left"
       return 1
     fi
-    [[ -z "$left" ]] && return 0
-    if [[ $(($(now_ms) - STOP_START_MS)) -ge $((STOP_TIMEOUT * 1000)) ]]; then
-      DETAIL="still alive: $left"
+    if [[ $elapsed -gt $((STOP_TIMEOUT * 1000)) ]]; then
+      if [[ -z "$left" ]]; then
+        DETAIL="first observed empty only after ${elapsed}ms (budget ${STOP_TIMEOUT}s from the request)"
+      else
+        DETAIL="still alive after ${elapsed}ms: $left"
+      fi
       return 1
     fi
+    [[ -z "$left" ]] && return 0
     sleep 0.1
   done
 }
