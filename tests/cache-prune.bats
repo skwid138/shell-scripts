@@ -39,7 +39,16 @@ setup() {
 }
 
 teardown() {
-  touch "$FIX/b.go" 2>/dev/null
+  touch "$FIX/b.go" "$FIX/hook.go" 2>/dev/null
+  # Rescue, after the test's assertions: only processes this test started.
+  # Nothing to do when setup skipped (off macOS) before T was set; never a
+  # pattern that could match the bats run itself (its argv names
+  # tests/cache-prune.bats, never this test's temp dir).
+  [[ -n "${T:-}" && -n "${BATS_TEST_TMPDIR:-}" && "$T" == "$BATS_TEST_TMPDIR" ]] || return 0
+  if [[ -n "${BG_PID:-}" ]] && [[ "$(/bin/ps -o command= -p "$BG_PID" 2>/dev/null)" == *personal/cache-prune.sh* ]]; then
+    kill -KILL "$BG_PID" 2>/dev/null
+  fi
+  pkill -KILL -f "$T/(tsleep|desc|slowperl|hook|stubs/)" 2>/dev/null
   return 0
 }
 
@@ -129,13 +138,14 @@ case "$1 ${2-}" in
     [[ -f "$FIX/break_log_on_image_inspect" ]] && chmod 000 "$HOME/Library/Logs/cache-prune.log"
     fail image_inspect; ids=(); while IFS= read -r i; do ids+=("$i"); done < <(nonflag_ids "$@"); pick "$FIX/images.txt" "${ids[@]}" ;;
   "image rm")
+    fail image_rm
     # Untag in the fixture; drop the row when no tags remain unless
     # rm_leaves_dangling (then the image lingers untagged = dangling).
     awk -F'|' -v OFS='|' -v t="${3-}" -v keep="$([[ -f "$FIX/rm_leaves_dangling" ]] && echo 1)" '{
       if (NF > 1) { n = split($4, a, " "); r = ""; for (i = 1; i <= n; i++) if (a[i] != t) r = r a[i] " "; if ($4 != "" && r == "") { if (keep != "1") next; $5 = 0 }; $4 = r }
       print }' "$FIX/images.txt" >"$FIX/images.tmp" && mv "$FIX/images.tmp" "$FIX/images.txt"
     echo "Untagged: ${3-}" ;;
-  "image prune") echo "Total reclaimed space: 0B" ;;
+  "image prune") fail image_prune; echo "Total reclaimed space: 0B" ;;
   "builder prune") echo "Total:	0B" ;;
   "system df") printf 'TYPE TOTAL ACTIVE SIZE RECLAIMABLE\nImages 1 1 1GB 0B (0%%)\n' ;;
   "buildx du")
@@ -192,6 +202,11 @@ mutating_calls() {
   assert_output --partial "--apply"
   assert_output --partial "--install"
   assert_output --partial "--uninstall"
+  # Mutations' own process groups, their overrides, and the Docker boundary.
+  assert_output --partial "CACHE_PRUNE_GRACE"
+  assert_output --partial "CACHE_PRUNE_PS"
+  assert_output --partial "ExitTimeOut"
+  assert_output --partial "does not cancel or roll back"
 }
 
 # --- dry-run safety ----------------------------------------------------------
@@ -1312,6 +1327,10 @@ plist_get() { /usr/bin/plutil -extract "$1" "${2:-json}" -o - "$(PLIST)"; }
   assert_output "false"
   run plist_get KeepAlive
   assert_failure
+  # Room for the TERM handler to stop a mutation's own process group
+  # (TERM, CACHE_PRUNE_GRACE, KILL) before launchd escalates to SIGKILL.
+  run plist_get ExitTimeOut raw
+  assert_output "30"
   run plist_get EnvironmentVariables.PATH raw
   assert_output "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
   run plist_get EnvironmentVariables.HOME raw
@@ -1631,4 +1650,290 @@ STUB
 @test "cache-prune: --status conflicts with other modes" {
   run_prune --status --apply
   assert_failure 2
+}
+
+# --- mutating steps: own process group, TERM/INT, readiness -------------------
+# Every process these tests start has this test's temp dir in its argv
+# ($T/tsleep, $T/desc, $T/slowperl, $T/stubs/...), so teardown's rescue can
+# kill exactly those, after the assertions.
+
+# setup_mut_fixture: $T/tsleep (a sleep matchable by argv), $T/desc (a
+# descendant: `desc <fix> <name> term|ignore` records its pid in
+# <fix>/<name>.pid once its TERM disposition is set; "term" touches
+# <fix>/<name>.term on TERM and exits, "ignore" ignores TERM), and a uv stub
+# whose `cache prune` writes $FIX/uv.marker (pid, pgid), starts the
+# descendants listed in $FIX/uv_desc ("name:mode ..."), touches
+# $FIX/uv.ready once they are all alive, then hangs if $FIX/uv_hang exists,
+# else exits with $FIX/uv_prune_rc (default 0).
+setup_mut_fixture() {
+  ln -s /bin/sleep "$T/tsleep"
+  cat >"$T/desc" <<'EOF'
+#!/usr/bin/perl
+my ($fix, $name, $mode) = @ARGV;
+if ($mode eq 'ignore') {
+  $SIG{TERM} = 'IGNORE';
+} else {
+  $SIG{TERM} = sub { open(my $f, '>', "$fix/$name.term"); close $f; exit 0 };
+}
+open(my $p, '>', "$fix/$name.pid.tmp") or die; print $p "$$\n"; close $p;
+rename("$fix/$name.pid.tmp", "$fix/$name.pid") or die;
+sleep 600 while 1;
+EOF
+  chmod +x "$T/desc"
+  make_stub "$STUBS/uv" \
+    "T_DIR='$T'" \
+    'case "$*" in' \
+    '  "cache dir") echo "$HOME/.cache/uv"; exit 0 ;;' \
+    '  "cache prune") ;;' \
+    '  *) exit 0 ;;' \
+    'esac' \
+    'printf "pid=%s pgid=%s\n" "$$" "$(/bin/ps -o pgid= -p $$ | tr -d " ")" >"$FIX/uv.marker"' \
+    'for d in $(cat "$FIX/uv_desc" 2>/dev/null); do' \
+    '  "$T_DIR/desc" "$FIX" "${d%%:*}" "${d#*:}" </dev/null >/dev/null 2>&1 &' \
+    '  i=0; while [[ ! -s "$FIX/${d%%:*}.pid" && $i -lt 200 ]]; do sleep 0.05; i=$((i + 1)); done' \
+    'done' \
+    'touch "$FIX/uv.ready"' \
+    '[[ -f "$FIX/uv_hang" ]] && "$T_DIR/tsleep" 600' \
+    'exit "$(cat "$FIX/uv_prune_rc" 2>/dev/null || echo 0)"'
+}
+
+# marker_field <pid|pgid>: from the uv stub's marker.
+marker_field() { sed -n "s/.*$1=\\([0-9]*\\).*/\\1/p" "$FIX/uv.marker"; }
+
+# Independent observer (/bin/ps, never the script's CACHE_PRUNE_PS): live
+# members of a process group. Returns 2 when ps fails or lists nothing, so
+# an observation failure is never read as an empty group.
+group_members() {
+  local out
+  out="$(/bin/ps -A -o pid= -o pgid= -o stat=)" || return 2
+  [[ -n "$out" ]] || return 2
+  awk -v g="$1" '$2 == g && $3 !~ /^Z/ { printf "%s ", $1 }' <<<"$out"
+}
+group_empty() {
+  local m
+  m="$(group_members "$1")" || return 1
+  [[ -z "$m" ]] || {
+    echo "process group $1 still has: $m" >&2
+    return 1
+  }
+}
+pid_gone() { ! /bin/ps -o pid= -p "$1" >/dev/null 2>&1; }
+
+# wait_exit <pid> <secs>: wait for a background run to end within <secs>;
+# sets EXIT_RC. Returns 1 (leaving it for teardown) when it does not.
+wait_exit() {
+  local i=0 n=$(($2 * 10))
+  while kill -0 "$1" 2>/dev/null; do
+    [[ $i -lt $n ]] || {
+      echo "pid $1 still running after $2s" >&2
+      return 1
+    }
+    sleep 0.1
+    i=$((i + 1))
+  done
+  EXIT_RC=0
+  wait "$1" || EXIT_RC=$?
+}
+
+@test "cache-prune: TERM while a mutating step runs stops its own process group (TERM, then KILL), exits 143, releases the lock" {
+  setup_mut_fixture
+  echo "ign:ignore trm:term" >"$FIX/uv_desc"
+  touch "$FIX/uv_hang"
+  bg_prune "$T/b" CACHE_PRUNE_GRACE=2 -- --apply --no-notify
+  wait_for test -e "$FIX/uv.ready"
+  local pid pgid
+  pid="$(marker_field pid)"
+  pgid="$(marker_field pgid)"
+  # The mutation leads its own process group (not the script's).
+  [[ -n "$pid" && "$pgid" == "$pid" && "$pgid" != "$BG_PID" ]]
+  local start=$SECONDS
+  kill -TERM "$BG_PID"
+  wait_exit "$BG_PID" 15
+  [[ "$EXIT_RC" -eq 143 ]]
+  [[ $((SECONDS - start)) -le 12 ]]
+  group_empty "$pgid"
+  # The group got TERM first (a TERM-handling member exited on it), and
+  # the TERM-ignoring member was KILLed.
+  [[ -e "$FIX/trm.term" ]]
+  pid_gone "$(cat "$FIX/ign.pid")"
+  [[ ! -e "$(LOCK)" ]]
+  run ! grep -q 'finished OK' "$T/b.out"
+  # The next run is unaffected.
+  rm -f "$FIX/uv_hang" "$FIX/uv_desc"
+  run_prune --apply --no-notify
+  assert_success
+  assert_output --partial "finished OK"
+}
+
+@test "cache-prune: INT while a mutating step runs stops its process group, exits 130, releases the lock" {
+  setup_mut_fixture
+  echo "ign:ignore" >"$FIX/uv_desc"
+  touch "$FIX/uv_hang"
+  # A background job of a non-interactive shell inherits SIGINT ignored
+  # (and bash cannot trap a signal ignored on entry): reset it first.
+  /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die' \
+    env -i HOME="$FAKE_HOME" CALLS="$CALLS" FIX="$FIX" \
+    CACHE_PRUNE_BASE_PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
+    CACHE_PRUNE_NOW="$NOW" CACHE_PRUNE_GRACE=2 \
+    /bin/bash "$SCRIPT" --apply --no-notify </dev/null >"$T/b.out" 2>"$T/b.err" 3>&- &
+  BG_PID=$!
+  wait_for test -e "$FIX/uv.ready"
+  local pgid
+  pgid="$(marker_field pgid)"
+  [[ -n "$pgid" && "$pgid" != "$BG_PID" ]]
+  kill -INT "$BG_PID"
+  wait_exit "$BG_PID" 15
+  [[ "$EXIT_RC" -eq 130 ]]
+  group_empty "$pgid"
+  pid_gone "$(cat "$FIX/ign.pid")"
+  [[ ! -e "$(LOCK)" ]]
+  run ! grep -q 'finished OK' "$T/b.out"
+  rm -f "$FIX/uv_hang" "$FIX/uv_desc"
+  run_prune --apply --no-notify
+  assert_success
+  assert_output --partial "finished OK"
+}
+
+@test "cache-prune: TERM inside the startup critical section (group ready, not yet registered) is deferred, then stops the group and exits 143" {
+  setup_mut_fixture
+  echo "ign:ignore" >"$FIX/uv_desc"
+  touch "$FIX/uv_hang"
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == mutation-ready ]] || exit 0
+echo "\${2-}" >"$FIX/hook.pid"
+touch "$FIX/hook.paused"
+while [[ ! -e "$FIX/hook.go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+  bg_prune "$T/b" CACHE_PRUNE_TEST_HOOK="$T/hook" CACHE_PRUNE_GRACE=2 -- --apply --no-notify
+  wait_for test -e "$FIX/hook.paused"
+  wait_for test -e "$FIX/uv.ready"
+  local pgid
+  pgid="$(marker_field pgid)"
+  [[ -n "$pgid" && "$(cat "$FIX/hook.pid")" == "$pgid" ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/hook.go"
+  wait_exit "$BG_PID" 15
+  [[ "$EXIT_RC" -eq 143 ]]
+  group_empty "$pgid"
+  [[ ! -e "$(LOCK)" ]]
+  run ! grep -q 'finished OK' "$T/b.out"
+}
+
+@test "cache-prune: a mutation leader that exits leaving a descendant: the group is reaped (TERM first) and the leader's status is kept" {
+  setup_mut_fixture
+  echo "trm:term" >"$FIX/uv_desc"
+  run_prune_with CACHE_PRUNE_GRACE=5 -- --apply --no-notify
+  assert_success
+  assert_output --partial "[success] uv:"
+  [[ -e "$FIX/trm.term" ]]
+  group_empty "$(marker_field pgid)"
+  pid_gone "$(cat "$FIX/trm.pid")"
+
+  rm -f "$FIX/trm.term" "$FIX/trm.pid" "$FIX/uv.marker"
+  echo 3 >"$FIX/uv_prune_rc"
+  run_prune_with CACHE_PRUNE_GRACE=5 -- --apply --no-notify
+  assert_failure 1
+  assert_output --partial "[fail] uv: uv cache prune exited 3"
+  [[ -e "$FIX/trm.term" ]]
+  group_empty "$(marker_field pgid)"
+  refute_output --partial "ERROR"
+}
+
+@test "cache-prune: a mutating command that exits instantly with 0 is a successful step" {
+  ln -sf /usr/bin/true "$STUBS/uv"
+  run_prune --apply --no-notify
+  assert_success
+  assert_output --partial "[success] uv:"
+  assert_output --partial "[success] pnpm:"
+  assert_output --partial "[success] npm:"
+  assert_output --partial "[success] docker:image-prune:"
+  assert_output --partial "[success] docker:builder-prune:"
+  refute_output --partial "readiness"
+}
+
+@test "cache-prune: no readiness from the mutation's process group in time fails the step, kills the leader, and never runs the command" {
+  setup_mut_fixture
+  # A perl that, once, stalls 8s before running the spawn code (so before
+  # setpgrp, the readiness byte, and the exec); every other use is normal.
+  cat >"$T/slowperl" <<EOF
+#!/usr/bin/perl
+if ((grep { /setpgrp/ } @ARGV) && ! -e "$FIX/slow.pid") {
+  open(my \$f, '>', "$FIX/slow.pid") or die; print \$f "\$\$\\n"; close \$f;
+  select(undef, undef, undef, 8);
+}
+exec '/usr/bin/perl', @ARGV or exit 126;
+EOF
+  chmod +x "$T/slowperl"
+  local start=$SECONDS
+  run_prune_with CACHE_PRUNE_PERL="$T/slowperl" -- --apply --no-notify
+  assert_failure 1
+  assert_output --regexp '\[fail\] uv: .*readiness'
+  [[ -s "$FIX/slow.pid" ]]
+  pid_gone "$(cat "$FIX/slow.pid")"
+  # Later steps still ran (a readiness failure is not terminal).
+  grep -q '^pnpm store prune$' "$CALLS"
+  # The mutation never ran, even after the stall would have ended.
+  while [[ $((SECONDS - start)) -lt 10 ]]; do sleep 0.2; done
+  run grep -c '^uv cache prune' "$CALLS"
+  assert_output "0"
+  [[ ! -e "$FIX/uv.marker" ]]
+}
+
+@test "cache-prune: a failing process-group observer escalates to KILL, fails the step, refuses later mutations, and exits nonzero" {
+  setup_mut_fixture
+  echo "ign:ignore" >"$FIX/uv_desc"
+  printf '#!/bin/bash\necho "ps: simulated failure" >&2\nexit 1\n' >"$T/badps"
+  chmod +x "$T/badps"
+  run_prune_with CACHE_PRUNE_PS="$T/badps" CACHE_PRUNE_GRACE=1 -- --apply --no-notify
+  assert_failure 1
+  assert_output --partial "ERROR:"
+  assert_output --partial "could not be confirmed empty"
+  assert_output --partial "[fail] uv:"
+  grep -q "ERROR: .*could not be confirmed empty" "$(LOGF)"
+  # No later mutation ran.
+  run mutating_calls
+  assert_output "uv cache prune"
+  # The independent (working) observer sees nothing left: KILL was sent.
+  group_empty "$(marker_field pgid)"
+  pid_gone "$(cat "$FIX/ign.pid")"
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: mutating command failures (nonzero, killed by a signal, docker stderr) keep their accounting and later steps continue" {
+  make_stub "$STUBS/uv" \
+    'case "$*" in' \
+    '  "cache dir") echo "$HOME/.cache/uv" ;;' \
+    '  "cache prune") echo "uv-stdout-line"; echo "uv-stderr-line" >&2; exit 3 ;;' \
+    'esac' 'exit 0'
+  local bin="$FAKE_HOME/.nvm/versions/node/v$NODE_VER/bin"
+  make_stub "$bin/pnpm" \
+    'case "$*" in' \
+    '  "store path") echo "$HOME/Library/pnpm/store/v10" ;;' \
+    '  "store prune") echo "pnpm-stdout-line"; echo "pnpm-stderr-line" >&2; exit 4 ;;' \
+    'esac' 'exit 0'
+  make_stub "$bin/npm" \
+    'case "$*" in' \
+    '  "config get cache") echo "$HOME/.npm" ;;' \
+    '  "cache verify") echo "npm-before-kill"; kill -KILL $$ ;;' \
+    'esac' 'exit 0'
+  write_policy_fixture
+  touch "$FIX/fail_image_rm" "$FIX/fail_image_prune"
+  run_prune --apply --no-notify
+  assert_failure 1
+  assert_line "    uv-stdout-line"
+  assert_line "    uv-stderr-line"
+  assert_output --partial "[fail] uv: uv cache prune exited 3"
+  assert_line "    pnpm-stderr-line"
+  assert_output --partial "[fail] pnpm: pnpm store prune exited 4"
+  assert_line "    npm-before-kill"
+  assert_output --partial "[fail] npm: npm cache verify exited 137"
+  assert_output --partial "FAILED to remove old:91: exit 1: Error: forced image_rm failure"
+  assert_output --partial "[fail] docker:tagged-images: removed 0/3 tags"
+  assert_output --partial "[fail] docker:image-prune: exit 1: Error: forced image_prune failure"
+  assert_output --partial "[success] docker:builder-prune"
+  assert_output --partial "[success] report:pip"
+  refute_output --partial "ERROR"
+  assert_output --partial "finished with 5 failed/timed-out step(s)"
 }

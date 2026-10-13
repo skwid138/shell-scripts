@@ -180,7 +180,13 @@ A few scripts here are interactive launchers wired up via aliases in
   developer-cache cleanup (uv, pnpm, npm, Docker via OrbStack). Dry-run
   by default; `--apply` prunes. `--install` / `--uninstall` manage a monthly
   LaunchAgent (day 1, 10:00) that runs `--apply`. Logs to
-  `~/Library/Logs/cache-prune.log`.
+  `~/Library/Logs/cache-prune.log`. Each mutating command runs in its own
+  process group, so a TERM/INT stops it at once (TERM, a grace period, then
+  KILL; exit 143/130, lock released). launchd's job-group cleanup no longer
+  reaches those groups; the script's own cleanup plus the agent's
+  `ExitTimeOut` (30s) replace it. Killing the docker CLI does not cancel or
+  roll back work the daemon already accepted: an interrupted run may leave a
+  removal or prune partly done, and the next run re-inventories.
 - `personal/gitleaks-hook.sh` (no alias) — global pre-commit secret scan.
   Registered in the dotfiles `~/.gitconfig` as a git config hook
   (`hook.gitleaks.command` / `hook.gitleaks.event = pre-commit`), so it runs

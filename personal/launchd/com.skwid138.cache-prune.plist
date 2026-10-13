@@ -4,7 +4,10 @@
   Template for personal/cache-prune.sh -install. Do not load this file
   directly: the double-underscore placeholder tokens are rendered (XML-escaped) into
   ~/Library/LaunchAgents/com.skwid138.cache-prune.plist by the installer.
-  Runs `cache-prune.sh -apply` at 10:00 on day 1 of every month.
+  Runs `cache-prune.sh -apply` at 10:00 on day 1 of every month. Mutating
+  steps run in their own process group, outside launchd's job-group cleanup;
+  ExitTimeOut leaves room for the TERM handler to stop that group (TERM,
+  grace, KILL) before SIGKILL.
 -->
 <plist version="1.0">
 <dict>
@@ -27,6 +30,8 @@
   </dict>
   <key>RunAtLoad</key>
   <false/>
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>

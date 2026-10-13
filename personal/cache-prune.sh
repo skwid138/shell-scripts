@@ -57,6 +57,24 @@ on `orb status` exiting 0; OrbStack is never started):
 Keep-list: ~/.config/cache-prune/keep-images — one repo:tag or image ID per
 line (# comments allowed). Listing any tag protects the whole image ID.
 
+Signals and process groups:
+  Every mutating command (uv/pnpm/npm, each docker image rm, image prune,
+  builder prune) runs in its own process group, started through perl, which
+  confirms the group to this script (readiness) before it execs the command.
+  A TERM or INT during a mutation is handled at once: that group gets TERM,
+  up to CACHE_PRUNE_GRACE seconds (default 8) to exit, then KILL, and the run
+  exits 143/130 with the lock released. When a command exits but leaves
+  processes in its group, they get the same TERM/grace/KILL; if the group
+  still cannot be confirmed empty, the step fails, no later mutation runs,
+  and the run exits 1 (report steps still run). A mutation whose group never
+  confirms readiness (5s) is killed before it execs and its step fails.
+  Because these groups are not the launchd job's, launchd's job-group
+  cleanup no longer reaches them: this cleanup plus the agent's ExitTimeOut
+  (30s) take its place.
+  Docker: killing the docker CLI does not cancel or roll back work the
+  daemon already accepted. An interrupted run may leave a removal or prune
+  partly done; the next run re-inventories from scratch.
+
 Files:
   Log:   ~/Library/Logs/cache-prune.log (rotated to .1 above 1 MiB; authoritative)
   Lock:  ~/Library/Caches/cache-prune.lock (mkdir lock with owner pid/host/start).
@@ -79,18 +97,27 @@ Exit codes:
   2   usage error
   75  another run holds the lock (live owner pid, a lock with no parseable
       owner younger than 6h, or another run is reclaiming); nothing done
+  130/143  interrupted by INT/TERM (a running mutation's process group was
+      stopped first; lock released)
 
 Environment overrides (tests/advanced use):
   CACHE_PRUNE_BASE_PATH  PATH used instead of the built-in base PATH
                          (nvm default node bin is still prepended)
   CACHE_PRUNE_NOW        epoch seconds to use as "now" for age checks
   CACHE_PRUNE_TIMEOUT    watchdog seconds for inventory/report commands (default 120)
+  CACHE_PRUNE_GRACE      seconds a mutation's process group gets after TERM
+                         before KILL (default 8)
   CACHE_PRUNE_LOCK_STALE_SECS  age after which a lock with no parseable owner
                          pid is reclaimed (default 21600 = 6h)
   CACHE_PRUNE_RECLAIM_WAIT  seconds to wait for the reclaim mutex (default 10)
-  CACHE_PRUNE_PERL       perl for the lock-path lstat and the reclaim mutex
+  CACHE_PRUNE_PERL       perl for the lock-path lstat, the reclaim mutex, and
+                         starting each mutation in its own process group
                          (default /usr/bin/perl)
-  CACHE_PRUNE_TEST_HOOK  test-only: command run at lock decision points
+  CACHE_PRUNE_PS         ps used to watch a mutation's process group (default
+                         /bin/ps); a failing ps never counts as an empty group
+  CACHE_PRUNE_TEST_HOOK  test-only: command run at lock decision points and
+                         when a mutation's group is ready (before it is
+                         registered)
 EOF
 }
 
@@ -311,12 +338,56 @@ cleanup() {
   fi
   [[ -n "${WORK:-}" && -d "$WORK" ]] && rm -rf "$WORK"
 }
+
+# Signals. Each mutating command runs in its own process group (see
+# run_mutating) while this shell waits for it with the `wait` builtin, so a
+# TERM/INT is handled at once instead of after the command exits.
+# The TERM/INT handlers are installed once and never replaced (bash 3.2
+# briefly installs SIG_IGN while a trap is replaced, which can drop a
+# signal). Inside a critical section (IN_CRITICAL=1: a mutation's group is
+# being started and not yet registered in CHILD_PGID) they only record the
+# signal; end_critical acts on it once the group is known. Outside it, a
+# registered group is stopped (stop_group: TERM, GRACE, KILL) before the run
+# exits 143/130 through the EXIT trap (lock released). A signal arriving
+# while that is under way is recorded and does not restart it.
+IN_CRITICAL=0
+PENDING_SIG=""
+SIG_CLEANUP=0
+CHILD_PGID=""
+GRACE="${CACHE_PRUNE_GRACE:-8}"
+[[ "$GRACE" =~ ^[0-9]+$ ]] || GRACE=8
+KILL_WAIT=2
+READY_WAIT=5
+PS_BIN="${CACHE_PRUNE_PS:-/bin/ps}"
+# shellcheck disable=SC2329  # invoked via trap
+on_signal() { # <exit code>
+  if [[ "$IN_CRITICAL" -eq 1 || "$SIG_CLEANUP" -eq 1 ]]; then
+    [[ -n "$PENDING_SIG" ]] || PENDING_SIG="$1"
+    return 0
+  fi
+  SIG_CLEANUP=1
+  if [[ -n "$CHILD_PGID" ]]; then
+    log "  signal: stopping mutation process group $CHILD_PGID (TERM, up to ${GRACE}s, then KILL)"
+    stop_group "$CHILD_PGID" ||
+      log "  ERROR: mutation process group $CHILD_PGID could not be confirmed empty after TERM and KILL"
+  fi
+  exit "$1"
+}
+# end_critical: leave the critical section; a signal recorded inside it is
+# handled now (with CHILD_PGID registered, if the group started).
+end_critical() {
+  IN_CRITICAL=0
+  [[ -z "$PENDING_SIG" ]] || on_signal "$PENDING_SIG"
+}
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 LOG_OK=0
 REFUSE_MUTATIONS=0
+# Why mutations are refused (for the skip messages): a log write failure,
+# unless an earlier mutation's process group could not be confirmed empty.
+REFUSE_WHY="log unwritable"
 open_log() {
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
   if [[ -f "$LOG_FILE" ]]; then
@@ -597,11 +668,12 @@ reclaim_mutex_take() {
 
 reclaim_mutex_release() { exec 9>&-; }
 
-# test_hook <phase>: test-only seam to pause at a decision point (runs with
-# fd 9 closed so a paused hook never holds the reclaim mutex itself).
+# test_hook <phase> [args...]: test-only seam to pause at a decision point
+# (runs with fd 9 closed so a paused hook never holds the reclaim mutex
+# itself, and fd 8 closed so it never holds a mutation's readiness FIFO).
 test_hook() {
   [[ -n "$TEST_HOOK" ]] || return 0
-  "$TEST_HOOK" "$1" </dev/null >/dev/null 2>&1 9>&-
+  "$TEST_HOOK" "$@" </dev/null >/dev/null 2>&1 8>&- 9>&-
   return 0
 }
 
@@ -748,6 +820,162 @@ status_for_rc() {
   esac
 }
 
+# --- mutating commands: own process group ------------------------------------
+
+# group_has_members <pgid>: 0 when the group has a live (non-zombie) member
+# OR cannot be observed; 1 only when a successful ps listing (one that
+# includes this shell) shows no live member. An observation failure is
+# never read as an empty group.
+group_has_members() {
+  local out verdict
+  out="$("$PS_BIN" -A -o pid= -o pgid= -o stat= 2>/dev/null)" || return 0
+  verdict="$(awk -v g="$1" -v me="$$" '
+    $1 == me { seen = 1 }
+    $2 == g && $3 !~ /^Z/ { live = 1 }
+    END { print (seen && !live) ? "empty" : "busy" }' <<<"$out" 2>/dev/null)"
+  [[ "$verdict" != empty ]]
+}
+
+# wait_group_empty <pgid> <secs>: 0 once the group is observed empty, 1 if
+# it is not within about <secs> seconds.
+wait_group_empty() {
+  local i=0 n=$(($2 * 10))
+  while group_has_members "$1"; do
+    [[ $i -lt $n ]] || return 1
+    /bin/sleep 0.1
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# stop_group <pgid>: TERM the group, wait up to GRACE seconds for it to
+# empty, then KILL it and wait up to KILL_WAIT. 0 = observed empty;
+# 1 = emptiness could not be established (members persist or ps fails).
+stop_group() {
+  kill -TERM -- "-$1" 2>/dev/null
+  wait_group_empty "$1" "$GRACE" && return 0
+  kill -KILL -- "-$1" 2>/dev/null
+  wait_group_empty "$1" "$KILL_WAIT"
+}
+
+# The spawn helper (perl, argv: <fifo> <cmd...>): leave this shell's process
+# group (setpgrp; exit 121 if that fails), write ONE readiness byte to the
+# FIFO (non-blocking open: exit 122 if nobody is reading it), close it, and
+# only then exec the command. stdin and the caller's redirections are the
+# helper's own, so the command inherits them unchanged.
+# shellcheck disable=SC2016 # perl code: $f/$w/$!/@ARGV are perl variables
+MUT_SPAWN='use Fcntl; my $f = shift @ARGV;
+setpgrp(0, 0) or exit 121;
+sysopen(my $w, $f, O_WRONLY | O_NONBLOCK) or exit 122;
+(syswrite($w, "R", 1) // 0) == 1 or exit 122;
+close($w) or exit 122;
+exec { $ARGV[0] } @ARGV;
+print STDERR "cache-prune: cannot exec $ARGV[0]: $!\n";
+exit 127;'
+MUT_SEQ=0
+MUT_ERR=""
+
+# abort_unready <pid>: the leader never confirmed its group: TERM it (and a
+# group of that id, if it got that far), a short grace, KILL both, reap the
+# leader, and check that no group of that id is left.
+abort_unready() {
+  local pid="$1" i=0
+  kill -TERM "$pid" 2>/dev/null
+  kill -TERM -- "-$pid" 2>/dev/null
+  while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
+    /bin/sleep 0.1
+    i=$((i + 1))
+  done
+  kill -KILL "$pid" 2>/dev/null
+  kill -KILL -- "-$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  MUT_ERR="mutation not started: no readiness signal from its process group within ${READY_WAIT}s (leader $pid terminated)"
+  if ! wait_group_empty "$pid" "$KILL_WAIT"; then
+    MUT_ERR="$MUT_ERR; process group $pid could not be confirmed empty after TERM and KILL"
+    REFUSE_MUTATIONS=1
+    REFUSE_WHY="an earlier mutation's process group could not be confirmed empty"
+  fi
+  log "  ERROR: $MUT_ERR"
+}
+
+# run_mutating <stdout-file> <stderr-file> <cmd...>: run one mutating
+# command in its own process group (stderr merged into stdout when both
+# files are the same), stdin </dev/null. Returns the command's own exit
+# status. MUT_ERR is set (and the return is nonzero) when the command never
+# started (no readiness) or when its group could not be confirmed empty
+# afterwards; the latter also sets REFUSE_MUTATIONS. Never use this for
+# inventory commands (run_timed).
+#
+# Startup is a critical section: the group exists from the helper's setpgrp
+# on, but this shell only knows it once the readiness byte arrives, so a
+# TERM/INT in between is deferred (on_signal) until CHILD_PGID is set.
+# Readiness is mandatory: the byte is written before exec, so a command that
+# finishes instantly still reports it. The FIFO is opened read-write here
+# (an open that never blocks); a missing byte is caught by the deadline.
+run_mutating() {
+  local out="$1" err="$2" dir="$WORK/mut" fifo pid rc byte="" end
+  shift 2
+  MUT_ERR=""
+  MUT_SEQ=$((MUT_SEQ + 1))
+  fifo="$dir/ready.$MUT_SEQ"
+  if ! { [[ -d "$dir" ]] || mkdir -m 700 "$dir"; } 2>/dev/null ||
+    ! mkfifo -m 600 "$fifo" 2>/dev/null || ! { exec 8<>"$fifo"; } 2>/dev/null; then
+    rm -f "$fifo" 2>/dev/null
+    MUT_ERR="mutation not started: cannot create its readiness FIFO $fifo"
+    log "  ERROR: $MUT_ERR"
+    return 1
+  fi
+  IN_CRITICAL=1
+  if [[ "$err" == "$out" ]]; then
+    "$PERL" -e "$MUT_SPAWN" "$fifo" "$@" >"$out" 2>&1 </dev/null 8>&- 9>&- &
+  else
+    "$PERL" -e "$MUT_SPAWN" "$fifo" "$@" >"$out" 2>"$err" </dev/null 8>&- 9>&- &
+  fi
+  pid=$!
+  end=$((SECONDS + READY_WAIT))
+  while :; do
+    byte=""
+    IFS= read -r -n 1 -t 1 -u 8 byte
+    [[ "$byte" == R || $SECONDS -ge $end ]] && break
+  done
+  exec 8>&-
+  rm -f "$fifo"
+  if [[ "$byte" != R ]]; then
+    abort_unready "$pid"
+    end_critical
+    return 1
+  fi
+  test_hook mutation-ready "$pid"
+  CHILD_PGID="$pid"
+  end_critical
+  wait "$pid"
+  rc=$?
+  # The leader is gone; anything it left in its group is stopped too.
+  if group_has_members "$pid"; then
+    log "  process group $pid still has members after its leader exited ($rc); stopping them (TERM, up to ${GRACE}s, then KILL)"
+    if ! stop_group "$pid"; then
+      MUT_ERR="process group $pid could not be confirmed empty after TERM and KILL"
+      log "  ERROR: $MUT_ERR; refusing all further destructive steps"
+      REFUSE_MUTATIONS=1
+      REFUSE_WHY="an earlier mutation's process group could not be confirmed empty"
+      CHILD_PGID=""
+      [[ $rc -ne 0 ]] || rc=1
+      return "$rc"
+    fi
+  fi
+  CHILD_PGID=""
+  return "$rc"
+}
+
+# mut_note <rc> <what>: failure detail for a mutating command.
+mut_note() {
+  if [[ -n "$MUT_ERR" ]]; then
+    echo "$2: $MUT_ERR"
+  else
+    echo "$2 exited $1"
+  fi
+}
+
 # --- size helpers -------------------------------------------------------------
 
 # du_kb <path>: KB used, or "unknown".
@@ -820,15 +1048,17 @@ docker_inv() {
   run_timed "$out" docker --context "$DOCKER_CTX" "$@"
 }
 
-# docker_mut <out-file> <args...>: gated, pinned mutation. No watchdog kill.
+# docker_mut <out-file> <args...>: gated, pinned mutation in its own process
+# group (run_mutating). No watchdog kill.
 docker_mut() {
   local out="$1"
   shift
+  MUT_ERR=""
   if [[ "$DOCKER_OK" -ne 1 ]] || ! orb_gate; then
     DOCKER_OK=0
     return 125
   fi
-  docker --context "$DOCKER_CTX" "$@" >"$out" 2>"$out.err" </dev/null
+  run_mutating "$out" "$out.err" docker --context "$DOCKER_CTX" "$@"
 }
 
 docker_rc_note() {
@@ -837,6 +1067,16 @@ docker_rc_note() {
     124) echo "timed out after ${TIMEOUT}s" ;;
     *) echo "exit $1: $(head -n1 "$2.err" 2>/dev/null)" ;;
   esac
+}
+
+# docker_mut_note <rc> <out-file>: docker_rc_note for a docker_mut result
+# (a readiness or process-group failure is reported as such).
+docker_mut_note() {
+  if [[ "$1" -ne 125 && -n "$MUT_ERR" ]]; then
+    echo "$MUT_ERR"
+  else
+    docker_rc_note "$1" "$2"
+  fi
 }
 
 # load_keep_list: snapshot the keep-list once. Absent = empty (protects
@@ -1103,15 +1343,18 @@ docker_tagged_images() {
       log_file "$out"
     else
       failed=$((failed + 1))
-      log "  FAILED to remove $t: $(docker_rc_note "$rc" "$out")"
+      log "  FAILED to remove $t: $(docker_mut_note "$rc" "$out")"
     fi
   done <"$REMOVE_TAGS_FILE"
   local detail="removed $IMAGES_REMOVED_TAGS/$n_tags tags; $untagged untagged references, $deleted deleted image IDs/layers reported"
   [[ $changed -gt 0 ]] && detail="$detail; $changed skipped (tag changed since inventory)"
-  if [[ $refused -gt 0 ]]; then
-    record_step "docker:tagged-images" skip "$detail; $refused removals refused (log unwritable)"
-  elif [[ $failed -gt 0 ]]; then
+  if [[ $failed -gt 0 ]]; then
+    # A failed removal fails the step even if later ones were refused (an
+    # unconfirmed process group both fails its removal and refuses the rest).
+    [[ $refused -gt 0 ]] && detail="$detail; $refused removals refused ($REFUSE_WHY)"
     record_step "docker:tagged-images" fail "$detail; $failed removals failed"
+  elif [[ $refused -gt 0 ]]; then
+    record_step "docker:tagged-images" skip "$detail; $refused removals refused ($REFUSE_WHY)"
   else
     record_step "docker:tagged-images" success "$detail"
   fi
@@ -1158,7 +1401,7 @@ docker_dangling() {
     return
   fi
   if ! mutation_allowed "docker --context $DOCKER_CTX image prune -f --filter until=$PRUNE_UNTIL"; then
-    record_step "docker:image-prune" skip "log unwritable; refusing destructive step"
+    record_step "docker:image-prune" skip "$REFUSE_WHY; refusing destructive step"
     return
   fi
   local out="$WORK/iprune.out" rc
@@ -1168,7 +1411,7 @@ docker_dangling() {
   if [[ $rc -eq 0 ]]; then
     record_step "docker:image-prune" success "$(grep -i 'reclaimed' "$out" | head -n1)"
   else
-    record_step "docker:image-prune" "$(status_for_rc "$rc")" "$(docker_rc_note "$rc" "$out")"
+    record_step "docker:image-prune" "$(status_for_rc "$rc")" "$(docker_mut_note "$rc" "$out")"
   fi
 }
 
@@ -1220,7 +1463,7 @@ docker_builder() {
     return
   fi
   if ! mutation_allowed "docker --context $DOCKER_CTX builder prune -f --filter until=$PRUNE_UNTIL"; then
-    record_step "docker:builder-prune" skip "log unwritable; refusing destructive step"
+    record_step "docker:builder-prune" skip "$REFUSE_WHY; refusing destructive step"
     return
   fi
   out="$WORK/bprune.out"
@@ -1230,7 +1473,7 @@ docker_builder() {
   if [[ $rc -eq 0 ]]; then
     record_step "docker:builder-prune" success "$(grep -i 'total' "$out" | head -n1)"
   else
-    record_step "docker:builder-prune" "$(status_for_rc "$rc")" "$(docker_rc_note "$rc" "$out")"
+    record_step "docker:builder-prune" "$(status_for_rc "$rc")" "$(docker_mut_note "$rc" "$out")"
   fi
 }
 
@@ -1329,10 +1572,10 @@ uv_step() {
     return
   fi
   if ! mutation_allowed "uv cache prune"; then
-    record_step "uv" skip "log unwritable; refusing destructive step"
+    record_step "uv" skip "$REFUSE_WHY; refusing destructive step"
     return
   fi
-  uv cache prune >"$out" 2>&1 </dev/null
+  run_mutating "$out" "$out" uv cache prune
   rc=$?
   log_file "$out"
   after="unknown"
@@ -1347,7 +1590,7 @@ uv_step() {
   if [[ $rc -eq 0 ]]; then
     record_step "uv" success "$detail"
   else
-    record_step "uv" fail "uv cache prune exited $rc; $detail"
+    record_step "uv" fail "$(mut_note "$rc" "uv cache prune"); $detail"
   fi
 }
 
@@ -1379,10 +1622,10 @@ pnpm_step() {
     return
   fi
   if ! mutation_allowed "$pnpm store prune"; then
-    record_step "pnpm" skip "log unwritable; refusing destructive step"
+    record_step "pnpm" skip "$REFUSE_WHY; refusing destructive step"
     return
   fi
-  "$pnpm" store prune >"$out" 2>&1 </dev/null
+  run_mutating "$out" "$out" "$pnpm" store prune
   rc=$?
   log_file "$out"
   after="$(du_kb "$store")"
@@ -1390,7 +1633,7 @@ pnpm_step() {
   if [[ $rc -eq 0 ]]; then
     record_step "pnpm" success "store $(human_kb "$before") -> $(human_kb "$after")"
   else
-    record_step "pnpm" fail "pnpm store prune exited $rc; store $(human_kb "$before") -> $(human_kb "$after")"
+    record_step "pnpm" fail "$(mut_note "$rc" "pnpm store prune"); store $(human_kb "$before") -> $(human_kb "$after")"
   fi
 }
 
@@ -1418,10 +1661,10 @@ npm_step() {
     return
   fi
   if ! mutation_allowed "$npm cache verify"; then
-    record_step "npm" skip "log unwritable; refusing destructive step"
+    record_step "npm" skip "$REFUSE_WHY; refusing destructive step"
     return
   fi
-  "$npm" cache verify >"$out" 2>&1 </dev/null
+  run_mutating "$out" "$out" "$npm" cache verify
   rc=$?
   log_file "$out"
   after="$(du_kb "$cache/_cacache")"
@@ -1429,7 +1672,7 @@ npm_step() {
   if [[ $rc -eq 0 ]]; then
     record_step "npm" success "_cacache $(human_kb "$before") -> $(human_kb "$after")"
   else
-    record_step "npm" fail "npm cache verify exited $rc; _cacache $(human_kb "$before") -> $(human_kb "$after")"
+    record_step "npm" fail "$(mut_note "$rc" "npm cache verify"); _cacache $(human_kb "$before") -> $(human_kb "$after")"
   fi
 }
 
