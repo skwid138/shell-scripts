@@ -23,6 +23,9 @@ usage() {
   cat <<'EOF'
 Usage: gitleaks-audit [--run | --full | --report | --install | --uninstall | --status] [--no-notify]
        gitleaks-audit --prune-delivered [--dry-run]
+       gitleaks-audit --set-export-passphrase
+       gitleaks-audit --export-store <dest-dir> [--plain]
+       gitleaks-audit --import-store <archive>
 
 Daily gitleaks history audit of git repositories under ~/code.
 
@@ -68,9 +71,70 @@ Modes:
                 last run summary.
   -h, --help    Show this help.
 
+Store backup and restore (the private suppression store: repos/,
+protected, and config under ~/.config/gitleaks-audit):
+  --set-export-passphrase
+                Store the export passphrase in your keychain (needs a
+                terminal: `security add-generic-password -U -s
+                gitleaks-audit-export -a $USER -w`, so security prompts for
+                it twice and it never appears in argv). A new item goes to
+                your default keychain, the local file-based login keychain;
+                with -U an existing matching item anywhere in the keychain
+                search list is updated where it is. This is the login
+                keychain, not iCloud Keychain: the item is not synced to your
+                other devices, so
+                keep a copy of the passphrase off this Mac (e.g. in a
+                password manager) or the encrypted archives are unreadable
+                after losing this Mac.
+  --export-store <dest-dir> [--plain]
+                Write a backup archive of the store into <dest-dir> (an
+                existing real directory you own; not a symlink). The whole
+                store is validated first, independent of repo discovery
+                (only directories and repos/<rel>/gitleaks.toml|gitleaksignore
+                under repos/, every file's grammar, and the owner/mode/ACL
+                checks); anything unexpected, or a member name longer than
+                100 bytes, is an error and nothing is written. The archive
+                (ustar + gzip, with a MANIFEST of sha256 sums) is encrypted
+                with `openssl enc -aes-256-cbc -pbkdf2 -iter 600000` using the
+                keychain passphrase (looked up before the audit lock is taken;
+                passed on a file descriptor, never in argv or the
+                environment) and published atomically as
+                <dest-dir>/gitleaks-store-<UTC stamp>.tar.gz.enc (-2 ... -99
+                if taken), mode 600 with no ACL; the path and its sha256 are
+                printed. --plain skips encryption (.tar.gz): it is a
+                plaintext copy of sensitive metadata. Runs under the audit
+                lock (75 when busy).
+  --import-store <archive>
+                Verify an archive and unpack it into
+                ~/.config/gitleaks-audit/restore-<UTC stamp>/ for a manual
+                install; the live repos/, protected, and config are never
+                touched (no audit lock). Encrypted archives (.enc or a
+                Salted__ header) use the keychain passphrase, else a terminal
+                prompt (no terminal = error). Decrypted and decompressed sizes
+                are capped at 6 MiB; every tar header is checked (ustar
+                regular files and directories only, allowlisted names, no
+                links, no '..', no duplicates, NUL padding) before anything
+                is extracted; MANIFEST must match both ways; the restored
+                tree is validated like a live store. The install commands are
+                printed (fresh store, or move the live repos/ and protected
+                aside first, then run --full).
+  What the archive holds: repo names and paths, rules, and full
+  fingerprints (commit:file:rule:line) of findings including unrotated
+  secrets, but never secret values. Keep it as private as the store.
+  iCloud: an encrypted archive may go to iCloud Drive (standard iCloud
+  encrypts it in transit and at rest, but Apple holds those keys unless
+  Advanced Data Protection is on); never put the live store itself in
+  iCloud or any synced folder. Restore scope: the store only; audit state
+  is not restored, so the first scan after a restore baselines (no NEW
+  notifications) and pending announcements are not restored. While
+  repos/ exists without protected the audit reports a run ERROR, and
+  during the manual move the hook sees no store (a commit blocked only by a
+  store error may pass in that window).
+
 Options:
   --no-notify   With --run/--full, skip the macOS notification.
   --dry-run     Only with --prune-delivered (see above).
+  --plain       Only with --export-store (see above).
 
 What a scan runs (cwd = the repo; GITLEAKS_CONFIG/GITLEAKS_CONFIG_TOML unset,
 so the effective config is the repo's .gitleaks.toml/.gitleaksignore or the
@@ -211,6 +275,11 @@ Environment overrides (tests/advanced use):
                              owner pid is reclaimed (default 21600 = 6h)
   GITLEAKS_AUDIT_RECLAIM_WAIT  seconds to wait for the reclaim mutex (default 10)
   GITLEAKS_AUDIT_TEST_HOOK   test-only: command run at lock decision points
+                             and store-export publication seams
+  GITLEAKS_AUDIT_SECURITY    keychain CLI (default /usr/bin/security)
+  GITLEAKS_AUDIT_OPENSSL     openssl for the store archive (default
+                             /usr/bin/openssl)
+  GITLEAKS_AUDIT_SECURITY_TIMEOUT  keychain lookup watchdog seconds (default 30)
   GITLEAKS_SUPPRESS_DIR      tests only: private store base dir instead of
                              ~/.config/gitleaks-audit (not a security boundary)
 EOF
@@ -219,15 +288,28 @@ EOF
 MODE="dry-run"
 NOTIFY=1
 PRUNE_DRY=0
+PLAIN=0
+STORE_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
       usage
       exit 0
       ;;
-    --run | --full | --report | --install | --uninstall | --status | --prune-delivered)
+    --run | --full | --report | --install | --uninstall | --status | --prune-delivered | --set-export-passphrase)
       [[ "$MODE" == "dry-run" ]] || die_usage "only one mode may be given (see --help)"
       MODE="${1#--}"
+      shift
+      ;;
+    --export-store | --import-store)
+      [[ "$MODE" == "dry-run" ]] || die_usage "only one mode may be given (see --help)"
+      [[ $# -ge 2 && -n "$2" ]] || die_usage "$1 needs an argument (see --help)"
+      MODE="${1#--}"
+      STORE_ARG="$2"
+      shift 2
+      ;;
+    --plain)
+      PLAIN=1
       shift
       ;;
     --no-notify)
@@ -243,6 +325,9 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ "$PRUNE_DRY" -eq 1 && "$MODE" != "prune-delivered" ]]; then
   die_usage "--dry-run is only valid with --prune-delivered (the default mode is already a dry run)"
+fi
+if [[ "$PLAIN" -eq 1 && "$MODE" != "export-store" ]]; then
+  die_usage "--plain is only valid with --export-store"
 fi
 
 # --- environment -------------------------------------------------------------
@@ -297,6 +382,10 @@ WORK=""
 LOCK_HELD=0
 CUR_PGID=""
 WD_PID=""
+# Store export/import artifacts this run created (removed on failure only).
+EXPORT_TMPFILE=""
+EXPORT_SUBDIR=""
+RESTORE_DIR=""
 
 # reap_group <pgid>: TERM the whole process group, give it GRACE seconds to
 # empty, then KILL it. Returns immediately if the group no longer exists.
@@ -345,6 +434,11 @@ cleanup() {
     fi
     LOCK_HELD=0
   fi
+  # Only what this run created: the unique publication subdir and the file
+  # it made inside it, or a restore dir it made but did not finish.
+  [[ -n "$EXPORT_TMPFILE" ]] && rm -f "$EXPORT_TMPFILE"
+  [[ -n "$EXPORT_SUBDIR" ]] && rmdir "$EXPORT_SUBDIR" 2>/dev/null
+  [[ -n "$RESTORE_DIR" ]] && rm -rf "$RESTORE_DIR"
   [[ -n "$WORK" && -d "$WORK" ]] && rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -615,11 +709,12 @@ reclaim_mutex_take() {
 
 reclaim_mutex_release() { exec 9>&-; }
 
-# test_hook <phase>: test-only seam to pause at a decision point (runs with
-# fd 9 closed so a paused hook never holds the reclaim mutex itself).
+# test_hook <phase> [path]: test-only seam to pause at a decision point
+# (runs with fd 9 closed so a paused hook never holds the reclaim mutex
+# itself). Store publication seams pass the path they are about.
 test_hook() {
   [[ -n "$TEST_HOOK" ]] || return 0
-  "$TEST_HOOK" "$1" </dev/null >/dev/null 2>&1 9>&-
+  "$TEST_HOOK" "$@" </dev/null >/dev/null 2>&1 9>&-
   return 0
 }
 
@@ -1057,17 +1152,18 @@ priv_init() {
     PRIV_INIT_ERR="protected manifest $GLP_PROTECTED is not readable"
     return 1
   fi
+  # Grammar shared with the store export/import (glp_check_protected).
+  local out
+  if ! out="$(glp_check_protected "$GLP_PROTECTED")"; then
+    PRIV_INIT_ERR="protected manifest $GLP_PROTECTED $out"
+    return 1
+  fi
   re='^(.+) ([0-9a-f]{40}:[^: ]+:[a-z0-9-]+:[0-9]+)$'
   : >"$WORK/protected.raw"
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
     [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
-    if [[ "$line" =~ $re ]] && glp_bad_rel "${BASH_REMATCH[1]}"; then
-      PRIV_INIT_ERR="protected manifest $GLP_PROTECTED line $n: the repo path contains a backslash or control character"
-      return 1
-    fi
-    if [[ "$line" =~ $re ]] && [[ "${BASH_REMATCH[1]}" != /* && "${BASH_REMATCH[1]}" != ./* &&
-      "${BASH_REMATCH[1]}" != */ ]]; then
+    if [[ "$line" =~ $re ]]; then
       printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >>"$WORK/protected.raw"
     else
       PRIV_INIT_ERR="protected manifest $GLP_PROTECTED line $n: expected '<rel> <40-hex-commit>:<file>:<rule>:<line>'"
@@ -2108,6 +2204,920 @@ do_prune_delivered() {
     "$(delivered_summary "$WORK/delivered" | sed 's/^[0-9]* (//; s/;.*$//')" "$n_keep"
 }
 
+# --- store backup / restore --------------------------------------------------------
+
+SECURITY="${GITLEAKS_AUDIT_SECURITY:-/usr/bin/security}"
+OPENSSL="${GITLEAKS_AUDIT_OPENSSL:-/usr/bin/openssl}"
+SECURITY_TIMEOUT="${GITLEAKS_AUDIT_SECURITY_TIMEOUT:-30}"
+EXPORT_SERVICE="gitleaks-audit-export"
+STORE_MAX_BYTES=6291456 # decrypted and decompressed archive cap (6 MiB)
+STORE_MAX_MEMBERS=2000
+STORE_NAME_MAX=100 # ustar name field; the prefix field is never used
+ACCT=""
+EXPORT_PASS=""
+STORE_ERR=""
+SV_REPOS=0
+SV_PROTECTED=0
+SV_CONFIG=0
+
+# store_fail <message>: report a store export/import error (stderr) and set
+# the exit code. Callers return right after.
+store_fail() {
+  printf 'gitleaks-audit: ERROR: %s\n' "$*" >&2
+  EXIT_CODE=1
+}
+
+# shq <string>: shell-quoted, for printed copy-paste commands.
+shq() { printf '%q' "$1"; }
+
+# have_tty: an interactive terminal is attached (stdin is a TTY and
+# /dev/tty opens). launchd and pipelines have none.
+have_tty() { [[ -t 0 ]] && { : <>/dev/tty; } 2>/dev/null; }
+
+# utc_stamp: the run's UTC timestamp for artifact names.
+utc_stamp() { /bin/date -u -r "$NOW" +%Y%m%dT%H%M%SZ; }
+
+# ls_led_ok <path> <mode-string>: exactly one `ls -led` line (no ACL
+# entries), starting with the given mode string and no ACL marker.
+ls_led_ok() {
+  local out
+  out="$(LC_ALL=C /bin/ls -led -- "$1" 2>/dev/null)" || return 1
+  [[ -n "$out" && "$out" != *$'\n'* && "${out:0:10}" == "$2" && "${out:10:1}" != "+" ]]
+}
+
+# keychain_lookup: print the export passphrase from the keychain (stdout,
+# meant for a command substitution: it is never written to disk, argv, or
+# the environment). security runs in its own process group under a
+# SECURITY_TIMEOUT watchdog that kills the whole group. Returns security's
+# exit status, or 124 on timeout.
+keychain_lookup() {
+  local pid wd rc
+  rm -f "$WORK/keychain.timeout"
+  # shellcheck disable=SC2016 # perl code: $!/$ARGV are perl variables
+  "$PERL" -e 'setpgrp(0, 0) or die "setpgrp: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";' \
+    "$SECURITY" find-generic-password -s "$EXPORT_SERVICE" -a "$ACCT" -w 2>"$WORK/keychain.err" </dev/null &
+  pid=$!
+  (
+    sp=""
+    trap 'kill "$sp" 2>/dev/null; exit 0' TERM
+    sleep "$SECURITY_TIMEOUT" &
+    sp=$!
+    wait "$sp"
+    : >"$WORK/keychain.timeout"
+    kill -TERM -- "-$pid" 2>/dev/null
+    sleep 1 &
+    sp=$!
+    wait "$sp"
+    kill -KILL -- "-$pid" 2>/dev/null
+  ) >/dev/null 2>&1 </dev/null &
+  wd=$!
+  wait "$pid"
+  rc=$?
+  kill -TERM "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  kill -KILL -- "-$pid" 2>/dev/null
+  [[ -e "$WORK/keychain.timeout" ]] && return 124
+  return "$rc"
+}
+
+# get_export_passphrase <prompt-ok 0|1> <archive>: set EXPORT_PASS from the
+# keychain. Exit 44 is "not found (or search failure)": with prompt-ok and
+# a terminal, ask for it there (read -s, never echoed); otherwise an error.
+# Any other failure or a timeout is a hard error. 0 = set; 1 = error
+# (reported).
+get_export_passphrase() {
+  local prompt_ok="$1" archive="${2-}" rc
+  if [[ ! "$SECURITY_TIMEOUT" =~ ^[0-9]+$ || "$SECURITY_TIMEOUT" -eq 0 ]]; then
+    store_fail "GITLEAKS_AUDIT_SECURITY_TIMEOUT must be a positive integer"
+    return 1
+  fi
+  [[ -n "$ACCT" ]] || ACCT="${USER:-$(id -un 2>/dev/null)}"
+  EXPORT_PASS="$(keychain_lookup)"
+  rc=$?
+  case "$rc" in
+    0)
+      [[ -n "$EXPORT_PASS" ]] && return 0
+      store_fail "the keychain item '$EXPORT_SERVICE' (account '$ACCT') holds an empty passphrase; set it with: gitleaks-audit.sh --set-export-passphrase"
+      return 1
+      ;;
+    44)
+      if [[ "$prompt_ok" -eq 1 ]] && have_tty; then
+        printf 'export passphrase not found in the keychain; Passphrase for %s: ' "$archive" >/dev/tty
+        IFS= read -r -s EXPORT_PASS </dev/tty
+        printf '\n' >/dev/tty
+        [[ -n "$EXPORT_PASS" ]] && return 0
+        store_fail "no passphrase entered"
+        return 1
+      fi
+      if [[ "$prompt_ok" -eq 1 ]]; then
+        store_fail "export passphrase not found (or search failure; the CLI loses specificity) in the keychain (service '$EXPORT_SERVICE', account '$ACCT'), and there is no terminal to prompt for it; run this in Terminal, or set it with: gitleaks-audit.sh --set-export-passphrase"
+      else
+        store_fail "export passphrase not found (or search failure; the CLI loses specificity) in the keychain (service '$EXPORT_SERVICE', account '$ACCT'); set it with: gitleaks-audit.sh --set-export-passphrase"
+      fi
+      return 1
+      ;;
+    124)
+      store_fail "keychain lookup timed out after ${SECURITY_TIMEOUT}s (a keychain dialog waiting for an answer?); nothing done"
+      return 1
+      ;;
+    *)
+      store_fail "keychain lookup failed (security exit $rc): $(head -n1 "$WORK/keychain.err" 2>/dev/null | cut -c1-200)"
+      return 1
+      ;;
+  esac
+}
+
+do_set_export_passphrase() {
+  [[ -n "$ACCT" ]] || ACCT="${USER:-$(id -un 2>/dev/null)}"
+  if ! have_tty; then
+    die "--set-export-passphrase needs an interactive terminal (security prompts for the passphrase twice itself); nothing changed"
+  fi
+  echo "Storing the store-export passphrase in your default (login) keychain: service '$EXPORT_SERVICE', account '$ACCT'."
+  echo "security prompts for it twice; it is never passed in argv."
+  # -w must stay the LAST argument, with no value: security then prompts.
+  if ! "$SECURITY" add-generic-password -U -s "$EXPORT_SERVICE" -a "$ACCT" -w; then
+    die "security add-generic-password failed; nothing stored"
+  fi
+  cat <<'EOF'
+Stored. This is the local login keychain, not iCloud Keychain: the item is
+not synced to your other devices. Keep a copy of the passphrase off this Mac
+(e.g. in a password manager), or encrypted store archives cannot be opened
+after losing this Mac.
+EOF
+}
+
+# store_validate <base> <live|tree>: validate a whole store independent of
+# repo discovery. live: the chain from $HOME to <base> (glp_check_base);
+# tree: <base> itself (a private temp tree). Then repos/ (every node: only
+# directories, and regular files named gitleaks.toml or gitleaksignore at
+# repos/<rel>/, every rel passing glp_valid_rel), protected and config:
+# owner/mode/ACL checks on every node and the grammar of every file.
+# Writes $WORK/sv.dirs (repo dir rels) and $WORK/sv.files (repos/... file
+# paths), sorted, and sets SV_REPOS/SV_PROTECTED/SV_CONFIG. Returns 1 with
+# STORE_ERR on the first problem.
+store_validate() {
+  local base="$1" kind="$2" rc p rel name parent out f
+  STORE_ERR=""
+  SV_REPOS=0
+  SV_PROTECTED=0
+  SV_CONFIG=0
+  : >"$WORK/sv.dirs"
+  : >"$WORK/sv.files"
+  glp_ids
+  if [[ "$kind" == live ]]; then
+    if ! glp_platform_check; then
+      STORE_ERR="$GLP_ERR"
+      return 1
+    fi
+    glp_check_base
+    rc=$?
+    if [[ $rc -eq 1 ]]; then
+      STORE_ERR="no private store at $base (nothing to export)"
+      return 1
+    fi
+  else
+    glp_check_node "$base" dir
+    rc=$?
+  fi
+  if [[ $rc -ne 0 ]]; then
+    STORE_ERR="${GLP_ERR:-$base is missing}"
+    return 1
+  fi
+  glp_check_node "$base/repos" dir
+  rc=$?
+  case $rc in
+    0) SV_REPOS=1 ;;
+    1) ;;
+    *)
+      STORE_ERR="$GLP_ERR"
+      return 1
+      ;;
+  esac
+  for f in protected config; do
+    glp_check_node "$base/$f" file
+    rc=$?
+    case $rc in
+      0) [[ "$f" == protected ]] && SV_PROTECTED=1 || SV_CONFIG=1 ;;
+      1) ;;
+      *)
+        STORE_ERR="$GLP_ERR"
+        return 1
+        ;;
+    esac
+  done
+  if [[ $SV_REPOS -eq 0 && $SV_PROTECTED -eq 0 ]]; then
+    STORE_ERR="neither repos/ nor protected exists under $base: no store"
+    return 1
+  fi
+  if [[ $SV_PROTECTED -eq 1 ]] && ! out="$(glp_check_protected "$base/protected")"; then
+    STORE_ERR="$base/protected: $out"
+    return 1
+  fi
+  if [[ $SV_CONFIG -eq 1 ]] && ! { : <"$base/config"; } 2>/dev/null; then
+    STORE_ERR="$base/config is not readable"
+    return 1
+  fi
+  [[ $SV_REPOS -eq 1 ]] || return 0
+  if ! find "$base/repos" -mindepth 1 -print0 >"$WORK/sv.find" 2>"$WORK/sv.find.err"; then
+    STORE_ERR="cannot list $base/repos: $(head -n1 "$WORK/sv.find.err" | cut -c1-200)"
+    return 1
+  fi
+  while IFS= read -r -d '' p; do
+    rel="${p#"$base"/repos/}"
+    glp_lstat "$p"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+      STORE_ERR="${GLP_ERR:-$p disappeared while validating}"
+      return 1
+    fi
+    case "$GLP_ST_TYPE" in
+      dir)
+        if ! glp_valid_rel "$rel"; then
+          STORE_ERR="repos/$rel is not a valid repo path (empty, '.' or '..' component, backslash, or control character)"
+          return 1
+        fi
+        if ! glp_check_node "$p" dir; then
+          STORE_ERR="$GLP_ERR"
+          return 1
+        fi
+        printf '%s\n' "$rel" >>"$WORK/sv.dirs"
+        ;;
+      file)
+        name="${rel##*/}"
+        parent="${rel%/*}"
+        if [[ "$rel" != */* || ("$name" != gitleaks.toml && "$name" != gitleaksignore) ]]; then
+          STORE_ERR="unexpected file repos/$rel (a store holds only repos/<rel>/gitleaks.toml and repos/<rel>/gitleaksignore)"
+          return 1
+        fi
+        if ! glp_valid_rel "$parent"; then
+          STORE_ERR="repos/$rel: not under a valid repo path"
+          return 1
+        fi
+        if ! glp_check_node "$p" file; then
+          STORE_ERR="$GLP_ERR"
+          return 1
+        fi
+        if [[ "$name" == gitleaks.toml ]]; then
+          out="$(glp_check_toml "$p")"
+        else
+          out="$(glp_check_ignore "$p")"
+        fi
+        if [[ "$out" != OK ]]; then
+          STORE_ERR="repos/$rel: $out"
+          return 1
+        fi
+        printf 'repos/%s\n' "$rel" >>"$WORK/sv.files"
+        ;;
+      *)
+        STORE_ERR="unexpected $GLP_ST_TYPE at repos/$rel (a store holds only directories and regular files; no symlinks)"
+        return 1
+        ;;
+    esac
+  done <"$WORK/sv.find"
+  LC_ALL=C sort -o "$WORK/sv.dirs" "$WORK/sv.dirs" && LC_ALL=C sort -o "$WORK/sv.files" "$WORK/sv.files"
+}
+
+# store_members <out>: the archive member names for the validated store
+# (store_validate's lists), in archive order: repos/ entries (directories
+# with a trailing slash, sorted), protected, config, MANIFEST.
+store_members() {
+  {
+    if [[ $SV_REPOS -eq 1 ]]; then
+      {
+        echo "repos/"
+        awk '{ print "repos/" $0 "/" }' "$WORK/sv.dirs"
+        cat "$WORK/sv.files"
+      } | LC_ALL=C sort
+    fi
+    [[ $SV_PROTECTED -eq 1 ]] && echo protected
+    [[ $SV_CONFIG -eq 1 ]] && echo config
+    echo MANIFEST
+  } >"$1"
+}
+
+# USTAR_READER: perl validator for an uncompressed archive, run BEFORE any
+# extraction. Every 512-byte header must be strict ustar ("ustar\0", "00",
+# a valid unsigned checksum, octal-only numeric fields, no base-256, empty
+# linkname and prefix, the name ending at its first NUL with only NULs
+# after it) of typeflag '0'/'\0' (regular) or '5' (directory, size 0, name
+# ending in /); payload padding must be NUL; the archive must end with two
+# NUL blocks followed only by NULs. Names: no absolute paths, '..' or empty
+# components, no duplicates (also case- and normalization-insensitive, as
+# on APFS), only allowlisted members (MANIFEST, config, protected, repos/,
+# repos/<rel>/, repos/<rel>/gitleaks.toml|gitleaksignore), at most
+# <max> members. Prints "f <name>" / "d <name>" per member and exits 0, or
+# prints "<rule>: <detail>" and exits 1.
+# shellcheck disable=SC2016 # perl code
+USTAR_READER='use strict; use warnings; use feature "fc"; use Unicode::Normalize;
+my ($file, $max) = @ARGV;
+open(my $fh, "<", $file) or do { print "read: cannot open the archive: $!\n"; exit 2 };
+binmode $fh;
+my $data = do { local $/; <$fh> };
+close $fh;
+$data = "" unless defined $data;
+my ($len, $pos, $n) = (length($data), 0, 0);
+my (%seen, %folded, @out);
+sub rej { print "$_[0]\n"; exit 1 }
+sub shown { my $s = shift; $s =~ s/([^\x20-\x7e])/sprintf("\\x%02x", ord($1))/ge; return $s }
+sub rel_ok {
+  my $r = shift;
+  return 0 if $r eq "" || $r =~ /[\\\x00-\x1f\x7f]/;
+  for my $c (split m{/}, $r, -1) { return 0 if $c eq "" || $c eq "." || $c eq ".." }
+  return 1;
+}
+sub num {
+  my ($f, $what) = @_;
+  rej("header: base-256 (binary) numeric field $what is not allowed") if ord(substr($f, 0, 1)) & 0x80;
+  rej("header: malformed octal numeric field $what") unless $f =~ /\A[0-7]+[ \0]*\z/;
+  my ($d) = $f =~ /\A([0-7]+)/;
+  return oct($d);
+}
+while (1) {
+  rej("truncated: the archive ends without its two end-of-archive blocks") if $pos + 512 > $len;
+  my $h = substr($data, $pos, 512);
+  if ($h eq ("\0" x 512)) {
+    rej("truncated: the second end-of-archive block is missing") if $pos + 1024 > $len;
+    rej("trailing data after the end of archive (second end block not NUL)") if substr($data, $pos + 512, 512) ne ("\0" x 512);
+    rej("trailing data after the end of archive") if substr($data, $pos + 1024) =~ /[^\0]/;
+    last;
+  }
+  my $ck = substr($h, 148, 8);
+  rej("header: base-256 (binary) checksum field") if ord($ck) & 0x80;
+  rej("header: malformed checksum field") unless $ck =~ /\A[0-7]+[ \0]*\z/;
+  my ($ckd) = $ck =~ /\A([0-7]+)/;
+  my $t = $h;
+  substr($t, 148, 8) = " " x 8;
+  rej("header: checksum mismatch") unless oct($ckd) == unpack("%32C*", $t);
+  rej("header: magic is not \"ustar\\0\"") unless substr($h, 257, 6) eq "ustar\0";
+  rej("header: version is not \"00\"") unless substr($h, 263, 2) eq "00";
+  my $type = substr($h, 156, 1);
+  rej("typeflag \x27" . shown($type) . "\x27 is not allowed (only regular files and directories)")
+    unless $type eq "0" || $type eq "\0" || $type eq "5";
+  num(substr($h, 100, 8), "mode");
+  num(substr($h, 108, 8), "uid");
+  num(substr($h, 116, 8), "gid");
+  my $size = num(substr($h, 124, 12), "size");
+  num(substr($h, 136, 12), "mtime");
+  my $nf = substr($h, 0, 100);
+  my $name = $nf;
+  $name =~ s/\0.*\z//s;
+  rej("name: bytes after the first NUL are not all NUL (hidden suffix after " . shown($name) . ")")
+    if substr($nf, length($name)) =~ /[^\0]/;
+  rej("name: empty") if $name eq "";
+  rej("linkname is not empty: " . shown($name)) if substr($h, 157, 100) =~ /[^\0]/;
+  rej("prefix is not empty (long names are not allowed): " . shown($name)) if substr($h, 345, 155) =~ /[^\0]/;
+  my $isdir = $type eq "5";
+  if ($isdir) {
+    rej("directory entry with nonzero size: " . shown($name)) if $size != 0;
+    rej("directory entry whose name does not end in /: " . shown($name)) unless $name =~ m{/\z};
+  } else {
+    rej("regular entry whose name ends in /: " . shown($name)) if $name =~ m{/\z};
+  }
+  rej("absolute path: " . shown($name)) if $name =~ m{\A/};
+  my $p = $isdir ? substr($name, 0, -1) : $name;
+  my @c = split m{/}, $p, -1;
+  rej("\x27..\x27 path component: " . shown($name)) if grep { $_ eq ".." } @c;
+  rej("empty path component: " . shown($name)) if grep { $_ eq "" } @c;
+  my $ok = 0;
+  if (!$isdir && ($name eq "MANIFEST" || $name eq "config" || $name eq "protected")) { $ok = 1 }
+  elsif ($isdir && $name eq "repos/") { $ok = 1 }
+  elsif ($isdir && $name =~ m{\Arepos/(.+)/\z}s) { $ok = rel_ok($1) }
+  elsif (!$isdir && $name =~ m{\Arepos/(.+)/(?:gitleaks\.toml|gitleaksignore)\z}s) { $ok = rel_ok($1) }
+  rej("member not in the allowlist: " . shown($name)) unless $ok;
+  rej("duplicate member: " . shown($name)) if $seen{$name}++;
+  my $u = $name;
+  my $key = utf8::decode($u) ? fc(NFD($u)) : lc($name);
+  rej("case-insensitive duplicate member: " . shown($name)) if $folded{$key}++;
+  $n++;
+  rej("too many members (more than $max)") if $n > $max;
+  my $padded = $size + ((512 - $size % 512) % 512);
+  rej("truncated payload: " . shown($name)) if $pos + 512 + $padded > $len;
+  rej("payload padding is not all NUL: " . shown($name)) if substr($data, $pos + 512 + $size, $padded - $size) =~ /[^\0]/;
+  push @out, ($isdir ? "d " : "f ") . $name;
+  $pos += 512 + $padded;
+}
+rej("the archive has no members") unless @out;
+print "$_\n" for @out;
+exit 0;'
+
+# ustar_check <raw.tar> <out-members>: run USTAR_READER. 0 = valid (members
+# written); 1 = rejected (STORE_ERR names the rule); 2 = could not run.
+ustar_check() {
+  local rc
+  "$PERL" -e "$USTAR_READER" "$1" "$STORE_MAX_MEMBERS" >"$2" 2>"$WORK/reader.err"
+  rc=$?
+  case $rc in
+    0) return 0 ;;
+    1)
+      STORE_ERR="$(head -n1 "$2")"
+      return 1
+      ;;
+    *)
+      STORE_ERR="archive reader failed (exit $rc): $(head -n1 "$WORK/reader.err" 2>/dev/null | cut -c1-200)"
+      return 2
+      ;;
+  esac
+}
+
+# Publication helpers (perl, one syscall per decision; see do_export_store).
+# shellcheck disable=SC2016 # perl code
+PUBLISH_MKDIR='use strict; use warnings; use Errno;
+umask 077;
+my ($dir, $pid) = @ARGV;
+for (1 .. 50) {
+  my $p = sprintf("%s/.gitleaks-export.%s.%06d", $dir, $pid, int(rand(1000000)));
+  if (mkdir($p, 0700)) { print "$p\n"; exit 0 }
+  die "mkdir $p: $!\n" unless $!{EEXIST};
+}
+die "no free staging name in $dir\n";'
+
+# PUBLISH_WRITER <src> <dst> <hook>: create <dst> with O_CREAT|O_EXCL 0600,
+# check it carries no ACL (one `ls -led` line, -rw-------) BEFORE writing,
+# then write <src> into it (the file-created and mid-write test seams run
+# in between), fsync and close.
+# shellcheck disable=SC2016 # perl code
+PUBLISH_WRITER='use strict; use warnings; use Fcntl; use IO::Handle;
+my ($src, $dst, $hook) = @ARGV;
+umask 077;
+sub seam {
+  my ($phase) = @_;
+  return unless defined($hook) && length($hook);
+  my $pid = fork();
+  die "fork: $!\n" unless defined $pid;
+  if (!$pid) {
+    open(STDIN, "<", "/dev/null"); open(STDOUT, ">", "/dev/null"); open(STDERR, ">", "/dev/null");
+    exec { $hook } $hook, $phase, $dst;
+    exit 127;
+  }
+  waitpid($pid, 0);
+}
+sysopen(my $out, $dst, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600) or die "create $dst: $!\n";
+open(my $ls, "-|", "/bin/ls", "-led", "--", $dst) or die "ls $dst: $!\n";
+my @l = <$ls>;
+close($ls);
+die "$dst carries an ACL or an unexpected mode right after creation\n" unless @l == 1 && $l[0] =~ /\A-rw------- /;
+seam("file-created");
+open(my $in, "<", $src) or die "read $src: $!\n";
+binmode $in;
+my $data = do { local $/; <$in> };
+close($in);
+sub put {
+  my ($buf) = @_;
+  my $off = 0;
+  while ($off < length($buf)) {
+    my $w = syswrite($out, $buf, length($buf) - $off, $off);
+    die "write $dst: $!\n" unless defined $w;
+    $off += $w;
+  }
+}
+my $half = int(length($data) / 2);
+put(substr($data, 0, $half));
+seam("mid-write");
+put(substr($data, $half));
+$out->sync or die "fsync $dst: $!\n";
+close($out) or die "close $dst: $!\n";
+exit 0;'
+
+# PUBLISH_LINK <src> <dir> <base> <ext>: link(2) <src> to <dir>/<base><ext>,
+# else <base>-2<ext> ... <base>-99<ext> on EEXIST only (link never follows
+# or writes through an existing name, symlink, or directory); any other
+# errno is a hard error. Prints the published path.
+# shellcheck disable=SC2016 # perl code
+PUBLISH_LINK='use strict; use warnings; use Errno;
+my ($src, $dir, $base, $ext) = @ARGV;
+for my $i (1 .. 99) {
+  my $p = $dir . "/" . $base . ($i == 1 ? "" : "-$i") . $ext;
+  if (link($src, $p)) { print "$p\n"; exit 0 }
+  next if $!{EEXIST};
+  die "link $p: $!\n";
+}
+die "no free name for $base$ext in $dir (tried -2 ... -99)\n";'
+
+# export_dest_ok <dir>: an existing real directory (not a symlink, not
+# dangling) owned by the current user. Sets EXPORT_DEST (absolute, no
+# trailing slash) or STORE_ERR.
+EXPORT_DEST=""
+export_dest_ok() {
+  local d="$1" rc
+  while [[ "$d" == */ && "$d" != / ]]; do d="${d%/}"; done
+  [[ "$d" == /* ]] || d="$PWD/$d"
+  glp_ids
+  glp_lstat "$d"
+  rc=$?
+  if [[ $rc -eq 1 ]]; then
+    STORE_ERR="destination $d does not exist (create it first)"
+    return 1
+  elif [[ $rc -ne 0 ]]; then
+    STORE_ERR="$GLP_ERR"
+    return 1
+  fi
+  case "$GLP_ST_TYPE" in
+    dir) ;;
+    link)
+      STORE_ERR="destination $d is a symlink (dangling or not); give the real directory"
+      return 1
+      ;;
+    *)
+      STORE_ERR="destination $d is not a directory"
+      return 1
+      ;;
+  esac
+  if [[ "$GLP_ST_UID" != "$GLP_UID" ]]; then
+    STORE_ERR="destination $d is owned by uid $GLP_ST_UID, not you ($GLP_UID)"
+    return 1
+  fi
+  EXPORT_DEST="$d"
+}
+
+# publish_artifact <file> <ext>: publish atomically into EXPORT_DEST:
+#   1. a unique private subdir (perl mkdir 0700, umask 077)
+#   2. chmod -N on it, verified ACL-free and 700 BEFORE anything is created
+#      inside it (an inherited ACL would otherwise reach the new file)
+#   3. the file inside it (O_EXCL 0600, verified ACL-free, written, fsync)
+#   4. link(2) to the final name (-2 ... -99 on EEXIST)
+#   5. unlink the staging file, rmdir the subdir (the EXIT trap removes
+#      both on any failure)
+# Prints the published path and its sha256.
+publish_artifact() {
+  local src="$1" ext="$2" ts sub final h
+  if ! export_dest_ok "$EXPORT_DEST"; then
+    store_fail "$STORE_ERR; nothing published"
+    return 1
+  fi
+  ts="$(utc_stamp)"
+  if ! sub="$("$PERL" -e "$PUBLISH_MKDIR" "$EXPORT_DEST" "$$" 2>"$WORK/publish.err")" || [[ -z "$sub" ]]; then
+    store_fail "cannot create a private staging dir in $EXPORT_DEST: $(head -n1 "$WORK/publish.err"); nothing published"
+    return 1
+  fi
+  EXPORT_SUBDIR="$sub"
+  test_hook subdir-created "$sub"
+  if ! chmod -N "$sub" 2>/dev/null || ! ls_led_ok "$sub" drwx------; then
+    store_fail "cannot strip ACLs from the staging dir $sub (chmod -N), or it is not a private 700 dir; nothing published"
+    return 1
+  fi
+  test_hook after-strip "$sub"
+  EXPORT_TMPFILE="$sub/gitleaks-store-$ts$ext"
+  if ! "$PERL" -e "$PUBLISH_WRITER" "$src" "$EXPORT_TMPFILE" "$TEST_HOOK" 2>"$WORK/publish.err"; then
+    store_fail "cannot write the archive in $sub: $(head -n1 "$WORK/publish.err"); nothing published"
+    return 1
+  fi
+  if ! final="$("$PERL" -e "$PUBLISH_LINK" "$EXPORT_TMPFILE" "$EXPORT_DEST" "gitleaks-store-$ts" "$ext" 2>"$WORK/publish.err")" || [[ -z "$final" ]]; then
+    store_fail "cannot publish into $EXPORT_DEST: $(head -n1 "$WORK/publish.err"); nothing published"
+    return 1
+  fi
+  h="$(sha256_file "$final")"
+  if ! rm -f "$EXPORT_TMPFILE" 2>/dev/null; then
+    store_fail "published $final, but could not remove the staging file $EXPORT_TMPFILE"
+    return 1
+  fi
+  EXPORT_TMPFILE=""
+  if ! rmdir "$sub" 2>/dev/null; then
+    store_fail "published $final, but could not remove the staging dir $sub"
+    return 1
+  fi
+  EXPORT_SUBDIR=""
+  echo "published: $final"
+  echo "sha256: ${h:-unknown}"
+}
+
+# openssl_enc <in> <out> [-d]: AES-256-CBC with PBKDF2 (600000 iterations,
+# salted). The passphrase reaches openssl only on fd 3 (a pipe from a shell
+# builtin), never argv or the environment.
+openssl_enc() {
+  local in="$1" out="$2" dir="${3-}"
+  # shellcheck disable=SC2086 # $dir is empty or -d
+  printf '%s\n' "$EXPORT_PASS" | "$OPENSSL" enc $dir -aes-256-cbc -pbkdf2 -iter 600000 -salt \
+    -in "$in" -out "$out" -pass fd:3 3<&0 0</dev/null 2>>"$WORK/openssl.err"
+}
+
+do_export_store() {
+  local m ext=".tar.gz" artifact
+  local -a members=()
+  make_work
+  if ! export_dest_ok "$STORE_ARG"; then
+    store_fail "$STORE_ERR; nothing exported"
+    return
+  fi
+  # 1. The passphrase first: a missing keychain item must not cost a lock.
+  if [[ "$PLAIN" -eq 0 ]]; then
+    get_export_passphrase 0 || return
+  fi
+  # 2. The audit lock (a running audit never sees a half-read store).
+  acquire_lock
+  case $? in
+    0) ;;
+    2)
+      store_fail "$LOCK_ERR"
+      return
+      ;;
+    *)
+      EXIT_CODE=$LOCK_BUSY_EXIT
+      return
+      ;;
+  esac
+  # 3. The whole live store, independent of repo discovery.
+  if ! store_validate "$GLP_BASE" live; then
+    store_fail "store validation: $STORE_ERR; nothing exported"
+    return
+  fi
+  [[ $SV_REPOS -eq 1 && $SV_PROTECTED -eq 0 ]] &&
+    warn "$GLP_BASE has repos/ but no protected manifest (the audit reports a run ERROR); exporting what is there"
+  # 4. Member names: the ustar name field only (100 bytes, no prefix).
+  store_members "$WORK/members"
+  while IFS= read -r m; do
+    if [[ "$(printf '%s' "$m" | LC_ALL=C wc -c | tr -d ' ')" -gt "$STORE_NAME_MAX" ]]; then
+      store_fail "archive member name longer than $STORE_NAME_MAX bytes: $m (shorten the repo path); nothing exported"
+      return
+    fi
+    members+=("$m")
+  done <"$WORK/members"
+  # 5. A private, ACL-free staging tree with copies and a MANIFEST.
+  local stage
+  if ! stage="$(mktemp -d "$WORK/stage.XXXXXX")" || ! chmod 700 "$stage" || ! chmod -N "$stage" ||
+    ! ls_led_ok "$stage" drwx------; then
+    store_fail "cannot create a private ACL-free staging dir under ${TMPDIR:-/tmp}; nothing exported"
+    return
+  fi
+  : >"$WORK/manifest"
+  for m in "${members[@]}"; do
+    case "$m" in
+      MANIFEST) ;;
+      */)
+        if ! mkdir -p "$stage/$m" || ! chmod 700 "$stage/$m"; then
+          store_fail "cannot stage $m; nothing exported"
+          return
+        fi
+        ;;
+      *)
+        if ! { cat "$GLP_BASE/$m" >"$stage/$m" && chmod 600 "$stage/$m"; } 2>/dev/null; then
+          store_fail "cannot stage $m; nothing exported"
+          return
+        fi
+        printf '%s  %s\n' "$(sha256_file "$stage/$m")" "$m" >>"$WORK/manifest"
+        ;;
+    esac
+  done
+  if grep -q '^  ' "$WORK/manifest" || ! { cp "$WORK/manifest" "$stage/MANIFEST" && chmod 600 "$stage/MANIFEST"; } 2>/dev/null; then
+    store_fail "cannot write the MANIFEST; nothing exported"
+    return
+  fi
+  # The staged copies are what gets archived: validate them too (and that
+  # the store did not change shape while it was copied).
+  if ! store_validate "$stage" tree; then
+    store_fail "staged copy: $STORE_ERR; nothing exported"
+    return
+  fi
+  store_members "$WORK/members.staged"
+  if ! cmp -s "$WORK/members" "$WORK/members.staged"; then
+    store_fail "the store changed while it was being exported; nothing exported (retry)"
+    return
+  fi
+  # 6. ustar + gzip, explicit member order, no extended metadata.
+  if ! (cd "$stage" && COPYFILE_DISABLE=1 /usr/bin/tar --format ustar --no-mac-metadata --no-xattrs \
+    --no-acls --no-fflags -c -z -n -f "$WORK/store.tar.gz" "${members[@]}") 2>"$WORK/tar.err"; then
+    store_fail "tar failed: $(head -n1 "$WORK/tar.err"); nothing exported"
+    return
+  fi
+  # Self-check: the import's reader must accept exactly these members.
+  if ! /usr/bin/gzip -dc "$WORK/store.tar.gz" >"$WORK/check.tar" 2>/dev/null ||
+    ! ustar_check "$WORK/check.tar" "$WORK/check.members" ||
+    [[ "$(cut -c3- "$WORK/check.members")" != "$(cat "$WORK/members")" ]]; then
+    store_fail "the archive does not pass the import checks (${STORE_ERR:-member list differs}); nothing exported"
+    return
+  fi
+  artifact="$WORK/store.tar.gz"
+  # 7. Encrypt (default), and prove the passphrase opens it again.
+  if [[ "$PLAIN" -eq 0 ]]; then
+    if ! openssl_enc "$WORK/store.tar.gz" "$WORK/store.tar.gz.enc" ||
+      ! openssl_enc "$WORK/store.tar.gz.enc" "$WORK/verify.tar.gz" -d ||
+      ! cmp -s "$WORK/store.tar.gz" "$WORK/verify.tar.gz"; then
+      store_fail "encryption failed: $(head -n1 "$WORK/openssl.err" 2>/dev/null); nothing exported"
+      return
+    fi
+    artifact="$WORK/store.tar.gz.enc"
+    ext=".tar.gz.enc"
+  else
+    warn "WARNING: --plain writes an UNENCRYPTED archive. It holds sensitive metadata (repo names and paths, fingerprints of unrotated secrets; no secret values): keep it private and out of synced folders."
+  fi
+  EXPORT_PASS=""
+  # 8. Publish.
+  publish_artifact "$artifact" "$ext" || return
+}
+
+# manifest_verify <tree> <members>: MANIFEST must list every regular member
+# except itself, exactly once, with a matching sha256, and nothing else.
+manifest_verify() {
+  local root="$1" mlist="$2" line n=0 h p kind
+  if ! grep -qxF "f MANIFEST" "$mlist"; then
+    STORE_ERR="MANIFEST: missing from the archive"
+    return 1
+  fi
+  : >"$WORK/manifest.listed"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    if [[ ! "$line" =~ ^([0-9a-f]{64})\ \ (.+)$ ]]; then
+      STORE_ERR="MANIFEST: line $n is not '<sha256>  <path>'"
+      return 1
+    fi
+    h="${BASH_REMATCH[1]}"
+    p="${BASH_REMATCH[2]}"
+    if [[ "$p" == MANIFEST ]]; then
+      STORE_ERR="MANIFEST: lists itself"
+      return 1
+    fi
+    if grep -qxF -- "$p" "$WORK/manifest.listed"; then
+      STORE_ERR="MANIFEST: $p is listed twice"
+      return 1
+    fi
+    printf '%s\n' "$p" >>"$WORK/manifest.listed"
+    if ! grep -qxF -- "f $p" "$mlist"; then
+      STORE_ERR="MANIFEST: $p is listed in MANIFEST but not in the archive"
+      return 1
+    fi
+    if [[ "$(sha256_file "$root/$p")" != "$h" ]]; then
+      STORE_ERR="MANIFEST: sha256 mismatch for $p"
+      return 1
+    fi
+  done <"$root/MANIFEST"
+  while read -r kind p; do
+    [[ "$kind" == f && "$p" != MANIFEST ]] || continue
+    if ! grep -qxF -- "$p" "$WORK/manifest.listed"; then
+      STORE_ERR="MANIFEST: $p is in the archive but not listed in MANIFEST"
+      return 1
+    fi
+  done <"$mlist"
+  return 0
+}
+
+# tree_nodes <root>: "d <rel>/" or "f <rel>" per node (sorted); 1 when a
+# node is neither a directory nor a regular file.
+tree_nodes() {
+  local root="$1" p rel
+  find "$root" -mindepth 1 -print0 2>/dev/null | while IFS= read -r -d '' p; do
+    rel="${p#"$root"/}"
+    if [[ -L "$p" ]]; then
+      echo "x $rel"
+    elif [[ -d "$p" ]]; then
+      echo "d $rel/"
+    elif [[ -f "$p" ]]; then
+      echo "f $rel"
+    else
+      echo "x $rel"
+    fi
+  done | LC_ALL=C sort
+}
+
+do_import_store() {
+  local a="$STORE_ARG" enc=0 gz size ts d i top live=0
+  local -a ps=()
+  make_work
+  if [[ ! -f "$a" || ! -r "$a" ]]; then
+    store_fail "archive $a is not a readable regular file"
+    return
+  fi
+  case "$a" in *.enc) enc=1 ;; esac
+  [[ "$(LC_ALL=C head -c 8 "$a" 2>/dev/null)" == "Salted__" ]] && enc=1
+  gz="$a"
+  # 1. Decrypt (capped): the passphrase only on fd 3.
+  if [[ $enc -eq 1 ]]; then
+    get_export_passphrase 1 "$a" || return
+    printf '%s\n' "$EXPORT_PASS" | "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$a" \
+      -pass fd:3 3<&0 0</dev/null 2>"$WORK/openssl.err" | head -c "$STORE_MAX_BYTES" >"$WORK/decrypted.gz"
+    ps=("${PIPESTATUS[@]}")
+    EXPORT_PASS=""
+    size="$(wc -c <"$WORK/decrypted.gz" | tr -d ' ')"
+    if [[ "$size" -ge "$STORE_MAX_BYTES" ]]; then
+      store_fail "import rejected: size: the decrypted archive exceeds limit ($STORE_MAX_BYTES bytes); nothing restored"
+      return
+    fi
+    if [[ "${ps[1]}" -ne 0 ]]; then
+      store_fail "import rejected: decrypt error: wrong passphrase or damaged archive; nothing restored"
+      return
+    fi
+    if [[ "${ps[0]}" -ne 0 || "${ps[2]}" -ne 0 ]]; then
+      store_fail "import: cannot write the decrypted archive; nothing restored"
+      return
+    fi
+    gz="$WORK/decrypted.gz"
+  fi
+  # 2. Decompress (capped one byte past the limit to tell "at" from "over").
+  /usr/bin/gzip -dc <"$gz" 2>"$WORK/gzip.err" | head -c "$((STORE_MAX_BYTES + 1))" >"$WORK/raw.tar"
+  ps=("${PIPESTATUS[@]}")
+  size="$(wc -c <"$WORK/raw.tar" | tr -d ' ')"
+  if [[ "$size" -gt "$STORE_MAX_BYTES" ]]; then
+    store_fail "import rejected: size: the decompressed archive exceeds limit ($STORE_MAX_BYTES bytes); nothing restored"
+    return
+  fi
+  if [[ "${ps[0]}" -ne 0 ]]; then
+    if [[ $enc -eq 1 ]]; then
+      store_fail "import rejected: decrypt/decompress error: wrong passphrase or damaged archive ($(head -n1 "$WORK/gzip.err" | cut -c1-160)); nothing restored"
+    else
+      store_fail "import rejected: decompress error: damaged archive ($(head -n1 "$WORK/gzip.err" | cut -c1-160)); nothing restored"
+    fi
+    return
+  fi
+  if [[ "${ps[1]}" -ne 0 ]]; then
+    store_fail "import: cannot write the decompressed archive; nothing restored"
+    return
+  fi
+  # 3. Every header, before anything is extracted.
+  if ! ustar_check "$WORK/raw.tar" "$WORK/members"; then
+    store_fail "import rejected: $STORE_ERR; nothing restored"
+    return
+  fi
+  LC_ALL=C sort -o "$WORK/members.sorted" "$WORK/members"
+  # 4. Extract into a private ACL-free temp dir; normalize to 700/600.
+  local x
+  if ! x="$(mktemp -d "$WORK/extract.XXXXXX")" || ! chmod 700 "$x" || ! chmod -N "$x" ||
+    ! ls_led_ok "$x" drwx------; then
+    store_fail "import: cannot create a private ACL-free extraction dir; nothing restored"
+    return
+  fi
+  if ! (cd "$x" && COPYFILE_DISABLE=1 /usr/bin/tar -x --no-mac-metadata --no-xattrs --no-acls --no-fflags \
+    -f "$WORK/raw.tar") 2>"$WORK/tar.err"; then
+    store_fail "import: extraction failed: $(head -n1 "$WORK/tar.err"); nothing restored"
+    return
+  fi
+  if ! find "$x" -type d -exec chmod 700 {} + 2>/dev/null || ! find "$x" -type f -exec chmod 600 {} + 2>/dev/null ||
+    ! chmod -RN "$x" 2>/dev/null; then
+    store_fail "import: cannot normalize the extracted modes/ACLs; nothing restored"
+    return
+  fi
+  tree_nodes "$x" >"$WORK/nodes"
+  if ! cmp -s "$WORK/nodes" "$WORK/members.sorted"; then
+    store_fail "import rejected: the extracted tree does not match the archive members exactly; nothing restored"
+    return
+  fi
+  # 5. MANIFEST, both ways.
+  if ! manifest_verify "$x" "$WORK/members"; then
+    store_fail "import rejected: $STORE_ERR; nothing restored"
+    return
+  fi
+  # 6. The restored tree must be a valid store.
+  if ! store_validate "$x" tree; then
+    store_fail "import rejected: restored store: $STORE_ERR; nothing restored"
+    return
+  fi
+  # 7. Move it to a new restore-<UTC> dir; nothing live is touched.
+  if [[ ! -d "$GLP_BASE" ]] && ! mkdir -p "$GLP_BASE" 2>/dev/null; then
+    store_fail "import: cannot create $GLP_BASE; nothing restored"
+    return
+  fi
+  ts="$(utc_stamp)"
+  d=""
+  for i in $(seq 1 99); do
+    if [[ $i -eq 1 ]]; then d="$GLP_BASE/restore-$ts"; else d="$GLP_BASE/restore-$ts-$i"; fi
+    if mkdir "$d" 2>/dev/null; then
+      RESTORE_DIR="$d"
+      break
+    fi
+    d=""
+  done
+  if [[ -z "$d" ]]; then
+    store_fail "import: no free restore-$ts name under $GLP_BASE; nothing restored"
+    return
+  fi
+  for top in repos protected config MANIFEST; do
+    [[ -e "$x/$top" ]] || continue
+    if ! mv "$x/$top" "$d/" 2>/dev/null; then
+      store_fail "import: cannot move $top into $d; nothing restored"
+      return
+    fi
+  done
+  if ! chmod 700 "$d" 2>/dev/null; then
+    store_fail "import: cannot chmod $d; nothing restored"
+    return
+  fi
+  RESTORE_DIR=""
+  [[ -e "$GLP_REPOS" || -L "$GLP_REPOS" || -e "$GLP_PROTECTED" || -L "$GLP_PROTECTED" ]] && live=1
+  echo "restored into $d (verified; NOT installed: the live store was not touched)"
+  echo
+  if [[ $live -eq 1 ]]; then
+    echo "An existing store is live at $GLP_BASE. To install the restored one, move the live one aside first:"
+    echo "  mkdir $(shq "$GLP_BASE/backup-$ts")"
+    [[ -e "$GLP_REPOS" || -L "$GLP_REPOS" ]] && echo "  mv $(shq "$GLP_REPOS") $(shq "$GLP_BASE/backup-$ts/")"
+    [[ -e "$GLP_PROTECTED" || -L "$GLP_PROTECTED" ]] && echo "  mv $(shq "$GLP_PROTECTED") $(shq "$GLP_BASE/backup-$ts/")"
+  else
+    echo "No live store at $GLP_BASE (fresh install):"
+  fi
+  [[ -e "$d/repos" ]] && echo "  mv $(shq "$d/repos") $(shq "$GLP_REPOS")"
+  [[ -e "$d/protected" ]] && echo "  mv $(shq "$d/protected") $(shq "$GLP_PROTECTED")"
+  [[ -e "$d/config" ]] && echo "  [ -e $(shq "$GLP_BASE/config") ] || mv $(shq "$d/config") $(shq "$GLP_BASE/config")"
+  echo "  gitleaks-audit.sh --full"
+  cat <<'EOF'
+
+Consequences:
+  - While repos/ exists without protected, the audit reports a run ERROR:
+    move protected in together with repos/.
+  - During the move the commit hook sees no store at all: that only adds
+    blocking for valid stores, but a commit blocked only by a store error
+    can pass in that window.
+  - The audit state is not restored: the first scan after the install
+    baselines its findings (no NEW notifications), and pending
+    announcements from before are not restored.
+EOF
+}
+
 do_status() {
   local uid service
   uid="$(id -u)"
@@ -2232,6 +3242,15 @@ case "$MODE" in
   report) do_report ;;
   prune-delivered)
     do_prune_delivered
+    exit "$EXIT_CODE"
+    ;;
+  set-export-passphrase) do_set_export_passphrase ;;
+  export-store)
+    do_export_store
+    exit "$EXIT_CODE"
+    ;;
+  import-store)
+    do_import_store
     exit "$EXIT_CODE"
     ;;
   status) do_status ;;

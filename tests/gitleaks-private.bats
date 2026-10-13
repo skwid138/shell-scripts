@@ -790,3 +790,39 @@ re_accept() {
   lib 'GLP_TOML="$HOME/../empty.toml"; GLP_IGNORE=""; glp_files_digest; echo "rc=$?"'
   assert_line "rc=1"
 }
+
+# --- repo paths and the protected manifest grammar (shared with the store
+# export/import) ---------------------------------------------------------------
+
+@test "gitleaks-private: glp_valid_rel accepts nested repo paths and rejects empty, '.', '..', absolute, and control characters" {
+  local r
+  for r in alpha "team x/beta" "a/b/c" "dots.in.name/x-y_z"; do
+    EXTRA_ENV=(TERM=dumb R="$r")
+    lib 'glp_valid_rel "$R"'
+    assert_success
+  done
+  for r in "" "/abs" "a/" "./a" "a/./b" "a/../b" ".." "a//b" 'a\b' $'a\tb'; do
+    EXTRA_ENV=(TERM=dumb R="$r")
+    lib 'glp_valid_rel "$R"'
+    assert_failure
+  done
+  EXTRA_ENV=(TERM=dumb)
+}
+
+@test "gitleaks-private: glp_check_protected accepts '<rel> <full fingerprint>' lines and rejects the rest with a line number" {
+  printf '# rotate first\n\nalpha %s:src/a.txt:generic-api-key:3\nteam x/beta %s:b:jwt:1\n' "$FP40" "$FP40" >"$T/prot"
+  lib 'glp_check_protected "$HOME/../prot"'
+  assert_success
+  assert_output "OK"
+  local bad
+  for bad in "alpha ${FP40:0:12}:src/a.txt:jwt:3" "a/../b $FP40:x:jwt:1" "/abs $FP40:x:jwt:1" "alpha" "alpha $FP40:x:jwt"; do
+    printf '# c\n%s\n' "$bad" >"$T/prot"
+    lib 'glp_check_protected "$HOME/../prot"'
+    assert_failure
+    assert_output --regexp '^line 2: '
+  done
+  printf 'a\\b %s:x:jwt:1\n' "$FP40" >"$T/prot"
+  lib 'glp_check_protected "$HOME/../prot"'
+  assert_failure
+  assert_output "line 1: the repo path contains a backslash or control character"
+}

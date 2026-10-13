@@ -504,6 +504,52 @@ glp_check_ignore() {
   return 0
 }
 
+# glp_valid_rel <rel>: 0 when <rel> is a usable store repo path: non-empty,
+# relative, every '/'-separated component non-empty and neither '.' nor '..',
+# and no backslash or control character (glp_bad_rel). The protected
+# manifest, the store export/import, and store enumeration share this rule.
+glp_valid_rel() {
+  local rel="$1" rest comp
+  [[ -n "$rel" ]] || return 1
+  glp_bad_rel "$rel" && return 1
+  rest="$rel/"
+  while [[ -n "$rest" ]]; do
+    comp="${rest%%/*}"
+    rest="${rest#*/}"
+    case "$comp" in
+      "" | . | ..) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# glp_check_protected <file>: grammar of the protected manifest. Blank lines
+# and # comments, otherwise exactly `<rel> <40-hex-commit>:<file>:<rule>:<line>`
+# where <rel> passes glp_valid_rel. Prints "OK" (returns 0) or
+# "line N: <reason>" (returns 1).
+glp_check_protected() {
+  local line n=0 re='^(.+) ([0-9a-f]{40}:[^: ]+:[a-z0-9-]+:[0-9]+)$'
+  if ! { : <"$1"; } 2>/dev/null; then
+    echo "cannot read $1"
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ $re ]] && glp_bad_rel "${BASH_REMATCH[1]}"; then
+      echo "line $n: the repo path contains a backslash or control character"
+      return 1
+    fi
+    if [[ "$line" =~ $re ]] && glp_valid_rel "${BASH_REMATCH[1]}"; then
+      continue
+    fi
+    echo "line $n: expected '<rel> <40-hex-commit>:<file>:<rule>:<line>'"
+    return 1
+  done <"$1"
+  echo OK
+  return 0
+}
+
 # glp_identity <dir>: the store identity of the repo containing <dir>. The
 # git common dir decides: if it ends in /.git its parent is the main repo
 # (so linked worktrees share the main repo's store); otherwise (submodules,
