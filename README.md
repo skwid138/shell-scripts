@@ -249,7 +249,17 @@ A few scripts here are interactive launchers wired up via aliases in
   A delivered announcement whose fingerprint never reaches that repo's
   known (finding gone or suppressed before recovery, repo excluded or
   removed) stays in the pending file, marked delivered, indefinitely, so a
-  later reappearance is not reported as NEW. The audit trusts a repo as
+  later reappearance is not reported as NEW. `--report` lists those
+  delivered entries (repo, rule, file:line, with counts; entries whose
+  fingerprint is already in known are marked, since the next `--run` drops
+  them). `gitleaks-audit.sh --prune-delivered` removes both delivered kinds
+  under the audit lock, whatever known says, and keeps every other row
+  byte-for-byte (the next `--run` still announces them); it never notifies,
+  exits 75 when the lock is busy, and exits 1 with the pending file
+  untouched on any read/write/rename/log failure. Afterwards a pruned
+  fingerprint that reappears is NEW if its repo has a known file, or
+  baselined if not. Preview with `--prune-delivered --dry-run` (no lock,
+  log, or state writes). The audit trusts a repo as
   unchanged only when its findings, provenance, and
   snapshot agree, and rescans it as "unsettled" otherwise (the first run
   after upgrading rescans every repo once, since older state has no
@@ -259,7 +269,69 @@ A few scripts here are interactive launchers wired up via aliases in
   and a mid-scan content change keeps the audit snapshot from advancing),
   but an accidental edit made and undone entirely within one scan window
   cannot be seen. The threat model is accidents, not same-user tampering.
-  The store is local-only: back it up yourself.
+  The store is local-only: back it up with `--export-store` (below).
+
+#### Backing up and restoring the private store
+
+The store (`~/.config/gitleaks-audit/repos/`, `protected`, and `config`) is
+backed up with an encrypted archive and restored by hand:
+
+```bash
+gitleaks-audit.sh --set-export-passphrase       # once, in Terminal
+gitleaks-audit.sh --export-store <dest-dir>     # gitleaks-store-<UTC>.tar.gz.enc
+gitleaks-audit.sh --import-store <archive>      # verify + unpack to restore-<UTC>/
+```
+
+- **Passphrase.** `--set-export-passphrase` runs `security
+  add-generic-password -U -s gitleaks-audit-export -a "$USER" -w` (it needs a
+  terminal; `security` prompts twice, and the passphrase never appears in
+  argv). A new item goes to your default keychain; with `-U` an existing
+  matching item anywhere in the keychain search list is updated where it
+  is. A `security` CLI generic password lives in the **file-based login
+  keychain, not in iCloud Keychain** (which syncs through the Passwords
+  app), so it does **not** sync to your other devices. Keep a copy of the
+  passphrase off this Mac (e.g. in a password manager): without it the
+  archives cannot be opened after losing this Mac. Export reads it with
+  `find-generic-password` (30 s watchdog; "not found" says how to set it).
+- **Export.** Validates the whole store first, independent of repo
+  discovery (only directories and `repos/<rel>/gitleaks.toml|gitleaksignore`,
+  every grammar, owner/mode/ACL checks, member names up to 100 bytes);
+  anything unexpected means no artifact. The archive (ustar + gzip with a
+  `MANIFEST` of sha256 sums; never `review/`, `restore-*/`, or audit state)
+  is encrypted with `openssl enc -aes-256-cbc -pbkdf2 -iter 600000`, the
+  passphrase passed on a file descriptor only, and published atomically
+  into `<dest-dir>` (an existing real directory you own) as a 600 file with
+  no ACL; the path and sha256 are printed. It runs under the audit lock
+  (exit 75 when busy). `--plain` skips encryption: avoid it.
+- **What the archive holds.** Sensitive metadata: repo names and paths,
+  rules, and full fingerprints (commit:file:rule:line) of findings,
+  including unrotated secrets, but no secret values.
+- **iCloud.** An encrypted archive may live in iCloud Drive. With standard
+  iCloud data protection Apple holds the keys for iCloud Drive; with
+  Advanced Data Protection only your devices do. Never put the live store
+  itself in iCloud or any synced folder (its validation requires a local,
+  non-symlinked, owner-only path). How iCloud Drive's File Provider treats
+  the export folder (e.g. evicting local copies) is verified when the
+  backup is activated.
+- **Import** never touches the live `repos/`, `protected`, or `config` and
+  takes no lock. It decrypts (keychain passphrase, else a terminal prompt;
+  no terminal is an error) and decompresses under 6 MiB caps, checks every
+  tar header before anything is extracted (strict ustar, regular files and
+  directories only, allowlisted names, no links, `..`, duplicates, or
+  hidden name suffixes), verifies `MANIFEST` both ways, validates the result
+  like a live store, and moves it to `~/.config/gitleaks-audit/restore-<UTC>/`.
+- **Install (manual), as printed by the import.** Fresh machine:
+  `mv restore-<UTC>/repos ~/.config/gitleaks-audit/repos`, the same for
+  `protected`, and `config` only if none exists. Existing store: first move
+  the live `repos/` and `protected` into a `backup-<UTC>/` dir, then move the
+  restored ones in, then run `gitleaks-audit.sh --full`.
+- **Restore scope and consequences.** Only the store is restored. Audit
+  state is not: the first scan afterwards baselines (no NEW
+  notifications), and pending announcements are not restored. While
+  `repos/` exists without `protected` the audit reports a run ERROR, so
+  move them together. During the move the commit hook sees no store: that
+  only adds blocking for a valid store, but a commit blocked only by a
+  store error can pass in that window.
 
 ## Development
 
@@ -277,8 +349,14 @@ make help           # list all targets
 
 CI runs `lint-strict`, `fmt-check`, and **both** `test-serial` and
 `test-parallel` as side-by-side blocking jobs (macOS + Ubuntu matrix),
-plus a separate gitleaks job for secret scanning. Two test jobs let us
-distinguish serial-only regressions from parallel-only regressions.
+plus a separate gitleaks job for secret scanning (`gitleaks git` over the
+full history). Two test jobs let us distinguish serial-only regressions
+from parallel-only regressions. Ubuntu jobs install gitleaks through
+`.github/actions/install-gitleaks` (one pinned version and SHA256 in the
+workflow env, verified before extracting); macOS jobs use Homebrew. Every
+test job keeps its TAP output and fails unless the four real-gitleaks hook
+tests in `tests/gitleaks-hook.bats` ran (`ok`, never `# skip`), checked by
+`.github/scripts/require-real-gitleaks-tests.sh`.
 
 Parallel test execution requires GNU `parallel` on PATH (preinstalled on
 GitHub-hosted runners; `brew install parallel` for local dev). The
@@ -319,6 +397,27 @@ agent is attempted even if an earlier one fails; the target then exits
 nonzero and names the failures. Agents are per-user (`gui/<uid>`), render
 their plist with absolute paths from the current `$HOME`, use
 `RunAtLoad false`, and are never kickstarted on install.
+
+Shutdown exercise (opt-in, manual, talks to your launchd; a few minutes):
+
+```bash
+agent/launchd-shutdown-check.sh --target gitleaks-audit          # describe only
+agent/launchd-shutdown-check.sh --target gitleaks-audit --run
+agent/launchd-shutdown-check.sh --target cache-prune --run
+```
+
+It bootstraps a throwaway `com.skwid138.shutdowntest.<pid>` job (refusing
+if that label exists) that runs the real script with a temp `HOME`, a
+stub-first base PATH (no Homebrew or OrbStack), a fake nvm default, and a
+production-like plist, after checking each tool's resolution explicitly.
+A stubbed step (`gitleaks git` / `uv cache prune`) marks itself, spawns a
+descendant, and hangs; the exercise stops it with `launchctl bootout` and
+with `launchctl kill TERM` (always the exact service `gui/<uid>/<label>`),
+then checks that the process group empties, the lock is released or
+reclaimable, nothing is published, and the next run exits 0. All checks
+are reported before the cleanup trap, which only touches this run's job,
+processes, and temp dir. The real agents are only read with `launchctl
+print` (before and after; they must match).
 
 ## Conventions
 

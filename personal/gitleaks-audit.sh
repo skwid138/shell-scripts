@@ -80,12 +80,12 @@ protected, and config under ~/.config/gitleaks-audit):
                 it twice and it never appears in argv). A new item goes to
                 your default keychain, the local file-based login keychain;
                 with -U an existing matching item anywhere in the keychain
-                search list is updated where it is. This is the login
-                keychain, not iCloud Keychain: the item is not synced to your
-                other devices, so
-                keep a copy of the passphrase off this Mac (e.g. in a
-                password manager) or the encrypted archives are unreadable
-                after losing this Mac.
+                search list is updated where it is. A `security` CLI generic
+                password lives in that file-based login keychain, not in
+                iCloud Keychain (which syncs through the Passwords app), so
+                it does not sync to your other devices: keep a copy of the
+                passphrase off this Mac (e.g. in a password manager) or the
+                encrypted archives are unreadable after losing this Mac.
   --export-store <dest-dir> [--plain]
                 Write a backup archive of the store into <dest-dir> (an
                 existing real directory you own; not a symlink). The whole
@@ -124,7 +124,9 @@ protected, and config under ~/.config/gitleaks-audit):
   iCloud: an encrypted archive may go to iCloud Drive (standard iCloud
   encrypts it in transit and at rest, but Apple holds those keys unless
   Advanced Data Protection is on); never put the live store itself in
-  iCloud or any synced folder. Restore scope: the store only; audit state
+  iCloud or any synced folder. How iCloud Drive's File Provider treats the
+  export folder (e.g. evicting local copies) is verified when the backup is
+  activated. Restore scope: the store only; audit state
   is not restored, so the first scan after a restore baselines (no NEW
   notifications) and pending announcements are not restored. While
   repos/ exists without protected the audit reports a run ERROR, and
@@ -2339,10 +2341,11 @@ do_set_export_passphrase() {
     die "security add-generic-password failed; nothing stored"
   fi
   cat <<'EOF'
-Stored. This is the local login keychain, not iCloud Keychain: the item is
-not synced to your other devices. Keep a copy of the passphrase off this Mac
-(e.g. in a password manager), or encrypted store archives cannot be opened
-after losing this Mac.
+Stored in the file-based login keychain. A security CLI generic password
+is not an iCloud Keychain item (iCloud Keychain syncs through the Passwords
+app), so it does not sync to your other devices. Keep a copy of the
+passphrase off this Mac (e.g. in a password manager), or encrypted store
+archives cannot be opened after losing this Mac.
 EOF
 }
 

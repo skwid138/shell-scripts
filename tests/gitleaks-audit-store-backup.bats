@@ -314,7 +314,8 @@ good_plain_archive() {
   assert_success
   local m
   for m in --set-export-passphrase "--export-store <dest-dir> [--plain]" "--import-store <archive>" \
-    "login keychain" "not iCloud Keychain" "Advanced Data Protection" "never put the live store" \
+    "file-based login keychain" "iCloud Keychain (which syncs through the Passwords app)" \
+    "does not sync to your other devices" "File Provider" "Advanced Data Protection" "never put the live store" \
     "off this Mac" "GITLEAKS_AUDIT_SECURITY" "GITLEAKS_AUDIT_OPENSSL" "restore-<UTC" "--full"; do
     assert_output --partial -- "$m"
   done
