@@ -279,8 +279,13 @@ Exit codes:
       reclaim mutex file unopenable or its perl helper or flock failing, or
       a stale lock that cannot be removed); new findings are still notified
       and recorded
+      Also 1 instead of 0, 10 or 75 whenever a process group (scan,
+      notification, keychain lookup) could not be started (readiness FIFO,
+      no readiness within 5s, or an earlier group still registered) or
+      confirmed empty, including the lock-busy notification below
   2   usage error
-  75  another run holds the lock, or is reclaiming it (contention only)
+  75  another run holds the lock, or is reclaiming it (contention only;
+      1 instead if the lock-busy notification's process group fails)
 
 Environment overrides (tests/advanced use):
   GITLEAKS_AUDIT_BASE_PATH   PATH to use instead of the built-in one
@@ -295,8 +300,8 @@ Environment overrides (tests/advanced use):
   GITLEAKS_AUDIT_RECLAIM_WAIT  seconds to wait for the reclaim mutex (default 10)
   GITLEAKS_AUDIT_TEST_HOOK   test-only: command run at lock decision points,
                              store-export publication seams, after a process
-                             group or keychain lookup is started (before it
-                             is registered), and before the exclusive create
+                             group, keychain lookup, or watchdog is started
+                             (before it is registered), and before the exclusive create
                              of the --prune-delivered temp file
   GITLEAKS_AUDIT_SECURITY    keychain CLI (default /usr/bin/security)
   GITLEAKS_AUDIT_OPENSSL     openssl for the store archive (default
@@ -937,11 +942,14 @@ group_watchdog() {
 }
 
 # start_watchdog <pgid> <marker> <secs> <grace>: launch and register WD_PID
-# in one critical section.
+# in one critical section (the watchdog-launched test seam sits between).
 start_watchdog() {
+  local p
   begin_critical
   group_watchdog "$@" >/dev/null 2>&1 </dev/null 7>&- 8>&- 9>&- &
-  WD_PID=$!
+  p=$!
+  test_hook watchdog-launched "$p"
+  WD_PID=$p
   end_critical
 }
 
@@ -951,10 +959,12 @@ start_watchdog() {
 # CUR_PGID are one critical section (the <hook-phase> test seam sits
 # between them). Then the group's readiness byte is awaited (read builtin,
 # interruptible by TERM/INT) for READY_WAIT seconds. 0 = started,
-# registered, ready. 1 = not started (RG_ERR set): another group is still
-# registered (entry guard), no readiness FIFO, or no readiness (the leader
-# is killed directly and reaped; the group, if it formed, is reaped too and
-# stays registered when that cannot be confirmed).
+# registered, ready. 1 = not started (RG_ERR and RG_FAILED set): another
+# group is still registered (entry guard), no readiness FIFO, or no
+# readiness (the leader is killed directly and reaped; the group, if it
+# formed, is reaped too and stays registered when that cannot be
+# confirmed). Every process-group failure sets RG_FAILED, so the run never
+# ends 0/10/75 after one (finish).
 spawn_group() {
   local dir="$1" out="$2" err="$3" phase="$4" fifo pid byte="" end
   shift 4
@@ -969,6 +979,7 @@ spawn_group() {
   if ! mkfifo -m 600 "$fifo" 2>/dev/null || ! { exec 8<>"$fifo"; } 2>/dev/null; then
     rm -f "$fifo" 2>/dev/null
     RG_ERR="not started: cannot create its readiness FIFO $fifo"
+    RG_FAILED=1
     return 1
   fi
   begin_critical
@@ -997,11 +1008,11 @@ spawn_group() {
   kill -KILL "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   RG_ERR="not started: no readiness from its process group within ${READY_WAIT}s (leader $pid killed)"
+  RG_FAILED=1
   if reap_group "$pid" 0; then
     CUR_PGID=""
   else
     RG_ERR="$RG_ERR; process group $pid could not be confirmed empty after TERM and KILL"
-    RG_FAILED=1
   fi
   return 1
 }
@@ -1892,6 +1903,8 @@ do_scan_mode() { # dry-run | run | full
         ;;
       *)
         EXIT_CODE=$LOCK_BUSY_EXIT
+        # Best effort (not delivered is fine), but a process-group failure
+        # of the notification (RG_FAILED) turns the exit into 1 (finish).
         [[ -n "$LOCK_BUSY_NOTE" ]] && { send_notify "$LOCK_BUSY_NOTE" || true; }
         return
         ;;
@@ -3621,8 +3634,9 @@ do_uninstall() {
   fi
 }
 
-# finish <code>: exit, but never 0/10/75 after a process group could not be
-# started cleanly or confirmed empty (RG_FAILED).
+# finish <code>: exit, but never 0/10/75 after any process-group failure
+# (RG_FAILED: a group not started - entry guard, readiness FIFO, readiness -
+# or not confirmed empty), e.g. the lock-busy notification.
 finish() {
   if [[ "$RG_FAILED" -eq 1 && "$1" -ne 130 && "$1" -ne 143 ]]; then
     exit 1

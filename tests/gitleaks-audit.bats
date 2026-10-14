@@ -3385,3 +3385,106 @@ HOOK
     rm -f "$p"
   done
 }
+
+# old_live_lock: a lock held by a live pid for two days (the busy path
+# notifies); sets HOLDER.
+old_live_lock() {
+  sleep 120 &
+  HOLDER=$!
+  mkdir -p "$(LOCKD)"
+  printf 'pid=%s\nhost=%s\nstarted=%s\n' "$HOLDER" "$(/bin/hostname)" "$(($(/bin/date -u +%s) - 2 * 86400))" >"$(LOCKD)/owner"
+}
+
+@test "gitleaks-audit: busy lock: a notification whose process group never confirms readiness makes the run exit 1, not 75" {
+  mkrepo alpha
+  old_live_lock
+  cat >"$T/hangperl" <<EOF
+#!/usr/bin/perl
+if ((grep { /setpgrp/ } @ARGV) && ! -e "$FIX/hang.pid") {
+  setpgrp(0, 0) or exit 121;
+  open(my \$f, '>', "$FIX/hang.pid") or die; print \$f "\$\$\\n"; close \$f;
+  sleep 600 while 1;
+}
+exec '/usr/bin/perl', @ARGV or exit 126;
+EOF
+  chmod +x "$T/hangperl"
+  bg_audit "$T/b" GITLEAKS_AUDIT_PERL="$T/hangperl" -- --run
+  wait_bounded "$BG_PID" 20
+  kill "$HOLDER" 2>/dev/null
+  [[ "$RC" -eq 1 ]]
+  proc_dead "$(cat "$FIX/hang.pid")"
+  grep -q "ERROR: notification: not started: no readiness" "$T/b.out"
+  run notifies
+  assert_output ""
+  [[ "$(scans)" -eq 0 ]]
+}
+
+@test "gitleaks-audit: busy lock: a notification whose readiness FIFO cannot be created makes the run exit 1, not 75" {
+  mkrepo alpha
+  old_live_lock
+  printf '#!/bin/bash\necho "mkfifo: forced failure" >&2\nexit 1\n' >"$STUBS/mkfifo"
+  chmod +x "$STUBS/mkfifo"
+  bg_audit "$T/b" -- --run
+  wait_bounded "$BG_PID" 20
+  kill "$HOLDER" 2>/dev/null
+  [[ "$RC" -eq 1 ]]
+  grep -q "ERROR: notification: not started: cannot create its readiness FIFO" "$T/b.out"
+  run notifies
+  assert_output ""
+}
+
+@test "gitleaks-audit: busy lock: a notification group that cannot be confirmed empty makes the run exit 1, not 75" {
+  mkrepo alpha
+  old_live_lock
+  printf '#!/bin/bash\nexit 0\n' >"$T/liveprobe"
+  chmod +x "$T/liveprobe"
+  bg_audit "$T/b" GITLEAKS_AUDIT_GROUP_PROBE="$T/liveprobe" -- --run
+  wait_bounded "$BG_PID" 30
+  kill "$HOLDER" 2>/dev/null
+  [[ "$RC" -eq 1 ]]
+  grep -q "ERROR: notification: process group .* could not be confirmed empty" "$T/b.out"
+  run notifies
+  assert_output --partial "lock held"
+}
+
+@test "gitleaks-audit: --help documents that a process-group failure turns 0/10/75 into 1" {
+  run_audit --help
+  assert_success
+  assert_output --partial "Also 1 instead of 0, 10 or 75 whenever a process group"
+  assert_output --partial "1 instead if the lock-busy notification's process group fails"
+}
+
+# children_of <pid>: "pid command" of its current child processes.
+children_of() {
+  /bin/ps -A -o pid=,ppid=,command= | awk -v p="$1" '$2 == p { $2 = ""; print }'
+}
+
+@test "gitleaks-audit: TERM between starting a watchdog and registering it stops that watchdog and its sleep (143)" {
+  mkrepo alpha
+  touch "$FIX/hang.alpha"
+  first_pause_hook watchdog-launched
+  bg_audit "$T/b" GITLEAKS_AUDIT_TIMEOUT=60 GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --run
+  wait_for test -e "$FIX/paused"
+  local wd sl
+  wd="$(cat "$FIX/hook.arg")"
+  [[ "$wd" =~ ^[0-9]+$ ]]
+  # The matcher really sees the watchdog: a shell of this run (a child of
+  # the audit) whose child is a 1s sleep.
+  [[ "$(/bin/ps -o ppid= -p "$wd" | tr -d ' ')" == "$BG_PID" ]]
+  [[ "$(/bin/ps -o command= -p "$wd")" == *gitleaks-audit.sh* ]]
+  wait_for eval '[[ -n "$(children_of "$wd" | grep "sleep 1$")" ]]'
+  sl="$(children_of "$wd" | awk '/sleep 1$/ { print $1; exit }')"
+  [[ "$sl" =~ ^[0-9]+$ ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/go"
+  wait_bounded "$BG_PID" 20
+  [[ "$RC" -eq 143 ]]
+  # Gone right away: the watchdog (registered, so stopped by cleanup) ...
+  run kill -0 "$wd"
+  assert_failure
+  # ... and its current 1s sleep within a second of it.
+  proc_dead "$sl"
+  [[ -z "$(children_of "$wd")" ]]
+  proc_dead "$(cat "$FIX/leader.pid")"
+  [[ ! -e "$(LOCKD)" ]]
+}
