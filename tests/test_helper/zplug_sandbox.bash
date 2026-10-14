@@ -24,11 +24,16 @@ zplug_sandbox() {
 # suite's ACTUAL setup(). Points every zplug path override at sentinel dirs
 # and files outside the sandbox, exports them, re-runs the suite's setup(),
 # then sources the snippet in zsh and prints the zplug paths zplug resolved
-# there. Each must be under the per-test sandbox (or unset, where zplug is
-# not installed), and every sentinel must be byte-unchanged.
+# there. When zplug is installed (the init.zsh that rc/zsh_plugins.zsh
+# sources exists), zplug must have initialized (its `zplug` function is
+# defined) and every path must be set and under the per-test sandbox; when
+# it is absent, zplug must not have loaded and only ZPLUG_HOME (exported by
+# the setup) may be set. Every sentinel must be byte-unchanged.
 # shellcheck disable=SC2154 # status/output are set by bats' run
 assert_setup_sandboxes_zplug() {
-  local snippet="$1" out="$BATS_TEST_TMPDIR/outside-zplug" n before after line
+  local snippet="$1" out="$BATS_TEST_TMPDIR/outside-zplug" n before after line init installed=0
+  init="$(sed -n 's/^[[:space:]]*source "\(.*zplug\/init\.zsh\)".*/\1/p' "$REPO/shell/rc/zsh_plugins.zsh" | head -n 1)"
+  [[ -n "$init" && -f "$init" ]] && installed=1
   mkdir -p "$out"
   for n in home bin repos cache root; do
     mkdir -p "$out/$n"
@@ -47,6 +52,7 @@ assert_setup_sandboxes_zplug() {
     for v in ZPLUG_HOME ZPLUG_BIN ZPLUG_REPOS ZPLUG_LOADFILE ZPLUG_CACHE_DIR ZPLUG_ERROR_LOG; do
       print -r -- \"\$v=\${(P)v}\"
     done
+    print -r -- \"ZPLUG_FN=\$+functions[zplug]\"
     print -r -- \"ROOT=\${ZPLUG_ROOT-}\"
     print -r -- \"LEGACY=\${ZPLUG_CACHE_FILE-}\${ZPLUG_SHALLOW-}\${ZPLUG_CLONE_DEPTH-}\""
   [[ "$status" -eq 0 ]] || {
@@ -59,12 +65,29 @@ assert_setup_sandboxes_zplug() {
       return 1
     }
     line="${line#*=}"
-    [[ "$line" == "$BATS_TEST_TMPDIR/.zplug" || "$line" == "$BATS_TEST_TMPDIR/.zplug/"* ||
-      ($n != ZPLUG_HOME && -z "$line") ]] || {
-      echo "$n resolved outside the sandbox: '$line'" >&2
+    if [[ $installed -eq 1 || $n == ZPLUG_HOME ]]; then
+      [[ "$line" == "$BATS_TEST_TMPDIR/.zplug" || "$line" == "$BATS_TEST_TMPDIR/.zplug/"* ]] || {
+        echo "$n is not set inside the sandbox: '$line'" >&2
+        return 1
+      }
+    else
+      [[ -z "$line" ]] || {
+        echo "zplug is not installed, yet $n is set: '$line'" >&2
+        return 1
+      }
+    fi
+  done
+  if [[ $installed -eq 1 ]]; then
+    printf '%s\n' "$output" | grep -qx "ZPLUG_FN=1" || {
+      echo "zplug ($init) is installed but did not initialize: $output" >&2
       return 1
     }
-  done
+  else
+    printf '%s\n' "$output" | grep -qx "ZPLUG_FN=0" || {
+      echo "zplug is not installed, yet a zplug function is defined: $output" >&2
+      return 1
+    }
+  fi
   [[ "$output" != *"$out"* ]] || {
     echo "an outside override leaked into zsh: $output" >&2
     return 1

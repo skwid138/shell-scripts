@@ -449,7 +449,7 @@ good_plain_archive() {
   assert_success
   assert_output --partial "published: $DEST/gitleaks-store-$TS.tar.gz"
   # One prefix only: lib/common.sh warn() already prints "Warning: ".
-  grep -qx "Warning: --plain writes an UNENCRYPTED archive\..*" <<<"$stderr"
+  grep -qxF "Warning: --plain writes an UNENCRYPTED archive. It holds sensitive metadata (repo names and paths, fingerprints of unrotated secrets; no secret values): keep it private and out of synced folders." <<<"$stderr"
   [[ "$stderr" != *"Warning: WARNING:"* ]]
   local a
   a="$(published)"
