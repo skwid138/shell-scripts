@@ -164,15 +164,21 @@ EOF
   chmod +x "$BIN/gitleaks"
 }
 
-# The real gitleaks behind a wrapper that reports the pinned version (CI may
-# install a newer brew bottle) and logs its argv.
+# The real gitleaks behind a wrapper that logs its argv. Only when the
+# installed binary is NOT the pinned 8.30.1 (CI's macOS runners install the
+# current brew bottle) does the wrapper also answer `version` with the pin, so
+# these detection tests still run; the version gate itself is covered by the
+# stub test "refuses any gitleaks other than 8.30.1".
 use_real_gitleaks() {
   [[ "$REAL_GITLEAKS" == /* ]] || skip "real gitleaks not installed"
+  local real_version fake_version=""
+  real_version="$("$REAL_GITLEAKS" version 2>/dev/null | tr -d '[:space:]')"
+  [[ "${real_version#v}" == 8.30.1 ]] || fake_version='if [[ "${1-}" == version ]]; then echo 8.30.1; exit 0; fi'
   rm -f "$BIN/gitleaks"
   cat >"$BIN/gitleaks" <<EOF
 #!/bin/bash
 printf 'gitleaks %s\n' "\$*" >>"$FIX/gl.calls"
-if [[ "\${1-}" == version ]]; then echo 8.30.1; exit 0; fi
+$fake_version
 exec "$REAL_GITLEAKS" "\$@"
 EOF
   chmod +x "$BIN/gitleaks"
@@ -271,6 +277,8 @@ assert_no_secret_on_disk() {
   assert_output --partial "Usage: gh-public-history-scan"
   assert_output --partial "merge-touched-file"
   assert_output --partial "debug level"
+  assert_output --partial "scope.txt"
+  assert_output --partial "--log"
 }
 
 @test "gh-public-history-scan: refuses a non-https clone base without the test switch" {
@@ -461,6 +469,21 @@ assert_no_secret_on_disk() {
   [[ "$(mfield rcone 4)" == error && "$(mfield rcone 12)" == *"exited 1"* ]]
   [[ "$(mfield notarray 4)" == error && "$(mfield notarray 12)" == *JSON* ]]
   [[ -z "$(awk '!/^#/' "$(scan_dir)/findings.tsv")" ]]
+}
+
+@test "gh-public-history-scan: an empty report or more than one JSON document is an error, never clean" {
+  gh_repo blank 21 public false disabled
+  gh_repo twodocs 22 public false disabled
+  gh_repo onedoc 23 public false disabled
+  for r in blank twodocs onedoc; do src_repo "$r" >/dev/null; done
+  : >"$FIX/gl.21.git.json"
+  printf '[]\n[]\n' >"$FIX/gl.22.git.json"
+  printf '[]\n' >"$FIX/gl.23.git.json"
+  run_scan --owner "$OWNER"
+  assert_failure 1
+  [[ "$(mfield blank 4)" == error && "$(mfield blank 12)" == *JSON* ]]
+  [[ "$(mfield twodocs 4)" == error && "$(mfield twodocs 12)" == *JSON* ]]
+  [[ "$(mfield onedoc 4)" == clean ]]
 }
 
 @test "gh-public-history-scan: a timed-out scan with a TERM-ignoring child is status timeout; the child dies before the work dir is removed" {
@@ -757,4 +780,231 @@ EOF
   [[ "$(calls_for 402)" -ge 1 && "$(calls_for 403)" -ge 1 ]]
   [[ "$(mfield aaa 4)" == clean && "$(mfield bbb 4)" == clean && "$(mfield ccc 4)" == findings ]]
   [[ "$(frows ccc | grep -c .)" -eq 1 && "$(mfield ccc 5)" -eq 1 ]]
+}
+
+# --- lock ----------------------------------------------------------------------------
+
+# one_scan_dir: a finished one-repo scan dir (stub gitleaks); prints it.
+one_scan_dir() {
+  gh_repo alpha 101 public false disabled
+  src_repo alpha >/dev/null
+  run_scan --owner "$OWNER"
+  [[ "$status" -eq 0 ]] || return 1
+  scan_dir
+}
+
+# bg_scan <tag> [args...]: run the scan in the background; rc/out/err files.
+bg_scan() {
+  local tag="$1"
+  shift
+  (
+    rc=0
+    env -i HOME="$FAKE_HOME" TMPDIR="$TMPD" \
+      GH_SCAN_GH="$T/gh" GH_SCAN_BASE_PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" \
+      GH_SCAN_CLONE_BASE="$CLONE_BASE" GH_SCAN_TEST_INSECURE_URLS=1 \
+      GH_SCAN_TIMEOUT="$TIMEOUT" GH_SCAN_KILL_GRACE=1 \
+      ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
+      /bin/bash "$SCRIPT" "$@" </dev/null >"$T/$tag.out" 2>"$T/$tag.err" || rc=$?
+    echo "$rc" >"$T/$tag.rc"
+  ) &
+  BG_PIDS+=($!)
+}
+
+dead_pid() {
+  /bin/sh -c 'exit 0' &
+  local p=$!
+  wait "$p"
+  echo "$p"
+}
+
+@test "gh-public-history-scan: a fresh ownerless lock and a live owner are busy (exit 75); nothing is reclaimed or changed" {
+  local sd
+  sd="$(one_scan_dir)"
+  cp "$sd/manifest.tsv" "$T/manifest.before"
+  : >"$sd/.lock"
+  run_scan --owner "$OWNER" --resume "$sd"
+  assert_failure 75
+  [[ "$stderr" == *"in use"* ]]
+  [[ -e "$sd/.lock" && ! -s "$sd/.lock" ]]
+  cmp -s "$T/manifest.before" "$sd/manifest.tsv"
+  printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" >"$sd/.lock"
+  run_scan --owner "$OWNER" --resume "$sd"
+  assert_failure 75
+  grep -qx "pid=$$" "$sd/.lock"
+}
+
+@test "gh-public-history-scan: a dead-owner lock and an old ownerless lock are reclaimed" {
+  local sd
+  sd="$(one_scan_dir)"
+  printf 'pid=%s\nstarted=1\n' "$(dead_pid)" >"$sd/.lock"
+  run_scan --owner "$OWNER" --resume "$sd"
+  assert_success
+  [[ ! -e "$sd/.lock" ]]
+  : >"$sd/.lock"
+  touch -t 200001010000 "$sd/.lock"
+  run_scan --owner "$OWNER" --resume "$sd"
+  assert_success
+  [[ ! -e "$sd/.lock" ]]
+}
+
+@test "gh-public-history-scan: concurrent contenders for a stale lock - exactly one proceeds" {
+  local sd i ok=0 busy=0 rc
+  sd="$(one_scan_dir)"
+  printf 'pid=%s\nstarted=1\n' "$(dead_pid)" >"$sd/.lock"
+  # Inside the reclaim mutex: reclaim-locked is a barrier (up to 2s) for all
+  # four contenders, and reclaim-decided (between re-inspection and removal)
+  # sleeps 1..4s by arrival order, so unserialized reclaimers would all judge
+  # the old lock stale together and then remove each other's fresh locks one
+  # after another. The winner holds the lock (locked) until every contender
+  # has decided.
+  cat >"$T/hook" <<EOF
+#!/bin/sh
+case "\$1" in
+  reclaim-locked)
+    : >"$T/arrived.\$PPID"
+    n=1
+    until mkdir "$T/ticket.\$n" 2>/dev/null; do n=\$((n + 1)); done
+    echo "\$n" >"$T/order.\$PPID"
+    i=0
+    while [ "\$(ls "$T" | grep -c '^arrived\.')" -lt 4 ] && [ \$i -lt 20 ]; do sleep 0.1; i=\$((i + 1)); done
+    ;;
+  reclaim-decided) sleep "\$(cat "$T/order.\$PPID")" ;;
+  locked) sleep 12 ;;
+esac
+exit 0
+EOF
+  chmod +x "$T/hook"
+  EXTRA_ENV=(GH_SCAN_TEST_HOOK="$T/hook")
+  BG_PIDS=()
+  for i in 1 2 3 4; do bg_scan "c$i" --owner "$OWNER" --resume "$sd"; done
+  for i in "${BG_PIDS[@]}"; do wait "$i" || true; done
+  for i in 1 2 3 4; do
+    rc="$(cat "$T/c$i.rc")"
+    case "$rc" in
+      0) ok=$((ok + 1)) ;;
+      75) busy=$((busy + 1)) ;;
+      *)
+        echo "contender $i exited $rc" >&2
+        return 1
+        ;;
+    esac
+  done
+  for i in 1 2 3 4; do echo "c$i rc=$(cat "$T/c$i.rc") $(cat "$T/c$i.err")" >&2; done
+  [[ "$ok" -eq 1 && "$busy" -eq 3 ]]
+  [[ ! -e "$sd/.lock" ]]
+}
+
+# --- log -----------------------------------------------------------------------------
+
+@test "gh-public-history-scan: --log writes everything to a 600 file without ACL entries; a symlink is refused" {
+  gh_repo alpha 101 public false disabled
+  src_repo alpha >/dev/null
+  mkdir -p "$T/logs"
+  /bin/chmod +a "everyone allow read,file_inherit" "$T/logs"
+  run_scan --owner "$OWNER" --log "$T/logs/scan.log"
+  assert_success
+  [[ -z "$output" && -z "$stderr" ]]
+  [[ "$(/bin/ls -le "$T/logs/scan.log" | grep -c .)" -eq 1 ]]
+  [[ "$(/bin/ls -le "$T/logs/scan.log" | cut -c1-11)" == "-rw------- " ]]
+  grep -q 'complete: yes' "$T/logs/scan.log"
+  ln -s "$T/elsewhere.log" "$T/logs/link.log"
+  run_scan --owner "$OWNER" --log "$T/logs/link.log"
+  assert_failure 2
+  [[ ! -e "$T/elsewhere.log" ]]
+}
+
+# --- isolation layers ------------------------------------------------------------------
+#
+# env -i already removes every inherited config channel (GIT_CONFIG_*,
+# GIT_CONFIG_GLOBAL, GIT_ASKPASS, ...; see the tests above). These tests check
+# the remaining layers on their own by planting config in places the isolated
+# git could still read (via the test-only work-ready hook, which receives the
+# private work dir): the clone template (repo-level config) and the private
+# HOME. GIT_CONFIG_NOSYSTEM=1 is not tested on its own: the system config path
+# is compiled into git (e.g. /opt/homebrew/etc/gitconfig, which here carries
+# the real osxkeychain helper) and env -i strips GIT_CONFIG_SYSTEM, so the only
+# way to exercise it would be to read or call the real system config and
+# keychain helper.
+
+start_401_server() {
+  cat >"$T/srv.pl" <<'EOF'
+use strict; use IO::Socket::INET;
+my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0, Listen => 5, ReuseAddr => 1) or die "listen: $!";
+open my $p, '>', "$ARGV[0].tmp" or die; print $p $s->sockport; close $p; rename "$ARGV[0].tmp", $ARGV[0];
+while (my $c = $s->accept) {
+  my $first = <$c>;
+  while (my $l = <$c>) { last if $l =~ /^\r?\n$/ }
+  open my $log, '>>', $ARGV[1]; print $log $first; close $log;
+  print $c "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"synthetic\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  close $c;
+}
+EOF
+  /usr/bin/perl "$T/srv.pl" "$T/port" "$T/requests.log" &
+  echo $! >"$FIX/srv.pid"
+  local i=0
+  while [[ ! -s "$T/port" && $i -lt 50 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [[ -s "$T/port" ]] || return 1
+  PORT="$(cat "$T/port")"
+  cat >"$T/helper" <<EOF
+#!/bin/sh
+echo "helper \$*" >>"$T/helper.log"
+[ "\$1" = get ] && printf 'username=synth\npassword=synth\n'
+exit 0
+EOF
+  chmod +x "$T/helper"
+}
+
+@test "gh-public-history-scan: credential.helper= alone keeps a helper from repo-level (template) config unused" {
+  start_401_server
+  mkdir -p "$T/tpl"
+  printf '[credential]\n\thelper = %s\n' "$T/helper" >"$T/tpl/config"
+  # Control: an otherwise isolated git does read the template's helper.
+  run env -i HOME="$T/ctl-home" PATH="/usr/bin:/bin" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_TERMINAL_PROMPT=0 "$REAL_GIT" clone -q --mirror --template="$T/tpl" "http://127.0.0.1:$PORT/$OWNER/alpha.git" "$T/ctl.git"
+  assert_failure
+  grep -q '^helper get' "$T/helper.log"
+  rm -f "$T/helper.log"
+  cat >"$T/hook" <<EOF
+#!/bin/sh
+[ "\$1" = work-ready ] && cp "$T/tpl/config" "\$2/template/config"
+exit 0
+EOF
+  chmod +x "$T/hook"
+  gh_repo alpha 101 public false disabled
+  CLONE_BASE="http://127.0.0.1:$PORT"
+  EXTRA_ENV=(GH_SCAN_TEST_HOOK="$T/hook")
+  : >"$T/requests.log"
+  run_scan --owner "$OWNER"
+  assert_failure 1
+  [[ "$(mfield alpha 4)" == error ]]
+  grep -q "GET /$OWNER/alpha.git/info/refs" "$T/requests.log"
+  [[ ! -e "$T/helper.log" ]]
+}
+
+@test "gh-public-history-scan: GIT_CONFIG_GLOBAL=/dev/null alone keeps config in the private HOME unread" {
+  gh_repo alpha 101 public false disabled
+  src_repo alpha >/dev/null
+  printf '[url "file:///nonexistent-synth/"]\n\tinsteadOf = file://%s/\n' "$SRC" >"$T/home.gitconfig"
+  # Control: git that reads this HOME config cannot clone.
+  mkdir -p "$T/ctl-home"
+  cp "$T/home.gitconfig" "$T/ctl-home/.gitconfig"
+  run env -i HOME="$T/ctl-home" PATH="/usr/bin:/bin" GIT_CONFIG_NOSYSTEM=1 \
+    "$REAL_GIT" clone -q --mirror "file://$SRC/$OWNER/alpha.git" "$T/ctl.git"
+  assert_failure
+  cat >"$T/hook" <<EOF
+#!/bin/sh
+[ "\$1" = work-ready ] || exit 0
+cp "$T/home.gitconfig" "\$2/home/.gitconfig"
+mkdir -p "\$2/home/.config/git"
+cp "$T/home.gitconfig" "\$2/home/.config/git/config"
+exit 0
+EOF
+  chmod +x "$T/hook"
+  EXTRA_ENV=(GH_SCAN_TEST_HOOK="$T/hook")
+  run_scan --owner "$OWNER"
+  assert_success
+  [[ "$(mfield alpha 4)" == clean ]]
 }

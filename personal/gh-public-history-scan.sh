@@ -24,6 +24,7 @@ usage() {
   cat <<'EOF'
 Usage: gh-public-history-scan [--owner LOGIN] [--only a,b | --repos FILE]
                               [--resume DIR] [--timeout SECS] [--dry-run]
+                              [--log FILE]
 
 Scan the full git history of every PUBLIC repo owned by LOGIN whose
 secret_scanning status is "disabled", with a pinned gitleaks (8.30.1).
@@ -37,10 +38,15 @@ Options:
                   error / timeout / not-attempted, or whose findings.tsv row
                   count disagrees with the manifest, are scanned again; settled
                   repos (clean / findings / empty) are kept. The inventory is
-                  re-read; without --only/--repos the earlier scope is reused.
+                  re-read; without --only/--repos the scope saved in the dir's
+                  scope.txt is reused, so a limited (pilot) dir stays limited:
+                  it can never be resumed into a full scan (start a new scan
+                  dir for that). One run per dir at a time (.lock; exit 75).
   --timeout SECS  Bound for each clone / git / gitleaks command (default 3600).
   --dry-run       Inventory only: print targets, skips and errors; no clones,
                   no scans, nothing written.
+  --log FILE      Send stdout and stderr to FILE, created 600 without ACL
+                  entries (never through a symlink) before anything is written.
   -h, --help      Show this help.
 
 Inventory:
@@ -96,6 +102,7 @@ Exit codes:
       failed publication
   2   usage error
   3   missing dependency or a gitleaks other than 8.30.1
+  75  the scan dir is locked by another run (or a fresh ownerless lock)
 
 Environment (tests):
   GH_SCAN_GH            gh command (default gh)
@@ -106,12 +113,15 @@ Environment (tests):
                         and file:// only with GH_SCAN_TEST_INSECURE_URLS=1
   GH_SCAN_PERL          perl for process groups and helpers (default /usr/bin/perl)
   GH_SCAN_GROUP_PROBE   `<probe> <pgid>` exit 0 = group alive (test only)
-  GH_SCAN_TEST_HOOK     `<hook> <phase> <scan-dir>` at publish-findings (test only)
+  GH_SCAN_TEST_HOOK     `<hook> <phase> <dir>` at work-ready (the private work
+                        dir), locked, reclaim-locked, reclaim-decided,
+                        publish-findings (test only)
 
 Examples:
   gh-public-history-scan --dry-run
   gh-public-history-scan --only repo-a,repo-b
-  nohup caffeinate -i gh-public-history-scan >scan.log 2>&1 &
+  nohup caffeinate -i gh-public-history-scan --timeout 7200 \
+    --log ~/Library/Logs/gh-public-history-scan.log >/dev/null 2>&1 &
   gh-public-history-scan --resume "$HOME/Library/Application Support/gh-security-rollout/scan-20261014T120000Z"
 EOF
 }
@@ -123,6 +133,7 @@ ONLY=""
 REPOS_FILE=""
 RESUME=""
 DRY_RUN=0
+LOG_PATH=""
 TIMEOUT="${GH_SCAN_TIMEOUT:-3600}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -158,6 +169,11 @@ while [[ $# -gt 0 ]]; do
     --dry-run)
       DRY_RUN=1
       shift
+      ;;
+    --log)
+      [[ -n "${2-}" ]] || die_usage "--log needs a file path"
+      LOG_PATH="$2"
+      shift 2
       ;;
     *) die_usage "unknown argument: $1 (see --help)" ;;
   esac
@@ -203,7 +219,9 @@ RG_ERR=""
 RG_SEQ=0
 READY_WAIT=5
 KILL_WAIT=2
-LOCK_DIR=""
+LOCK_FILE=""
+LOCK_HELD=0
+LOCK_ERR=""
 FATAL=0
 FATAL_MSG=""
 
@@ -264,10 +282,7 @@ cleanup() {
       warn "process group $CUR_PGID could not be confirmed empty; leaving $WORK in place (remove it once nothing runs)"
     fi
   fi
-  if [[ -n "$LOCK_DIR" ]]; then
-    rm -f "$LOCK_DIR/pid"
-    rmdir "$LOCK_DIR" 2>/dev/null
-  fi
+  release_lock
 }
 # Signals inside a critical section (a child launched but not yet
 # registered) are recorded and delivered at its end.
@@ -596,7 +611,7 @@ FINDINGS_HEADER=$'# repo\trepo_id\tpass\tcommit\tfile\trule\tline\tfingerprint'
 
 test_hook() {
   [[ -n "$TEST_HOOK" ]] || return 0
-  "$TEST_HOOK" "$@" </dev/null >/dev/null 2>&1
+  "$TEST_HOOK" "$@" </dev/null >/dev/null 2>&1 9>&-
 }
 
 # publish_file <src> <dest>: exclusive temp beside dest (noclobber), 600, no
@@ -650,6 +665,174 @@ publish_repo() {
     warn "$name: manifest publication failed; the repo is not marked complete"
     return 1
   fi
+}
+
+# --- scan-dir lock -------------------------------------------------------------------
+#
+# $SCAN_DIR/.lock is a FILE holding `pid=<pid>` and `started=<epoch>`. It is
+# taken by link(2) of a fully written private temp file, so the owner is
+# published atomically with the lock itself (a contender never sees an
+# ownerless lock of a live run) and an existing lock is never replaced.
+# Reclamation of a stale lock is serialized by an flock on
+# $SCAN_DIR/.lock.reclaim (never deleted), and re-inspected under it.
+
+LOCK_STALE_SECS=60 # an ownerless lock (hand-made, or a crash mid-write) is stale only after this
+RECLAIM_WAIT=10
+LK_STATE=""
+LK_WHY=""
+
+# lock_try: 0 = held; 3 = a lock exists; 4 = error (LOCK_ERR).
+lock_try() {
+  local tmp="$SCAN_DIR/.lock.tmp.$$.$RANDOM$RANDOM" rc
+  if ! (
+    set -C
+    printf 'pid=%s\nstarted=%s\n' "$$" "$(/bin/date -u +%s)" >"$tmp"
+  ) 2>/dev/null; then
+    LOCK_ERR="cannot write a lock temp file in $SCAN_DIR"
+    return 4
+  fi
+  "$PERL" -MErrno -e 'link($ARGV[0], $ARGV[1]) and exit 0; exit($!{EEXIST} ? 3 : 4)' "$tmp" "$LOCK_FILE"
+  rc=$?
+  rm -f "$tmp"
+  case "$rc" in
+    0) LOCK_HELD=1 ;;
+    3) ;;
+    *)
+      LOCK_ERR="cannot create the lock $LOCK_FILE (link failed)"
+      rc=4
+      ;;
+  esac
+  return "$rc"
+}
+
+# lock_inspect: LK_STATE = absent | live | stale | fresh, LK_WHY. live = the
+# owner pid parses and exists; stale = it parses and is dead, or there is no
+# parseable owner and the lock is untouched for >= LOCK_STALE_SECS; fresh =
+# no parseable owner yet, younger than that (never reclaimed).
+lock_inspect() {
+  local pid="" mt now
+  LK_WHY=""
+  if [[ ! -e "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]; then
+    LK_STATE=absent
+    return
+  fi
+  if [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]; then
+    pid="$(sed -n 's/^pid=//p' "$LOCK_FILE" 2>/dev/null | head -n1)"
+  fi
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
+      LK_STATE=live
+      LK_WHY="held by live pid $pid"
+    else
+      LK_STATE=stale
+      LK_WHY="dead owner pid $pid"
+    fi
+    return
+  fi
+  mt="$(/usr/bin/stat -f %m "$LOCK_FILE" 2>/dev/null)"
+  now="$(/bin/date +%s)"
+  if [[ "$mt" =~ ^[0-9]+$ && $((now - mt)) -ge $LOCK_STALE_SECS ]]; then
+    LK_STATE=stale
+    LK_WHY="no parseable owner, untouched for $((now - mt))s"
+  else
+    LK_STATE=fresh
+    LK_WHY="lock without a parseable owner, younger than ${LOCK_STALE_SECS}s"
+  fi
+}
+
+# lock_reclaim: under the reclaim flock, re-inspect and remove the lock only
+# if it is still stale, then try to take it. 0 held; 1 busy; 2 error.
+lock_reclaim() {
+  local rc
+  if ! { exec 9>>"$SCAN_DIR/.lock.reclaim"; } 2>/dev/null; then
+    LOCK_ERR="cannot open the reclaim mutex $SCAN_DIR/.lock.reclaim"
+    return 2
+  fi
+  # shellcheck disable=SC2016 # perl code
+  "$PERL" -e 'use Fcntl qw(:flock); use Errno; open(my $f, ">&=", 9) or exit 2; my $end = time + $ARGV[0]; until (flock($f, LOCK_EX | LOCK_NB)) { unless ($!{EWOULDBLOCK} || $!{EAGAIN}) { exit 4 } exit 3 if time >= $end; select(undef, undef, undef, 0.05) } exit 0' "$RECLAIM_WAIT" 2>/dev/null
+  rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    exec 9>&-
+    [[ "$rc" -eq 3 ]] && {
+      LK_WHY="another run is reclaiming the lock"
+      return 1
+    }
+    LOCK_ERR="reclaim mutex flock failed (helper exit $rc)"
+    return 2
+  fi
+  test_hook reclaim-locked "$SCAN_DIR"
+  lock_inspect
+  case "$LK_STATE" in
+    stale)
+      test_hook reclaim-decided "$SCAN_DIR"
+      if [[ -d "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]; then
+        rm -f "$LOCK_FILE/pid" 2>/dev/null
+        rmdir "$LOCK_FILE" 2>/dev/null
+      else
+        rm -f "$LOCK_FILE" 2>/dev/null
+      fi
+      if [[ -e "$LOCK_FILE" || -L "$LOCK_FILE" ]]; then
+        exec 9>&-
+        LOCK_ERR="cannot remove the stale lock $LOCK_FILE ($LK_WHY); inspect and remove it by hand"
+        return 2
+      fi
+      ;;
+    absent) ;;
+    *)
+      exec 9>&-
+      return 1
+      ;;
+  esac
+  exec 9>&-
+  lock_try
+  case $? in
+    0) return 0 ;;
+    3)
+      LK_WHY="a concurrent run took the lock first"
+      return 1
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+# acquire_lock: 0 held; 1 busy (LK_WHY); 2 error (LOCK_ERR).
+acquire_lock() {
+  lock_try
+  case $? in
+    0) return 0 ;;
+    3) ;;
+    *) return 2 ;;
+  esac
+  lock_inspect
+  case "$LK_STATE" in
+    absent)
+      lock_try
+      case $? in
+        0) return 0 ;;
+        3)
+          LK_WHY="a concurrent run took the lock first"
+          return 1
+          ;;
+        *) return 2 ;;
+      esac
+      ;;
+    stale) lock_reclaim ;;
+    *) return 1 ;;
+  esac
+}
+
+# release_lock: remove the lock only if this run holds it and it still names us.
+release_lock() {
+  [[ "$LOCK_HELD" -eq 1 && -n "$LOCK_FILE" ]] || return 0
+  if [[ -f "$LOCK_FILE" && "$(sed -n 's/^pid=//p' "$LOCK_FILE" 2>/dev/null | head -n1)" == "$$" ]]; then
+    rm -f "$LOCK_FILE"
+  fi
+  LOCK_HELD=0
+}
+
+die_busy() {
+  printf '%bBusy:%b %s\n' "$RED" "$NC" "$*" >&2
+  exit 75
 }
 
 # --- gitleaks ----------------------------------------------------------------------
@@ -725,6 +908,13 @@ gl_run() {
   fi
   if [[ ! -f "$report" || ! -r "$report" ]]; then
     step_fail error "gitleaks $mode exited $rc without a JSON report"
+    return 1
+  fi
+  # Exactly one JSON document, and it is an array: an empty file or several
+  # documents (jq would read each in turn) are never a clean result.
+  if [[ "$(jq -s 'length == 1 and (.[0] | type == "array")' "$report" 2>/dev/null)" != true ]]; then
+    rm -f "$report"
+    step_fail error "malformed gitleaks $mode JSON report: not exactly one JSON array (exit $rc)"
     return 1
   fi
   if [[ "$mode" == git ]]; then
@@ -979,6 +1169,22 @@ scan_repo() {
 
 # --- main --------------------------------------------------------------------------
 
+# open_log: with --log, send stdout and stderr to a private (600, no ACL)
+# log file: created under umask 077 without following a symlink, then
+# verified before anything is written to it.
+open_log() {
+  [[ -n "$LOG_PATH" ]] || return 0
+  [[ -L "$LOG_PATH" ]] && die_usage "--log: $LOG_PATH is a symlink"
+  [[ ! -e "$LOG_PATH" || -f "$LOG_PATH" ]] || die_usage "--log: $LOG_PATH is not a regular file"
+  "$PERL" -MFcntl -e 'sysopen(my $f, $ARGV[0], O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0600) or exit 1' "$LOG_PATH" 2>/dev/null ||
+    die "--log: cannot create $LOG_PATH"
+  if [[ -L "$LOG_PATH" ]] || ! /bin/chmod 600 "$LOG_PATH" 2>/dev/null || ! /bin/chmod -N "$LOG_PATH" 2>/dev/null ||
+    ! ls_led_ok "$LOG_PATH" -rw-------; then
+    die "--log: cannot make $LOG_PATH private (600, no ACL)"
+  fi
+  exec >>"$LOG_PATH" 2>&1
+}
+
 require_cmd jq
 require_cmd git
 require_cmd gitleaks "Install gitleaks $GITLEAKS_PIN."
@@ -994,8 +1200,10 @@ if [[ -n "$RESUME" ]]; then
   RESUME="$(cd "$RESUME" && pwd)" || die_usage "--resume: cannot enter $RESUME"
 fi
 
+open_log
 make_work
 setup_iso
+test_hook work-ready "$WORK"
 check_gitleaks_version
 if [[ -z "$OWNER" ]]; then
   OWNER="$("$GH" api user --jq .login 2>/dev/null </dev/null)" || die_unauthed "gh api user failed (run: gh auth login)"
@@ -1024,17 +1232,14 @@ else
   [[ -d "$SCAN_DIR" ]] || mkdir "$SCAN_DIR" || die "cannot create $SCAN_DIR"
 fi
 private_dir "$SCAN_DIR" || die "cannot make $SCAN_DIR private (700, no ACL)"
-if ! mkdir "$SCAN_DIR/.lock" 2>/dev/null; then
-  lpid="$(cat "$SCAN_DIR/.lock/pid" 2>/dev/null)"
-  if [[ "$lpid" =~ ^[0-9]+$ ]] && kill -0 "$lpid" 2>/dev/null; then
-    die "$SCAN_DIR is in use by pid $lpid"
-  fi
-  rm -f "$SCAN_DIR/.lock/pid"
-  rmdir "$SCAN_DIR/.lock" 2>/dev/null
-  mkdir "$SCAN_DIR/.lock" 2>/dev/null || die "cannot lock $SCAN_DIR (remove $SCAN_DIR/.lock if no scan runs)"
-fi
-LOCK_DIR="$SCAN_DIR/.lock"
-echo "$$" >"$LOCK_DIR/pid"
+LOCK_FILE="$SCAN_DIR/.lock"
+acquire_lock
+case $? in
+  0) ;;
+  1) die_busy "$SCAN_DIR is in use ($LK_WHY); not started" ;;
+  *) die "$LOCK_ERR" ;;
+esac
+test_hook locked "$SCAN_DIR"
 
 PUBLISH_FAILED=0
 # Inventory files.
