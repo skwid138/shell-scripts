@@ -158,8 +158,13 @@ gitleaks default):
     [--config <store>/gitleaks.toml] [--gitleaks-ignore-path <store>/gitleaksignore] .
 The bracketed flags are added only for private store files that exist and
 pass validation (see Private suppressions).
-Each scan runs in its own process group under a watchdog; on timeout or
-interruption the whole group gets TERM, then KILL.
+Each scan (and each notification and keychain lookup) runs in its own
+process group under a watchdog; on timeout or interruption the whole group
+gets TERM, then KILL. The group confirms itself (a readiness byte, within
+5s) before the command execs; without it the leader is killed and that
+repo is an error. A group that cannot be confirmed empty after TERM and
+KILL stays registered: nothing new is started over it (later scans and the
+notification are errors), and the run exits 1.
 
 Change detection: before each scan the script snapshots every ref
 (`git for-each-ref`, including refs/stash), HEAD, every worktree's HEAD
@@ -288,12 +293,18 @@ Environment overrides (tests/advanced use):
   GITLEAKS_AUDIT_LOCK_STALE_SECS  age after which a lock with no parseable
                              owner pid is reclaimed (default 21600 = 6h)
   GITLEAKS_AUDIT_RECLAIM_WAIT  seconds to wait for the reclaim mutex (default 10)
-  GITLEAKS_AUDIT_TEST_HOOK   test-only: command run at lock decision points
-                             and store-export publication seams
+  GITLEAKS_AUDIT_TEST_HOOK   test-only: command run at lock decision points,
+                             store-export publication seams, after a process
+                             group or keychain lookup is started (before it
+                             is registered), and before the exclusive create
+                             of the --prune-delivered temp file
   GITLEAKS_AUDIT_SECURITY    keychain CLI (default /usr/bin/security)
   GITLEAKS_AUDIT_OPENSSL     openssl for the store archive (default
                              /usr/bin/openssl)
   GITLEAKS_AUDIT_SECURITY_TIMEOUT  keychain lookup watchdog seconds (default 30)
+  GITLEAKS_AUDIT_GROUP_PROBE test-only: command run as `<probe> <pgid>` instead
+                             of `kill -0 -<pgid>` to decide whether a process
+                             group still has members (exit 0 = yes)
   GITLEAKS_SUPPRESS_DIR      tests only: private store base dir instead of
                              ~/.config/gitleaks-audit (not a security boundary)
 EOF
@@ -394,35 +405,68 @@ fi
 
 WORK=""
 LOCK_HELD=0
-CUR_PGID=""
+CUR_PGID="" # registered process group (its leader's pid is the same number)
 WD_PID=""
+KC_OPEN=0 # fd 7 holds the keychain data FIFO
+RG_ERR=""
+RG_FAILED=0
+RG_SEQ=0
+READY_WAIT=5
+KILL_WAIT=2
 # Store export/import artifacts this run created (removed on failure only).
 PRUNE_TMP=""
 EXPORT_TMPFILE=""
 EXPORT_SUBDIR=""
 RESTORE_DIR=""
 
-# reap_group <pgid>: TERM the whole process group, give it GRACE seconds to
-# empty, then KILL it. Returns immediately if the group no longer exists.
+# group_live <pgid> <direct>: some process of the group can still be
+# signalled (a group held only by zombies cannot), or, with direct=1, its
+# leader pid still exists. GITLEAKS_AUDIT_GROUP_PROBE (test-only) replaces
+# the group check: `<probe> <pgid>` exiting 0 means live.
+GROUP_PROBE="${GITLEAKS_AUDIT_GROUP_PROBE:-}"
+group_live() {
+  if [[ -n "$GROUP_PROBE" ]]; then
+    "$GROUP_PROBE" "$1" </dev/null >/dev/null 2>&1 7>&- 8>&- 9>&- && return 0
+  else
+    kill -0 -- "-$1" 2>/dev/null && return 0
+  fi
+  [[ "$2" -eq 1 ]] && kill -0 "$1" 2>/dev/null
+}
+
+# reap_group <pgid> [direct]: TERM the whole process group, give it GRACE
+# seconds to empty, then KILL it and wait up to KILL_WAIT (wall clock, whole
+# seconds). If the group cannot be signalled (never formed, or already
+# gone) and direct is 1 (the default: the leader may not have been reaped
+# yet), the leader is TERMed/KILLed directly instead. An exited leader (a
+# child of this shell) is reaped; a running one is never waited for.
+# 0 = confirmed empty; 1 = something still runs after TERM and KILL.
 reap_group() {
-  local pg="$1" i=0 limit
+  local pg="$1" direct="${2:-1}" end
   [[ -n "$pg" ]] || return 0
-  kill -TERM -- "-$pg" 2>/dev/null || return 0
-  limit=$((GRACE * 10))
-  while kill -0 -- "-$pg" 2>/dev/null; do
-    if [[ $i -ge $limit ]]; then
-      kill -KILL -- "-$pg" 2>/dev/null
-      i=0
-      while kill -0 -- "-$pg" 2>/dev/null && [[ $i -lt 30 ]]; do
-        sleep 0.1
-        i=$((i + 1))
-      done
-      return 0
-    fi
+  if ! kill -TERM -- "-$pg" 2>/dev/null; then
+    [[ "$direct" -eq 1 ]] && kill -TERM "$pg" 2>/dev/null
+  fi
+  end=$((SECONDS + GRACE))
+  while group_live "$pg" "$direct" && [[ $SECONDS -lt $end ]]; do
     sleep 0.1
-    i=$((i + 1))
   done
-  return 0
+  if group_live "$pg" "$direct"; then
+    kill -KILL -- "-$pg" 2>/dev/null
+    [[ "$direct" -eq 1 ]] && kill -KILL "$pg" 2>/dev/null
+    end=$((SECONDS + KILL_WAIT))
+    while group_live "$pg" "$direct" && [[ $SECONDS -lt $end ]]; do
+      sleep 0.1
+    done
+  fi
+  kill -0 "$pg" 2>/dev/null || wait "$pg" 2>/dev/null
+  ! group_live "$pg" "$direct"
+}
+
+# kc_close: close the keychain data FIFO descriptor (fd 7) if open.
+kc_close() {
+  [[ "$KC_OPEN" -eq 1 ]] || return 0
+  exec 7>&-
+  KC_OPEN=0
 }
 
 stop_watchdog() {
@@ -435,7 +479,10 @@ stop_watchdog() {
 
 # shellcheck disable=SC2329  # invoked via trap
 cleanup() {
+  # A signal during cleanup is only recorded (on_signal): cleanup finishes.
+  CRIT_DEPTH=$((CRIT_DEPTH + 1))
   stop_watchdog
+  kc_close
   if [[ -n "$CUR_PGID" ]]; then
     reap_group "$CUR_PGID"
     CUR_PGID=""
@@ -461,22 +508,26 @@ cleanup() {
 }
 # TERM/INT handlers are installed once and never replaced (bash 3.2 briefly
 # installs SIG_IGN while a trap is being replaced, which can drop a signal).
-# Inside a critical section (IN_CRITICAL=1) they only record the signal;
-# the section's end exits through the normal path (end_critical).
-IN_CRITICAL=0
+# Inside a critical section (CRIT_DEPTH > 0: a child, its watchdog, or the
+# prune temp file exists but is not yet registered for cleanup) they only
+# record the signal. Sections nest (a depth counter); the outermost
+# end_critical exits through the normal path (130/143, EXIT trap cleanup).
+CRIT_DEPTH=0
 PENDING_SIG=""
 on_signal() { # <exit code>
-  if [[ "$IN_CRITICAL" -eq 1 ]]; then
-    PENDING_SIG="$1"
+  if [[ "$CRIT_DEPTH" -gt 0 ]]; then
+    [[ -n "$PENDING_SIG" ]] || PENDING_SIG="$1"
     return 0
   fi
   exit "$1"
 }
-# end_critical: leave the critical section; exit now (130/143, EXIT trap
-# cleanup) if a signal arrived inside it.
+begin_critical() { CRIT_DEPTH=$((CRIT_DEPTH + 1)); }
 end_critical() {
-  IN_CRITICAL=0
-  [[ -z "$PENDING_SIG" ]] || exit "$PENDING_SIG"
+  [[ "$CRIT_DEPTH" -gt 0 ]] && CRIT_DEPTH=$((CRIT_DEPTH - 1))
+  if [[ "$CRIT_DEPTH" -eq 0 && -n "$PENDING_SIG" ]]; then
+    exit "$PENDING_SIG"
+  fi
+  return 0
 }
 trap cleanup EXIT
 trap 'on_signal 130' INT
@@ -753,11 +804,12 @@ reclaim_mutex_take() {
 reclaim_mutex_release() { exec 9>&-; }
 
 # test_hook <phase> [path]: test-only seam to pause at a decision point
-# (runs with fd 9 closed so a paused hook never holds the reclaim mutex
-# itself). Store publication seams pass the path they are about.
+# (runs with fds 7-9 closed so a paused hook never holds the reclaim mutex,
+# a readiness FIFO, or the keychain FIFO itself). Store publication seams
+# pass the path they are about; launch seams the new leader's pid.
 test_hook() {
   [[ -n "$TEST_HOOK" ]] || return 0
-  "$TEST_HOOK" "$@" </dev/null >/dev/null 2>&1 9>&-
+  "$TEST_HOOK" "$@" </dev/null >/dev/null 2>&1 7>&- 8>&- 9>&-
   return 0
 }
 
@@ -852,41 +904,132 @@ acquire_lock() {
 
 # --- process-group runner ----------------------------------------------------
 
+# The group spawn helper (perl, argv: <fifo> <cmd...>): leave this shell's
+# process group (setpgrp), write ONE readiness byte to the FIFO
+# (non-blocking open), close it, and only then exec the command.
+# shellcheck disable=SC2016 # perl code: $f/$w/$!/@ARGV are perl variables
+GROUP_SPAWN='use Fcntl; my $f = shift @ARGV;
+setpgrp(0, 0) or die "setpgrp: $!\n";
+sysopen(my $w, $f, O_WRONLY | O_NONBLOCK) or die "readiness: $!\n";
+(syswrite($w, "R", 1) // 0) == 1 or die "readiness: $!\n";
+close($w) or die "readiness: $!\n";
+exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";'
+
+# group_watchdog <pgid> <marker> <secs> <grace>: run in the background. Sleeps
+# in 1s foreground steps (never a backgrounded sleep), then marks the
+# timeout, TERMs the group, and KILLs it <grace> 1s steps later. Default TERM
+# disposition: stop_watchdog ends it at once (its current 1s sleep may
+# outlive it by up to a second).
+group_watchdog() {
+  local n=0
+  while [[ $n -lt $3 ]]; do
+    /bin/sleep 1
+    n=$((n + 1))
+  done
+  : >"$2"
+  kill -TERM -- "-$1" 2>/dev/null
+  n=0
+  while [[ $n -lt $4 ]]; do
+    /bin/sleep 1
+    n=$((n + 1))
+  done
+  kill -KILL -- "-$1" 2>/dev/null
+}
+
+# start_watchdog <pgid> <marker> <secs> <grace>: launch and register WD_PID
+# in one critical section.
+start_watchdog() {
+  begin_critical
+  group_watchdog "$@" >/dev/null 2>&1 </dev/null 7>&- 8>&- 9>&- &
+  WD_PID=$!
+  end_critical
+}
+
+# spawn_group <dir> <stdout> <stderr> <hook-phase> <cmd...>: start cmd (cwd
+# dir) in a NEW process group (perl setpgrp + exec; bash 3.2 has no setsid
+# and there is no TTY for job control). The launch and its registration in
+# CUR_PGID are one critical section (the <hook-phase> test seam sits
+# between them). Then the group's readiness byte is awaited (read builtin,
+# interruptible by TERM/INT) for READY_WAIT seconds. 0 = started,
+# registered, ready. 1 = not started (RG_ERR set): another group is still
+# registered (entry guard), no readiness FIFO, or no readiness (the leader
+# is killed directly and reaped; the group, if it formed, is reaped too and
+# stays registered when that cannot be confirmed).
+spawn_group() {
+  local dir="$1" out="$2" err="$3" phase="$4" fifo pid byte="" end
+  shift 4
+  RG_ERR=""
+  if [[ -n "$CUR_PGID" ]]; then
+    RG_ERR="not started: process group $CUR_PGID of an earlier command is still registered (not confirmed empty)"
+    RG_FAILED=1
+    return 1
+  fi
+  RG_SEQ=$((RG_SEQ + 1))
+  fifo="$WORK/ready.$RG_SEQ"
+  if ! mkfifo -m 600 "$fifo" 2>/dev/null || ! { exec 8<>"$fifo"; } 2>/dev/null; then
+    rm -f "$fifo" 2>/dev/null
+    RG_ERR="not started: cannot create its readiness FIFO $fifo"
+    return 1
+  fi
+  begin_critical
+  (
+    cd "$dir" || exit 126
+    exec "$PERL" -e "$GROUP_SPAWN" "$fifo" "$@"
+  ) >"$out" 2>"$err" </dev/null 7>&- 8>&- 9>&- &
+  pid=$!
+  test_hook "$phase" "$pid"
+  CUR_PGID="$pid"
+  end_critical
+  end=$((SECONDS + READY_WAIT))
+  while :; do
+    byte=""
+    IFS= read -r -n 1 -t 1 -u 8 byte
+    [[ "$byte" == R || $SECONDS -ge $end ]] && break
+  done
+  exec 8>&-
+  rm -f "$fifo"
+  [[ "$byte" == R ]] && return 0
+  kill -TERM "$pid" 2>/dev/null
+  end=$((SECONDS + 1))
+  while kill -0 "$pid" 2>/dev/null && [[ $SECONDS -le $end ]]; do
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  RG_ERR="not started: no readiness from its process group within ${READY_WAIT}s (leader $pid killed)"
+  if reap_group "$pid" 0; then
+    CUR_PGID=""
+  else
+    RG_ERR="$RG_ERR; process group $pid could not be confirmed empty after TERM and KILL"
+    RG_FAILED=1
+  fi
+  return 1
+}
+
 # run_group <dir> <stdout-file> <stderr-file> <cmd...>: run cmd with cwd=dir
-# in a NEW process group (perl setpgrp + exec; bash 3.2 has no setsid and
-# there is no TTY for job control) under a watchdog. Returns cmd's rc, or 124
-# if the watchdog fired. Afterwards the whole group is reaped (TERM, then
-# KILL), so descendants cannot outlive the scan even if the leader exited.
+# in its own process group (spawn_group) under a watchdog. Returns cmd's rc,
+# or 124 if the watchdog fired; 1 with RG_ERR set when it never started.
+# Afterwards the whole group is reaped (TERM, then KILL), so descendants
+# cannot outlive the command even if the leader exited. If the group cannot
+# be confirmed empty, RG_ERR is set and the group stays registered
+# (CUR_PGID): no later run_group/keychain_lookup starts over it, and the
+# EXIT cleanup tries again. Callers must check RG_ERR.
 run_group() {
   local dir="$1" out="$2" err="$3" pid rc marker
   shift 3
   marker="$WORK/timeout.$RANDOM$RANDOM"
-  (
-    cd "$dir" || exit 126
-    # shellcheck disable=SC2016 # perl code: $!/$ARGV are perl variables
-    exec "$PERL" -e 'setpgrp(0, 0) or die "setpgrp: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";' "$@"
-  ) >"$out" 2>"$err" </dev/null &
-  pid=$!
-  CUR_PGID="$pid"
-  (
-    sp=""
-    trap 'kill "$sp" 2>/dev/null; exit 0' TERM
-    sleep "$TIMEOUT" &
-    sp=$!
-    wait "$sp"
-    : >"$marker"
-    kill -TERM -- "-$pid" 2>/dev/null
-    sleep "$GRACE" &
-    sp=$!
-    wait "$sp"
-    kill -KILL -- "-$pid" 2>/dev/null
-  ) >/dev/null 2>&1 </dev/null &
-  WD_PID=$!
+  spawn_group "$dir" "$out" "$err" group-launched "$@" || return 1
+  pid="$CUR_PGID"
+  start_watchdog "$pid" "$marker" "$TIMEOUT" "$GRACE"
   wait "$pid" 2>/dev/null
   rc=$?
   stop_watchdog
-  reap_group "$pid"
-  CUR_PGID=""
+  if reap_group "$pid" 0; then
+    CUR_PGID=""
+  else
+    RG_ERR="process group $pid could not be confirmed empty after TERM and KILL"
+    RG_FAILED=1
+  fi
   if [[ -e "$marker" ]]; then
     rm -f "$marker"
     return 124
@@ -1384,6 +1527,11 @@ scan_repo() {
   rc=$?
   # Raw gitleaks output may contain secret material: never read, just drop.
   rm -f "$out" "$err"
+  if [[ -n "$RG_ERR" ]]; then
+    rm -f "$report"
+    record_error "$rel" "gitleaks scan: $RG_ERR (nothing published)"
+    return
+  fi
   N_SCANNED=$((N_SCANNED + 1))
   case "$rc" in
     0 | 10) ;;
@@ -1544,11 +1692,20 @@ scan_repo() {
 
 # send_notify <msg>: 0 only when delivered (notifications enabled, osascript
 # present, and it exited 0).
+# A process-group failure (not started, or not confirmed empty) is an ERROR
+# (RUN_ERRORS) whatever the delivery.
 send_notify() {
+  local rc
   [[ "$NOTIFY" -eq 1 ]] || return 1
   command -v "$NOTIFIER" >/dev/null 2>&1 || return 1
   run_group "$HOME" "$WORK/notify.out" "$WORK/notify.err" \
     "$NOTIFIER" -e "display notification \"$1\" with title \"gitleaks-audit\""
+  rc=$?
+  if [[ -n "$RG_ERR" ]]; then
+    log "  ERROR: notification: $RG_ERR"
+    RUN_ERRORS=$((RUN_ERRORS + 1))
+  fi
+  return "$rc"
 }
 
 # announce_record <kind> <rel> <fps-file>: durably add one pending entry
@@ -2167,6 +2324,12 @@ prune_fail() {
   EXIT_CODE=1
 }
 
+# EXCL_CREATE (perl, argv: <path>): create <path> with O_CREAT|O_EXCL|
+# O_WRONLY|O_NOFOLLOW, mode 600, and close it. Exit 0 = created; anything
+# else = not created (it never unlinks anything).
+# shellcheck disable=SC2016 # perl code: $f/@ARGV are perl variables
+EXCL_CREATE='use Fcntl; sysopen(my $f, $ARGV[0], O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600) or exit 1; close($f) or exit 1; exit 0'
+
 # do_prune_delivered: remove every delivered pending row (both kinds,
 # regardless of known), keeping every other row byte-for-byte in its
 # original order. --dry-run only reads. The real run holds the audit lock,
@@ -2222,30 +2385,35 @@ do_prune_delivered() {
     return
   fi
   # Kept rows go through an invocation-unique temp file, created exclusively
-  # (noclobber) while holding the lock, then renamed over the pending file.
-  # The filter above (perl -n) keeps every kept row byte-for-byte, including
-  # an unterminated final row.
+  # while holding the lock, then renamed over the pending file. The filter
+  # above (perl -n) keeps every kept row byte-for-byte, including an
+  # unterminated final row.
   tmp="$PENDING_FILE.prune.$$"
   if [[ "$n_keep" -gt 0 ]]; then
     if [[ -e "$tmp" || -L "$tmp" ]]; then
       prune_fail "prune-delivered: $tmp already exists (not this run's); nothing changed"
       return
     fi
-    # Create it in THIS shell (noclobber: an O_EXCL open, no subshell) and
-    # record ownership inside one critical section: a TERM/INT arriving in
-    # between is only recorded (on_signal) and acted on by end_critical, so
-    # cleanup can never miss a file this run created; a file that already
-    # exists makes the exclusive create fail and is never recorded, so it is
-    # never removed. No trap is replaced here.
+    test_hook prune-precheck-done "$tmp"
+    # Create it with one exclusive open (EXCL_CREATE: O_CREAT|O_EXCL|
+    # O_NOFOLLOW, mode 600), so a node that appeared since the check above
+    # (a FIFO, a symlink to anything, a dangling symlink) is never opened,
+    # followed, or blocked on; bash's noclobber is not enough (it opens an
+    # existing non-regular file without O_EXCL). The create and recording
+    # ownership (PRUNE_TMP, set only after the helper exits 0) are one
+    # critical section: a TERM/INT in between is only recorded (on_signal)
+    # and acted on by end_critical, so cleanup never misses a file this run
+    # created and never removes one it did not. No trap is replaced here.
+    # Limitation: a signal sent only to the helper after its create can
+    # leave that temp file behind (the claims here cover the prune temp
+    # file only).
     local created=0
-    IN_CRITICAL=1
-    set -C
-    if { : >"$tmp"; } 2>/dev/null; then
+    begin_critical
+    if "$PERL" -e "$EXCL_CREATE" "$tmp" </dev/null >/dev/null 2>&1; then
       created=1
       test_hook prune-critical "$tmp"
       PRUNE_TMP="$tmp"
     fi
-    set +C
     end_critical
     if [[ $created -ne 1 ]]; then
       prune_fail "prune-delivered: cannot create $tmp (exists, or the state dir is not writable); nothing changed"
@@ -2323,49 +2491,85 @@ ls_led_ok() {
 }
 
 # keychain_lookup: set EXPORT_PASS from the keychain. security runs in its
-# own process group (registered as CUR_PGID, its watchdog as WD_PID, so the
-# EXIT trap reaps both if this run is interrupted) and writes the
-# passphrase into a FIFO in the private work dir that this shell reads with
-# the read builtin: it never touches disk, argv, or the environment, and a
-# trapped TERM interrupts the read at once. The watchdog kills the whole
-# group after SECURITY_TIMEOUT seconds. Returns security's exit status, or
-# 124 on timeout.
+# own process group (spawn_group: registered as CUR_PGID, readiness
+# confirmed; its watchdog as WD_PID), so the EXIT trap reaps both if this
+# run is interrupted. It writes the passphrase into a FIFO in the private
+# work dir that this shell holds open read-write on fd 7 from before the
+# launch (so the child's open never blocks) and reads one character at a
+# time with a 1s timeout (bash 3.2 drops a partial line when `read -t`
+# times out, so a whole-line read could truncate the passphrase): the
+# passphrase never touches disk, argv, or the environment, and a TERM/INT
+# interrupts the read at once. The loop ends at a full line, at the
+# child's exit (its status is collected once, then the FIFO is drained), or
+# at SECURITY_TIMEOUT. fd 7 is closed on every path (kc_close, also in
+# cleanup). Returns security's exit status, 124 on timeout, or 125 with
+# KC_ERR set when the lookup could not be started or its group could not
+# be confirmed empty.
+KC_ERR=""
 keychain_lookup() {
-  local pid rc fifo="$WORK/keychain.fifo" marker="$WORK/keychain.timeout"
+  local pid rc=0 fifo="$WORK/keychain.fifo" marker="$WORK/keychain.timeout" c buf=""
+  local exited=0 timed=0 end
   EXPORT_PASS=""
+  KC_ERR=""
   rm -f "$marker" "$fifo"
   mkfifo -m 600 "$fifo" || return 1
-  # shellcheck disable=SC2016 # perl code: $!/$ARGV are perl variables
-  "$PERL" -e 'setpgrp(0, 0) or die "setpgrp: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";' \
-    "$SECURITY" find-generic-password -s "$EXPORT_SERVICE" -a "$ACCT" -w >"$fifo" 2>"$WORK/keychain.err" </dev/null &
-  pid=$!
-  CUR_PGID="$pid"
-  (
-    sp=""
-    trap 'kill "$sp" 2>/dev/null; exit 0' TERM
-    sleep "$SECURITY_TIMEOUT" &
-    sp=$!
-    wait "$sp"
-    : >"$marker"
-    kill -TERM -- "-$pid" 2>/dev/null
-    sleep 1 &
-    sp=$!
-    wait "$sp"
-    kill -KILL -- "-$pid" 2>/dev/null
-  ) >/dev/null 2>&1 </dev/null &
-  WD_PID=$!
-  IFS= read -r EXPORT_PASS <"$fifo"
-  wait "$pid"
-  rc=$?
+  if ! { exec 7<>"$fifo"; } 2>/dev/null; then
+    rm -f "$fifo"
+    return 1
+  fi
+  KC_OPEN=1
+  if ! spawn_group "$WORK" "$fifo" "$WORK/keychain.err" keychain-launched \
+    "$SECURITY" find-generic-password -s "$EXPORT_SERVICE" -a "$ACCT" -w; then
+    kc_close
+    rm -f "$fifo"
+    KC_ERR="$RG_ERR"
+    return 125
+  fi
+  pid="$CUR_PGID"
+  start_watchdog "$pid" "$marker" "$SECURITY_TIMEOUT" 1
+  end=$((SECONDS + SECURITY_TIMEOUT))
+  while :; do
+    c=""
+    if IFS= read -r -n 1 -t 1 -u 7 c; then
+      [[ -n "$c" ]] || break # newline: a full line
+      buf="$buf$c"
+      continue
+    fi
+    # No character for 1s.
+    [[ $exited -eq 1 ]] && break # exited, and the FIFO is drained
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      rc=$?
+      exited=1
+      continue
+    fi
+    if [[ $SECONDS -ge $end || -e "$marker" ]]; then
+      timed=1
+      break
+    fi
+  done
+  if [[ $exited -eq 0 && $timed -eq 0 ]]; then
+    # A full line arrived first: the child's status, collected once.
+    wait "$pid"
+    rc=$?
+    exited=1
+  fi
   stop_watchdog
-  reap_group "$pid"
-  CUR_PGID=""
+  kc_close
   rm -f "$fifo"
-  if [[ -e "$marker" ]]; then
+  if reap_group "$pid" "$((1 - exited))"; then
+    CUR_PGID=""
+  else
+    RG_FAILED=1
+    KC_ERR="the keychain lookup's process group $pid could not be confirmed empty after TERM and KILL"
     EXPORT_PASS=""
+    return 125
+  fi
+  if [[ $timed -eq 1 || -e "$marker" ]]; then
+    rm -f "$marker"
     return 124
   fi
-  [[ $rc -eq 0 ]] || EXPORT_PASS=""
+  [[ $rc -eq 0 ]] && EXPORT_PASS="$buf"
   return "$rc"
 }
 
@@ -2407,6 +2611,10 @@ get_export_passphrase() {
       ;;
     124)
       store_fail "keychain lookup timed out after ${SECURITY_TIMEOUT}s (a keychain dialog waiting for an answer?); nothing done"
+      return 1
+      ;;
+    125)
+      store_fail "keychain lookup failed: $KC_ERR; nothing done"
       return 1
       ;;
     *)
@@ -3028,7 +3236,7 @@ do_export_store() {
     artifact="$WORK/store.tar.gz.enc"
     ext=".tar.gz.enc"
   else
-    warn "WARNING: --plain writes an UNENCRYPTED archive. It holds sensitive metadata (repo names and paths, fingerprints of unrotated secrets; no secret values): keep it private and out of synced folders."
+    warn "--plain writes an UNENCRYPTED archive. It holds sensitive metadata (repo names and paths, fingerprints of unrotated secrets; no secret values): keep it private and out of synced folders."
   fi
   EXPORT_PASS=""
   # 8. Publish.
@@ -3413,30 +3621,39 @@ do_uninstall() {
   fi
 }
 
+# finish <code>: exit, but never 0/10/75 after a process group could not be
+# started cleanly or confirmed empty (RG_FAILED).
+finish() {
+  if [[ "$RG_FAILED" -eq 1 && "$1" -ne 130 && "$1" -ne 143 ]]; then
+    exit 1
+  fi
+  exit "$1"
+}
+
 case "$MODE" in
   dry-run)
     NOTIFY=0
     echo "gitleaks-audit dry run: no scans, no state or log writes"
     do_scan_mode dry-run
-    exit "$EXIT_CODE"
+    finish "$EXIT_CODE"
     ;;
   run | full)
     do_scan_mode "$MODE"
-    exit "$EXIT_CODE"
+    finish "$EXIT_CODE"
     ;;
   report) do_report ;;
   prune-delivered)
     do_prune_delivered
-    exit "$EXIT_CODE"
+    finish "$EXIT_CODE"
     ;;
   set-export-passphrase) do_set_export_passphrase ;;
   export-store)
     do_export_store
-    exit "$EXIT_CODE"
+    finish "$EXIT_CODE"
     ;;
   import-store)
     do_import_store
-    exit "$EXIT_CODE"
+    finish "$EXIT_CODE"
     ;;
   status) do_status ;;
   install) do_install ;;

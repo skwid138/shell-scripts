@@ -64,7 +64,13 @@ case "${1-}" in
   find-generic-password)
     [[ -f "$FIX/security_sleep" ]] && "${0%/*}/kc-sleep" "$(cat "$FIX/security_sleep")"
     rc="$(cat "$FIX/security_rc" 2>/dev/null || echo 0)"
-    if [[ "$rc" -eq 0 ]]; then
+    if [[ "$rc" -eq 0 && -f "$FIX/security_split" ]]; then
+      # Half the passphrase, a pause longer than one read timeout, the rest.
+      p="$(cat "$FIX/passphrase")"
+      printf '%s' "${p:0:5}"
+      "${0%/*}/kc-sleep" "$(cat "$FIX/security_split")"
+      printf '%s\n' "${p:5}"
+    elif [[ "$rc" -eq 0 ]]; then
       cat "$FIX/passphrase"
       echo
     else
@@ -442,7 +448,9 @@ good_plain_archive() {
   run_audit --export-store "$DEST" --plain
   assert_success
   assert_output --partial "published: $DEST/gitleaks-store-$TS.tar.gz"
-  grep -q "WARNING: --plain" <<<"$stderr"
+  # One prefix only: lib/common.sh warn() already prints "Warning: ".
+  grep -qx "Warning: --plain writes an UNENCRYPTED archive\..*" <<<"$stderr"
+  [[ "$stderr" != *"Warning: WARNING:"* ]]
   local a
   a="$(published)"
   [[ "$a" == "$DEST/gitleaks-store-$TS.tar.gz" && -f "$a" ]]
@@ -1112,6 +1120,69 @@ assert_interrupted_clean() {
   [[ $rc -eq 143 ]]
   [[ $((SECONDS - start)) -lt 15 ]]
   sleep 0.5
+  assert_interrupted_clean
+}
+
+@test "store backup: keychain exit 44 and 51 end the lookup promptly (child exit is noticed, not the deadline)" {
+  mkstore
+  local code start
+  for code in 44 51; do
+    echo "$code" >"$FIX/security_rc"
+    start=$SECONDS
+    SEC_TIMEOUT=5 run_audit --export-store "$DEST"
+    assert_failure 1
+    [[ $((SECONDS - start)) -le 8 ]] || {
+      echo "exit $code took $((SECONDS - start))s" >&2
+      false
+    }
+    [[ -z "$(ls -A "$DEST")" ]]
+    refute_says "timed out"
+    if [[ "$code" -eq 44 ]]; then
+      says "not found (or search failure"
+    else
+      says "keychain lookup failed (security exit 51)"
+    fi
+  done
+}
+
+@test "store backup: a passphrase written in two parts across a read timeout is read whole" {
+  mkstore
+  echo 1.6 >"$FIX/security_split"
+  run_audit --export-store "$DEST"
+  assert_success
+  local a
+  a="$(published)"
+  [[ "$a" == *.tar.gz.enc ]]
+  # The archive opens with the full passphrase (the import reads it whole too).
+  /usr/bin/openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass "pass:$PASS" -in "$a" | /usr/bin/gzip -t
+  run_audit --import-store "$a"
+  assert_success
+  [[ "$(tree "$(restore_dirs)")" == "$(tree "$BASE")" ]]
+}
+
+@test "store backup: TERM between starting the keychain lookup and registering it still reaps it (143, nothing left)" {
+  mkstore
+  echo 47 >"$FIX/security_sleep"
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == keychain-launched ]] || exit 0
+echo "\${2-}" >"$FIX/hook.arg"
+touch "$FIX/paused"
+while [[ ! -e "$FIX/go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+  HOOK="$T/hook" bg_audit --export-store "$DEST"
+  wait_for test -e "$FIX/paused"
+  local leader start=$SECONDS rc=0
+  leader="$(cat "$FIX/hook.arg")"
+  [[ "$leader" =~ ^[0-9]+$ ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/go"
+  wait "$BG_PID" || rc=$?
+  [[ $rc -eq 143 ]]
+  [[ $((SECONDS - start)) -lt 15 ]]
+  sleep 0.5
+  run ! kill -0 "$leader"
   assert_interrupted_clean
 }
 

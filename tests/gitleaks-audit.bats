@@ -51,9 +51,11 @@ setup() {
 teardown() {
   local f
   touch "$FIX/b.go" 2>/dev/null
-  for f in "$FIX/gc.pid" "$FIX/leader.pid"; do
+  touch "$FIX/go" 2>/dev/null
+  for f in "$FIX/gc.pid" "$FIX/leader.pid" "$FIX/hang.pid"; do
     [[ -s "$f" ]] && kill -KILL "$(cat "$f")" 2>/dev/null
   done
+  [[ -n "${BG_PID:-}" ]] && kill -KILL "$BG_PID" 2>/dev/null
   # Restore permissions/ACLs a failed assertion may have left behind.
   /bin/chmod -RN "$BATS_TEST_TMPDIR" 2>/dev/null
   /bin/chmod -R u+rwx "$BATS_TEST_TMPDIR" 2>/dev/null
@@ -3232,4 +3234,154 @@ HOOK
   [[ -z "$(find "$STATE" -name 'pending-announce.prune.*')" ]]
   cmp -s "$(PENDING)" "$T/pending.orig"
   [[ ! -e "$(LOCKD)" ]]
+}
+
+# --- process groups: critical sections, readiness, unconfirmed groups -----------
+
+# wait_bounded <pid> <secs>: wait for a background run to end within <secs>
+# (polling, never an unconditional wait); sets RC. On overrun the run is
+# KILLed and the test fails.
+wait_bounded() {
+  local i=0 n=$(($2 * 10))
+  while kill -0 "$1" 2>/dev/null; do
+    if [[ $i -ge $n ]]; then
+      { kill -KILL "$1" && wait "$1"; } 2>/dev/null || true
+      echo "run $1 still going after $2s (killed)" >&2
+      return 1
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  RC=0
+  wait "$1" || RC=$?
+}
+
+# first_pause_hook <phase>: $T/hook pauses at the first <phase> call
+# (recording its argument in $FIX/hook.arg) until $FIX/go exists.
+first_pause_hook() {
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == "$1" ]] || exit 0
+[[ -e "$FIX/paused" ]] && exit 0
+echo "\${2-}" >"$FIX/hook.arg"
+touch "$FIX/paused"
+while [[ ! -e "$FIX/go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+}
+
+@test "gitleaks-audit: TERM between starting a scan's process group and registering it still reaps that group (143)" {
+  mkrepo alpha
+  touch "$FIX/hang.alpha"
+  first_pause_hook group-launched
+  bg_audit "$T/b" GITLEAKS_AUDIT_TIMEOUT=60 GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --run
+  wait_for test -e "$FIX/paused"
+  local leader
+  leader="$(cat "$FIX/hook.arg")"
+  [[ "$leader" =~ ^[0-9]+$ ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/go"
+  wait_bounded "$BG_PID" 20
+  [[ "$RC" -eq 143 ]]
+  proc_dead "$leader"
+  [[ ! -s "$FIX/gc.pid" ]] || proc_dead "$(cat "$FIX/gc.pid")"
+  [[ ! -e "$(LOCKD)" ]]
+  [[ -z "$(ls -A "$TMPD")" ]]
+}
+
+@test "gitleaks-audit: a scan whose process group never confirms readiness is a bounded repo error; the leader is killed, other repos still scan" {
+  mkrepo alpha
+  mkrepo beta
+  # A perl whose FIRST group-spawn helper leads its own group and then
+  # hangs without writing the readiness byte (never execs gitleaks).
+  cat >"$T/hangperl" <<EOF
+#!/usr/bin/perl
+if ((grep { /setpgrp/ } @ARGV) && ! -e "$FIX/hang.pid") {
+  setpgrp(0, 0) or exit 121;
+  open(my \$f, '>', "$FIX/hang.pid") or die; print \$f "\$\$\\n"; close \$f;
+  sleep 600 while 1;
+}
+exec '/usr/bin/perl', @ARGV or exit 126;
+EOF
+  chmod +x "$T/hangperl"
+  local start=$SECONDS
+  bg_audit "$T/b" GITLEAKS_AUDIT_TIMEOUT=60 GITLEAKS_AUDIT_PERL="$T/hangperl" -- --run --no-notify
+  wait_bounded "$BG_PID" 25
+  [[ "$RC" -eq 1 ]]
+  [[ $((SECONDS - start)) -le 15 ]]
+  proc_dead "$(cat "$FIX/hang.pid")"
+  grep -q "ERROR alpha: .*no readiness" "$LOGF"
+  run scanned_repos
+  assert_output "beta"
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: a scan group that cannot be confirmed empty stays registered: later launches are refused, the run exits 1" {
+  mkrepo alpha
+  mkrepo beta
+  # A failing group observer (test-only probe): every group always looks
+  # live, so no reap can ever confirm it empty. It records each probe.
+  printf '#!/bin/bash\necho "$1" >>"%s/probed"\nexit 0\n' "$FIX" >"$T/liveprobe"
+  chmod +x "$T/liveprobe"
+  local start=$SECONDS
+  bg_audit "$T/b" GITLEAKS_AUDIT_TIMEOUT=60 GITLEAKS_AUDIT_GROUP_PROBE="$T/liveprobe" -- --run
+  wait_bounded "$BG_PID" 40
+  [[ "$RC" -eq 1 ]]
+  [[ $((SECONDS - start)) -le 30 ]]
+  [[ -s "$FIX/probed" ]]
+  grep -q "ERROR alpha: .*could not be confirmed empty" "$LOGF"
+  # Nothing else was started over the registered group: beta was not
+  # scanned (an error), and the notification was not run.
+  grep -q "ERROR beta: .*still registered" "$LOGF"
+  run scanned_repos
+  assert_output "alpha"
+  run notifies
+  assert_output ""
+  grep -q "notification: .*still registered" "$LOGF"
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+# plant_hook <kind>: at prune-precheck-done, put a <kind> node at the prune
+# temp path (after the existence check, before the exclusive create).
+plant_hook() {
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == prune-precheck-done ]] || exit 0
+echo "\$2" >"$FIX/planted.path"
+case "$1" in
+  fifo) mkfifo "\$2" ;;
+  symlink-fifo) mkfifo "$T/fifo.target"; ln -s "$T/fifo.target" "\$2" ;;
+  dangling) ln -s "$T/nowhere" "\$2" ;;
+  symlink-file) printf 'target\n' >"$T/reg.target"; ln -s "$T/reg.target" "\$2" ;;
+esac
+/usr/bin/stat -f '%HT %Y %z' "\$2" >"$FIX/planted.stat"
+HOOK
+  chmod +x "$T/hook"
+}
+
+@test "gitleaks-audit: --prune-delivered never opens a node planted at its temp path (FIFO, symlink to FIFO, dangling symlink, symlink to file)" {
+  mkrepo alpha
+  local kind p
+  for kind in fifo symlink-fifo dangling symlink-file; do
+    rm -f "$FIX/planted.path" "$FIX/planted.stat" "$T/fifo.target" "$T/reg.target"
+    mixed_pending
+    cp -p "$(PENDING)" "$T/pending.orig"
+    plant_hook "$kind"
+    bg_audit "$T/p" GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --prune-delivered
+    wait_bounded "$BG_PID" 10 || {
+      echo "$kind: run did not finish" >&2
+      false
+    }
+    [[ "$RC" -eq 1 ]] || {
+      echo "$kind: exit $RC" >&2
+      false
+    }
+    p="$(cat "$FIX/planted.path")"
+    grep -q "cannot create $p" "$T/p.out"
+    cmp -s "$(PENDING)" "$T/pending.orig"
+    [[ "$(/usr/bin/stat -f '%HT %Y %z' "$p")" == "$(cat "$FIX/planted.stat")" ]]
+    [[ "$kind" != symlink-file || "$(cat "$T/reg.target")" == target ]]
+    [[ ! -e "$(LOCKD)" ]]
+    rm -f "$p"
+  done
 }
