@@ -271,7 +271,9 @@ A few scripts here are interactive launchers wired up via aliases in
   exits 75 when the lock is busy, and exits 1 with the pending file
   untouched on any read/write/rename/log failure. Its temp file is created
   with one exclusive, no-follow open, so a FIFO or symlink placed at that
-  path is an error, never opened or removed. Afterwards a pruned
+  path is an error, never opened or removed. Limitation: a signal sent only
+  to that small create helper (not to the audit) right after it created the
+  file can leave the temp file behind; this covers the prune temp file only. Afterwards a pruned
   fingerprint already in its repo's known stays known (never re-announced);
   one that is not reappears as NEW if the repo has a known file, or is
   baselined if not. Preview with `--prune-delivered --dry-run` (no lock,
