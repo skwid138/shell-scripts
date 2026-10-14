@@ -486,6 +486,23 @@ assert_no_secret_on_disk() {
   [[ "$(mfield onedoc 4)" == clean ]]
 }
 
+@test "gh-public-history-scan: the merge pass also rejects an empty report or several JSON documents" {
+  gh_repo blankm 24 public false disabled
+  gh_repo twom 25 public false disabled
+  local r d
+  for r in blankm twom; do
+    d="$(src_repo "$r")"
+    diverge "$d"
+    evil_merge "$d" evil.txt >/dev/null
+  done
+  : >"$FIX/gl.24.dir.json"
+  printf '[]\n[]\n' >"$FIX/gl.25.dir.json"
+  run_scan --owner "$OWNER"
+  assert_failure 1
+  [[ "$(mfield blankm 4)" == error && "$(mfield blankm 12)" == "merge pass"*JSON* ]]
+  [[ "$(mfield twom 4)" == error && "$(mfield twom 12)" == "merge pass"*JSON* ]]
+}
+
 @test "gh-public-history-scan: a timed-out scan with a TERM-ignoring child is status timeout; the child dies before the work dir is removed" {
   TIMEOUT=2
   gh_repo slow 301 public false disabled
@@ -920,11 +937,12 @@ EOF
 # the remaining layers on their own by planting config in places the isolated
 # git could still read (via the test-only work-ready hook, which receives the
 # private work dir): the clone template (repo-level config) and the private
-# HOME. GIT_CONFIG_NOSYSTEM=1 is not tested on its own: the system config path
-# is compiled into git (e.g. /opt/homebrew/etc/gitconfig, which here carries
-# the real osxkeychain helper) and env -i strips GIT_CONFIG_SYSTEM, so the only
-# way to exercise it would be to read or call the real system config and
-# keychain helper.
+# HOME (credential.helper=, core.askPass= and GIT_CONFIG_GLOBAL=/dev/null are
+# each mutation-checked on their own). GIT_CONFIG_NOSYSTEM=1 is not tested on
+# its own: the system config path is compiled into git (e.g.
+# /opt/homebrew/etc/gitconfig, which here carries the real osxkeychain helper)
+# and env -i strips GIT_CONFIG_SYSTEM, so the only way to exercise it would be
+# to read or call the real system config and keychain helper.
 
 start_401_server() {
   cat >"$T/srv.pl" <<'EOF'
@@ -1007,4 +1025,34 @@ EOF
   run_scan --owner "$OWNER"
   assert_success
   [[ "$(mfield alpha 4)" == clean ]]
+}
+
+@test "gh-public-history-scan: core.askPass= alone keeps an askpass from repo-level (template) config unused" {
+  start_401_server
+  printf '#!/bin/sh\necho askpass >>"%s/askpass.log"\necho synth\n' "$T" >"$T/askpass"
+  chmod +x "$T/askpass"
+  mkdir -p "$T/tpl"
+  printf '[core]\n\taskPass = %s\n' "$T/askpass" >"$T/tpl/config"
+  # Control: an otherwise isolated git (no helper, no terminal prompt) does
+  # run the template's askpass.
+  run env -i HOME="$T/ctl-home" PATH="/usr/bin:/bin" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_TERMINAL_PROMPT=0 "$REAL_GIT" clone -q --mirror --template="$T/tpl" "http://127.0.0.1:$PORT/$OWNER/alpha.git" "$T/ctl.git"
+  assert_failure
+  grep -q askpass "$T/askpass.log"
+  rm -f "$T/askpass.log"
+  cat >"$T/hook" <<EOF
+#!/bin/sh
+[ "\$1" = work-ready ] && cp "$T/tpl/config" "\$2/template/config"
+exit 0
+EOF
+  chmod +x "$T/hook"
+  gh_repo alpha 101 public false disabled
+  CLONE_BASE="http://127.0.0.1:$PORT"
+  EXTRA_ENV=(GH_SCAN_TEST_HOOK="$T/hook")
+  : >"$T/requests.log"
+  run_scan --owner "$OWNER"
+  assert_failure 1
+  [[ "$(mfield alpha 4)" == error ]]
+  grep -q "GET /$OWNER/alpha.git/info/refs" "$T/requests.log"
+  [[ ! -e "$T/askpass.log" ]]
 }
