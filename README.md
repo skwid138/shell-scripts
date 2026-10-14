@@ -233,7 +233,10 @@ A few scripts here are interactive launchers wired up via aliases in
   `findings.tsv` (metadata only, never secret values) under
   `~/Library/Application Support/gh-security-rollout/scan-<UTC>/`;
   `--only` / `--repos` limit targets, `--resume <dir>` re-runs
-  error / timeout / not-attempted repos. Known blind spot: gitleaks logs a
+  error / timeout / not-attempted repos within the dir's original scope
+  (`scope.txt`): a limited pilot dir can never be resumed into a full scan.
+  One run per scan dir (owner-stamped `.lock`; busy = exit 75). `--log <file>`
+  writes all output to a 600, ACL-free file. Known blind spot: gitleaks logs a
   failure of the `git log` it spawns only at debug level.
 - **Private gitleaks suppressions** (`lib/gitleaks-private.sh`, shared by the
   hook and the audit) — per-repo false-positive suppressions that live only
