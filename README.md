@@ -219,6 +219,22 @@ A few scripts here are interactive launchers wired up via aliases in
   group, which confirms itself before the command starts; a group that
   cannot be confirmed empty after TERM and KILL stays registered, nothing
   new starts over it, and the run exits 1.
+- `personal/gh-public-history-scan.sh` (no alias) — one-off, read-only
+  gitleaks *history* scan of every public GitHub repo you own whose secret
+  scanning is disabled (inventory via `gh api` GETs only; the per-repo GET is
+  needed because the list endpoint omits `security_and_analysis`). Each repo
+  is mirror-cloned over https in a private temp dir with git/gitleaks under
+  `env -i` (no git config, no credential helper) and a pinned gitleaks
+  8.30.1 with its own config; repo `.gitleaks.toml` / `.gitleaksignore` /
+  `gitleaks:allow` are never honoured. Besides `gitleaks git`, a merge
+  overscan exports the files each merge's resolution changed
+  (`diff-tree --cc`) and scans them with `gitleaks dir` (findings labelled
+  `merge-touched-file`: may be inherited). Writes `manifest.tsv` /
+  `findings.tsv` (metadata only, never secret values) under
+  `~/Library/Application Support/gh-security-rollout/scan-<UTC>/`;
+  `--only` / `--repos` limit targets, `--resume <dir>` re-runs
+  error / timeout / not-attempted repos. Known blind spot: gitleaks logs a
+  failure of the `git log` it spawns only at debug level.
 - **Private gitleaks suppressions** (`lib/gitleaks-private.sh`, shared by the
   hook and the audit) — per-repo false-positive suppressions that live only
   on this machine, for repos whose teammates do not run these scripts:
