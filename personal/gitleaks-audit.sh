@@ -1763,9 +1763,14 @@ exit($ok ? 0 : 2);'
 # (RUN_ERRORS; the pending file is left as it was). Creation and recording
 # ownership (PENDING_TMP, only once EXCL_WRITE created the file) are one
 # critical section, as are the rename and dropping ownership, so the EXIT
-# cleanup removes exactly a temp file this run created. The shared
-# PENDING_FILE.tmp of older versions is no longer used and is ignored (a
-# leftover is never read, written, or removed). 0 = replaced; 1 = not.
+# cleanup removes exactly a temp file this run created (and retries a
+# removal that failed here). A file created but not fully written (helper
+# exit 2) is never published. The shared PENDING_FILE.tmp of older
+# versions is no longer used and is ignored (a leftover is never read,
+# written, or removed). Limitation, as for the prune temp file: a signal
+# sent only to the perl helper (not to the audit) after its create leaves
+# an unregistered PENDING_FILE.tmp.<pid> behind; later runs (other pids)
+# ignore it, so it is harmless. 0 = replaced; 1 = not.
 pending_replace() {
   local tmp="$PENDING_FILE.tmp.$$" rc
   test_hook pending-precreate "$tmp"
@@ -1786,8 +1791,9 @@ pending_replace() {
     fi
     end_critical
   fi
-  if [[ -n "$PENDING_TMP" ]]; then
-    rm -f "$PENDING_TMP" 2>/dev/null
+  # Ownership is dropped only once the owned temp file is really gone; if
+  # rm fails it stays registered and the EXIT cleanup tries again.
+  if [[ -n "$PENDING_TMP" ]] && rm -f "$PENDING_TMP" 2>/dev/null; then
     PENDING_TMP=""
   fi
   return 1
@@ -2480,8 +2486,8 @@ do_prune_delivered() {
     # and acted on by end_critical, so cleanup never misses a file this run
     # created and never removes one it did not. No trap is replaced here.
     # Limitation: a signal sent only to the helper after its create can
-    # leave that temp file behind (the claims here cover the prune temp
-    # file only).
+    # leave that temp file behind (the same holds for the pending-file
+    # writer, pending_replace).
     local created=0
     begin_critical
     if "$PERL" -e "$EXCL_CREATE" "$tmp" </dev/null >/dev/null 2>&1; then

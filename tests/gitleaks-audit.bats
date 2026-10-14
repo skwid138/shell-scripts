@@ -3689,3 +3689,121 @@ HOOK
   cmp -s "$STATE/pending-announce.tmp" "$T/leftover.orig"
   [[ -z "$(find "$STATE" -maxdepth 1 -name 'pending-announce.tmp.*')" ]]
 }
+
+# --- pending file: failures after the temp file was created ---------------------
+
+# pending_fail_stubs: PATH stubs. mv refuses to rename onto the pending file
+# while $FIX/fail_mv_pending exists. rm refuses to remove the pending file
+# while $FIX/fail_rm_pending exists (copying it to $FIX/pending.at-rm
+# first), and refuses the FIRST removal of a pending temp file when
+# $FIX/fail_rm_tmp_once exists; every temp removal is logged to
+# $FIX/rm_tmp.log.
+pending_fail_stubs() {
+  local st q
+  st="$STATE/pending-announce"
+  q="$(printf '%q' "$st")"
+  cat >"$STUBS/mv" <<EOF
+#!/bin/bash
+if [[ -e "$FIX/fail_mv_pending" && "\${*: -1}" == $q ]]; then exit 1; fi
+exec /bin/mv "\$@"
+EOF
+  cat >"$STUBS/rm" <<EOF
+#!/bin/bash
+for a in "\$@"; do
+  case "\$a" in
+    $q)
+      if [[ -e "$FIX/fail_rm_pending" ]]; then cp -p $q "$FIX/pending.at-rm"; exit 1; fi ;;
+    $q.tmp.*)
+      echo "\$a" >>"$FIX/rm_tmp.log"
+      if [[ -e "$FIX/fail_rm_tmp_once" && ! -e "$FIX/rm_tmp.refused" ]]; then touch "$FIX/rm_tmp.refused"; exit 1; fi ;;
+  esac
+done
+exec /bin/rm "\$@"
+EOF
+  chmod +x "$STUBS/mv" "$STUBS/rm"
+}
+
+# pending_fail_fixture: alpha baselined; a delivered entry of another repo
+# keeps every settled pending file non-empty; a NEW finding is due. The
+# pending file is saved to $T/pending.orig.
+pending_fail_fixture() {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  ghost_delivered
+  commit_in alpha
+  findings_only alpha 1 3
+  cp -p "$STATE/pending-announce" "$T/pending.orig"
+  pending_fail_stubs
+}
+
+# assert_pending_failed: exit 1 with an ERROR, the pending file unchanged,
+# no pending temp file left, the lock released.
+assert_pending_failed() {
+  [[ "$RC" -eq 1 ]]
+  grep -q "ERROR" "$T/b.out"
+  cmp -s "$STATE/pending-announce" "${1:-$T/pending.orig}"
+  [[ -z "$(find "$STATE" -maxdepth 1 -name 'pending-announce.tmp*')" ]]
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: a pending temp file created but not fully written is never published, and is removed" {
+  pending_fail_fixture
+  # The writer creates the temp file, writes part of it, and fails.
+  cat >"$T/partperl" <<'EOF'
+#!/usr/bin/perl
+use Fcntl;
+if (grep { /sysread/ } @ARGV) {
+  sysopen(my $f, $ARGV[-1], O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600) or exit 1;
+  print $f "partial\n";
+  close $f;
+  exit 2;
+}
+exec '/usr/bin/perl', @ARGV or exit 126;
+EOF
+  chmod +x "$T/partperl"
+  bg_audit "$T/b" GITLEAKS_AUDIT_PERL="$T/partperl" -- --run
+  wait_bounded "$BG_PID" 20
+  assert_pending_failed
+  grep -q "ERROR alpha: state write failed" "$T/b.out"
+  [[ -s "$FIX/rm_tmp.log" ]]
+}
+
+@test "gitleaks-audit: a failed rename of the pending temp file is an ERROR; the temp file is removed" {
+  pending_fail_fixture
+  touch "$FIX/fail_mv_pending"
+  bg_audit "$T/b" -- --run
+  wait_bounded "$BG_PID" 20
+  assert_pending_failed
+  grep -q "ERROR alpha: state write failed" "$T/b.out"
+  [[ -s "$FIX/rm_tmp.log" ]]
+}
+
+@test "gitleaks-audit: a failed removal of a settled-empty pending file is an ERROR (exit 1), the file unchanged" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  commit_in alpha
+  findings_only alpha 1 3
+  pending_fail_stubs
+  touch "$FIX/fail_rm_pending"
+  bg_audit "$T/b" -- --run
+  wait_bounded "$BG_PID" 20
+  [[ -s "$FIX/pending.at-rm" ]]
+  assert_pending_failed "$FIX/pending.at-rm"
+  grep -q "ERROR: notification delivered but $STATE/pending-announce could not be updated" "$T/b.out"
+}
+
+@test "gitleaks-audit: an owned pending temp file whose removal fails stays registered; the exit cleanup removes it" {
+  pending_fail_fixture
+  touch "$FIX/fail_mv_pending" "$FIX/fail_rm_tmp_once"
+  bg_audit "$T/b" -- --run
+  wait_bounded "$BG_PID" 20
+  [[ -e "$FIX/rm_tmp.refused" ]]
+  assert_pending_failed
+  # Refused once by pending_replace, then retried (and done) by cleanup.
+  [[ "$(sort -u "$FIX/rm_tmp.log" | grep -c .)" -eq 1 ]]
+  [[ "$(grep -c . "$FIX/rm_tmp.log")" -ge 2 ]]
+}
