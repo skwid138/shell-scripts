@@ -22,18 +22,16 @@
 setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
+  load 'test_helper/zplug_sandbox'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
-  # Per-test ZPLUG_HOME isolation: rc-tier sources rc/zsh_plugins.zsh, which
-  # runs `zplug load` and writes to $ZPLUG_HOME/log/load_success.log. Under
-  # parallel bats workers (`bats --jobs N`), multiple subshells contending
-  # on the shared default (~/.zplug/log/load_success.log) emit log-write
-  # errors to stderr, breaking the silence assertion at line 68 below
-  # intermittently. Giving each test its own ZPLUG_HOME under the per-test
-  # tmpdir removes the contention. zplug honors $ZPLUG_HOME if pre-set
-  # (see /opt/homebrew/opt/zplug/base/core/core.zsh: `ZPLUG_HOME=${ZPLUG_HOME:-~/.zplug}`),
-  # so plugin behavior outside tests is unchanged.
-  export ZPLUG_HOME="$BATS_TEST_TMPDIR/.zplug"
-  mkdir -p "$ZPLUG_HOME/log"
+  # Per-test zplug isolation: rc-tier sources rc/zsh_plugins.zsh, which
+  # runs `zplug load` and writes under $ZPLUG_HOME (log/, cache/, repos/,
+  # ...). zplug_sandbox drops every inherited ZPLUG_* path (a developer
+  # shell exports ZPLUG_BIN/REPOS/LOADFILE/CACHE_DIR/ERROR_LOG pointing at
+  # the real ~/.zplug, and zplug keeps pre-set values) and exports
+  # ZPLUG_HOME under the per-test tmpdir, so parallel bats workers never
+  # share a zplug path. Plugin behavior outside tests is unchanged.
+  zplug_sandbox
   # Sandbox HOME for every zsh this file spawns. Production barrels resolve
   # ~/.nvm, ~/miniconda3, ~/code/wpromote/scripts (private layer) and the
   # default compinit dump relative to $HOME, so a temp HOME keeps tests off
@@ -67,6 +65,10 @@ setup() {
   assert_line "wpromote-profile"
   assert_line "wpromote-rc"
   assert_line "nvm use default --silent"
+}
+
+@test "compat: setup gives zplug only sandbox paths (inherited ZPLUG_* overrides are dropped)" {
+  assert_setup_sandboxes_zplug "source '$REPO/shell/init.zsh' >/dev/null 2>&1"
 }
 
 @test "compat: sourcing init.zsh exits 0" {

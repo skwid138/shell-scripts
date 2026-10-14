@@ -21,7 +21,8 @@
 # dir so no rc sub-file (in particular zplug, which calls compinit itself)
 # runs; only the barrel's own guard block executes.
 #
-# HOME, ZDOTDIR and ZPLUG_HOME are exported as per-test temp dirs in setup(),
+# HOME, ZDOTDIR and ZPLUG_HOME are exported as per-test temp dirs in setup()
+# (every inherited ZPLUG_* path is dropped first: zplug_sandbox),
 # so no test (including the full-barrel ones) reads or writes the real
 # ~/.zcompdump, ~/.zplug, ~/.nvm, ~/miniconda3 or the private
 # ~/code/wpromote layer — all of those are $HOME-relative in production.
@@ -29,14 +30,11 @@
 setup() {
   load 'test_helper/bats-support/load'
   load 'test_helper/bats-assert/load'
+  load 'test_helper/zplug_sandbox'
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)"
-  # Per-test ZPLUG_HOME isolation. See init_compat.bats setup() for the full
-  # rationale: `zplug load` writes to $ZPLUG_HOME/log/load_success.log, and
-  # parallel bats workers contending on the shared default (~/.zplug) leak
-  # log-write errors to stderr. Per-test dirs eliminate the race. zplug
-  # honors a pre-set $ZPLUG_HOME, so behavior outside tests is unchanged.
-  export ZPLUG_HOME="$BATS_TEST_TMPDIR/.zplug"
-  mkdir -p "$ZPLUG_HOME/log"
+  # Per-test zplug isolation (every inherited ZPLUG_* path dropped,
+  # ZPLUG_HOME under the per-test tmpdir). See tests/test_helper/zplug_sandbox.bash.
+  zplug_sandbox
   # Sandbox HOME for every zsh this file spawns (see header).
   ISO_HOME="$BATS_TEST_TMPDIR/home"
   mkdir -p "$ISO_HOME"
@@ -70,6 +68,10 @@ stamp_minutes_ago() {
 }
 
 # --- completion-system guard -----------------------------------------------
+
+@test "init_rc: setup gives zplug only sandbox paths (inherited ZPLUG_* overrides are dropped)" {
+  assert_setup_sandboxes_zplug "source '$REPO/shell/init_env.zsh' >/dev/null 2>&1; source '$REPO/shell/init_rc.zsh' >/dev/null 2>&1"
+}
 
 @test "init_rc: sets _COMPINIT_DONE=1 after first source" {
   # compaudit stubbed: on a tty-less runner with group-writable fpath dirs
