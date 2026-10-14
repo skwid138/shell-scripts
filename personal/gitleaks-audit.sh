@@ -420,6 +420,7 @@ READY_WAIT=5
 KILL_WAIT=2
 # Store export/import artifacts this run created (removed on failure only).
 PRUNE_TMP=""
+PENDING_TMP="" # this run's pending-announce temp file (pending_replace)
 EXPORT_TMPFILE=""
 EXPORT_SUBDIR=""
 RESTORE_DIR=""
@@ -495,6 +496,8 @@ cleanup() {
   # The prune temp file, only if this invocation created it under the lock
   # (PRUNE_TMP is set only then), removed before the lock is released.
   [[ -n "$PRUNE_TMP" && "$LOCK_HELD" -eq 1 ]] && rm -f "$PRUNE_TMP"
+  # Likewise the pending-announce temp file, only if this run created it.
+  [[ -n "$PENDING_TMP" && "$LOCK_HELD" -eq 1 ]] && rm -f "$PENDING_TMP"
   if [[ "$LOCK_HELD" -eq 1 ]]; then
     local owner_pid=""
     owner_pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
@@ -1719,6 +1722,77 @@ send_notify() {
   return "$rc"
 }
 
+# EXCL_CREATE (perl, argv: <path>): create <path> with O_CREAT|O_EXCL|
+# O_WRONLY|O_NOFOLLOW, mode 600, and close it. Exit 0 = created; anything
+# else = not created (it never unlinks anything).
+# shellcheck disable=SC2016 # perl code: $f/@ARGV are perl variables
+EXCL_CREATE='use Fcntl; sysopen(my $f, $ARGV[0], O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600) or exit 1; close($f) or exit 1; exit 0'
+
+# EXCL_WRITE (perl, argv: <path>; stdin: the contents): create <path> like
+# EXCL_CREATE (O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW, mode 600, fchmod 600)
+# and copy stdin into that same descriptor, so nothing is ever reopened by
+# name. Exit 0 = created and written; 1 = not created (an existing node of
+# any kind: file, FIFO, symlink, dangling symlink, directory; or an
+# unwritable dir); 2 = created, but writing or closing it failed. It never
+# unlinks anything.
+# shellcheck disable=SC2016 # perl code: $f/$b/$n/$o/$w/$ok/@ARGV are perl variables
+EXCL_WRITE='use Fcntl;
+sysopen(my $f, $ARGV[0], O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600) or exit 1;
+my $ok = chmod(0600, $f) ? 1 : 0;
+binmode STDIN;
+my $b;
+COPY: while ($ok) {
+  my $n = sysread(STDIN, $b, 65536);
+  if (!defined $n) { $ok = 0; last }
+  last if $n == 0;
+  my $o = 0;
+  while ($o < $n) {
+    my $w = syswrite($f, $b, $n - $o, $o);
+    if (!defined $w) { $ok = 0; last COPY }
+    $o += $w;
+  }
+}
+close($f) or $ok = 0;
+exit($ok ? 0 : 2);'
+
+# pending_replace <src>: replace PENDING_FILE with the contents of <src>
+# (lock holders only). They go through this run's own temp file
+# PENDING_FILE.tmp.<pid>, created and written by EXCL_WRITE, so a node
+# planted at that path (FIFO, symlink to anything, directory) is never
+# opened, followed, or removed: the write fails and the caller reports it
+# (RUN_ERRORS; the pending file is left as it was). Creation and recording
+# ownership (PENDING_TMP, only once EXCL_WRITE created the file) are one
+# critical section, as are the rename and dropping ownership, so the EXIT
+# cleanup removes exactly a temp file this run created. The shared
+# PENDING_FILE.tmp of older versions is no longer used and is ignored (a
+# leftover is never read, written, or removed). 0 = replaced; 1 = not.
+pending_replace() {
+  local tmp="$PENDING_FILE.tmp.$$" rc
+  test_hook pending-precreate "$tmp"
+  begin_critical
+  "$PERL" -e "$EXCL_WRITE" "$tmp" <"$1" >/dev/null 2>&1
+  rc=$?
+  if [[ $rc -eq 0 || $rc -eq 2 ]]; then
+    test_hook pending-created "$tmp"
+    PENDING_TMP="$tmp"
+  fi
+  end_critical
+  if [[ $rc -eq 0 ]]; then
+    begin_critical
+    if mv -f "$tmp" "$PENDING_FILE" 2>/dev/null; then
+      PENDING_TMP=""
+      end_critical
+      return 0
+    fi
+    end_critical
+  fi
+  if [[ -n "$PENDING_TMP" ]]; then
+    rm -f "$PENDING_TMP" 2>/dev/null
+    PENDING_TMP=""
+  fi
+  return 1
+}
+
 # announce_record <kind> <rel> <fps-file>: durably add one pending entry
 # "<kind>\t<rel>\t<fingerprint>" per fingerprint (sorted, unique, so
 # recording the same announcement twice after a crash is a no-op). Also
@@ -1728,14 +1802,11 @@ announce_record() {
   GLA_KIND="$1" GLA_REL="$2" awk '{ print ENVIRON["GLA_KIND"] "\t" ENVIRON["GLA_REL"] "\t" $0 }' "$3" \
     >"$WORK/announce.add" 2>/dev/null || return 1
   if [[ -f "$PENDING_FILE" ]]; then
-    LC_ALL=C sort -u "$WORK/announce.add" "$PENDING_FILE" >"$PENDING_FILE.tmp" 2>/dev/null || return 1
+    LC_ALL=C sort -u "$WORK/announce.add" "$PENDING_FILE" >"$WORK/pending.new" 2>/dev/null || return 1
   else
-    LC_ALL=C sort -u "$WORK/announce.add" >"$PENDING_FILE.tmp" 2>/dev/null || return 1
+    LC_ALL=C sort -u "$WORK/announce.add" >"$WORK/pending.new" 2>/dev/null || return 1
   fi
-  mv -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null || {
-    rm -f "$PENDING_FILE.tmp" 2>/dev/null
-    return 1
-  }
+  pending_replace "$WORK/pending.new" || return 1
   # Only a durably recorded announcement is announced by this run.
   cat "$WORK/announce.add" >>"$WORK/announce"
 }
@@ -1779,14 +1850,11 @@ pending_settle() {
       if (($2 "\t" $3) in k) { if (!done && !mark) print; next }
       if (mark && !done) $1 = $1 ".delivered"
       print
-    }' "$WORK/knownset" "$PENDING_FILE" 2>/dev/null | LC_ALL=C sort -u >"$PENDING_FILE.tmp" || {
-    rm -f "$PENDING_FILE.tmp" 2>/dev/null
-    return 1
-  }
-  if [[ -s "$PENDING_FILE.tmp" ]]; then
-    mv -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null || return 1
+    }' "$WORK/knownset" "$PENDING_FILE" 2>/dev/null | LC_ALL=C sort -u >"$WORK/pending.new" || return 1
+  if [[ -s "$WORK/pending.new" ]]; then
+    pending_replace "$WORK/pending.new" || return 1
   else
-    rm -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null || return 1
+    rm -f "$PENDING_FILE" 2>/dev/null || return 1
   fi
 }
 
@@ -1851,10 +1919,10 @@ notify() {
     return 0
   fi
   [[ $persist -eq 1 && -s "$all" ]] || return 0
-  if [[ -d "$STATE_DIR" ]] && { LC_ALL=C sort -u "$all" >"$PENDING_FILE.tmp" && mv -f "$PENDING_FILE.tmp" "$PENDING_FILE"; } 2>/dev/null; then
+  if [[ -d "$STATE_DIR" ]] && LC_ALL=C sort -u "$all" >"$WORK/pending.new" 2>/dev/null &&
+    pending_replace "$WORK/pending.new"; then
     log "  notification not delivered; announcement pending, retried next run ($nn new in $rn repos, $nb baselined in $rb repos)"
   else
-    rm -f "$PENDING_FILE.tmp" 2>/dev/null
     RUN_ERRORS=$((RUN_ERRORS + 1))
     log "  ERROR: notification not delivered and the announcement could not be saved to $PENDING_FILE"
   fi
@@ -2326,7 +2394,7 @@ report_delivered() {
 # prune_fail <message>: the --prune-delivered error path. Logs (best effort)
 # and exits 1. It never notifies, settles, or touches the pending file, and
 # removes nothing but the invocation-unique temp file this run created while
-# holding the lock (PRUNE_TMP): never the shared pending-announce.tmp of a
+# holding the lock (PRUNE_TMP): never a pending-announce temp file of a
 # concurrent --run, and nothing at all from a preview.
 prune_fail() {
   log "ERROR: $1"
@@ -2336,12 +2404,6 @@ prune_fail() {
   PRUNE_TMP=""
   EXIT_CODE=1
 }
-
-# EXCL_CREATE (perl, argv: <path>): create <path> with O_CREAT|O_EXCL|
-# O_WRONLY|O_NOFOLLOW, mode 600, and close it. Exit 0 = created; anything
-# else = not created (it never unlinks anything).
-# shellcheck disable=SC2016 # perl code: $f/@ARGV are perl variables
-EXCL_CREATE='use Fcntl; sysopen(my $f, $ARGV[0], O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600) or exit 1; close($f) or exit 1; exit 0'
 
 # do_prune_delivered: remove every delivered pending row (both kinds,
 # regardless of known), keeping every other row byte-for-byte in its

@@ -2618,6 +2618,67 @@ regexes = ['"'"'^\n? +(?:[a-z0-9_]+: [A-Za-z\[\]]+ = field\(metadata=\{"data_key
   assert_line --regexp '^== alpha .*unsettled'
 }
 
+# pending_plant_hook <kind> <when>: $T/hook plants a <kind> node (fifo,
+# symlink-fifo, dangling, symlink-file, dir) at the per-run pending temp
+# path at the pending-precreate seam (before the exclusive create): <when>
+# is "first" (the first pending write of the run), "flag" (the first one
+# once $FIX/obstruct exists), or "always" (every write; kind dir only). It
+# records the path ($FIX/planted.path), the node (planted.stat), and the
+# pending file at that moment (pending.at-plant, or pending.absent).
+pending_plant_hook() {
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == pending-precreate ]] || exit 0
+case "$2" in
+  first) [[ -e "$FIX/planted.path" ]] && exit 0 ;;
+  flag) [[ -e "$FIX/obstruct" && ! -e "$FIX/planted.path" ]] || exit 0 ;;
+esac
+echo "\$2" >"$FIX/planted.path"
+if [[ -e "$STATE/pending-announce" ]]; then
+  cp -p "$STATE/pending-announce" "$FIX/pending.at-plant"
+else
+  : >"$FIX/pending.absent"
+fi
+case "$1" in
+  fifo) mkfifo "\$2" ;;
+  symlink-fifo) mkfifo "$T/fifo.target"; ln -s "$T/fifo.target" "\$2" ;;
+  dangling) ln -s "$T/nowhere" "\$2" ;;
+  symlink-file) printf 'target\n' >"$T/reg.target"; ln -s "$T/reg.target" "\$2" ;;
+  dir) mkdir "\$2" ;;
+esac
+/usr/bin/stat -f '%HT %Y %z' "\$2" >"$FIX/planted.stat"
+HOOK
+  chmod +x "$T/hook"
+}
+
+# ghost_delivered: a delivered pending entry of a repo that is not scanned
+# (it is never counted and stays pending), so settling keeps a non-empty
+# pending file. only_ghost_pending: that entry is all that is left.
+ghost_delivered() {
+  mkdir -p "$STATE"
+  printf 'new.delivered\tghost\t%s\n' "$(fp 9)" >>"$STATE/pending-announce"
+  /bin/chmod 600 "$STATE/pending-announce"
+}
+only_ghost_pending() {
+  [[ "$(cat "$STATE/pending-announce")" == "$(printf 'new.delivered\tghost\t%s' "$(fp 9)")" ]]
+}
+
+# assert_planted_intact <kind>: the planted node, its target, and the
+# pending file (as it was when the node was planted) are unchanged, and no
+# other pending temp file is left.
+assert_planted_intact() {
+  local p
+  p="$(cat "$FIX/planted.path")"
+  [[ "$(/usr/bin/stat -f '%HT %Y %z' "$p")" == "$(cat "$FIX/planted.stat")" ]]
+  [[ "$1" != symlink-file || "$(cat "$T/reg.target")" == target ]]
+  if [[ -e "$FIX/pending.absent" ]]; then
+    [[ ! -e "$STATE/pending-announce" ]]
+  else
+    cmp -s "$STATE/pending-announce" "$FIX/pending.at-plant"
+  fi
+  [[ -z "$(find "$STATE" -maxdepth 1 -name 'pending-announce.tmp.*' ! -path "$p")" ]]
+}
+
 # new_notifications: how many notifications so far announced NEW findings.
 new_notifications() { grep -c '^osascript .*NEW' "$CALLS" || true; }
 
@@ -2659,13 +2720,14 @@ new_notifications() { grep -c '^osascript .*NEW' "$CALLS" || true; }
   assert_success
   commit_in alpha
   findings_only alpha 1 3
-  mkdir "$STATE/pending-announce.tmp"
+  # A directory obstructs every pending-file write of this run.
+  pending_plant_hook dir always
   : >"$CALLS"
-  run_audit --run
+  GITLEAKS_AUDIT_TEST_HOOK="$T/hook" run_audit_env --run
   assert_failure 1
   [[ "$(new_notifications)" -eq 0 ]]
   run ! grep -qx "$(fp 3)" "$(state_dir alpha)/known"
-  rmdir "$STATE/pending-announce.tmp"
+  find "$STATE" -maxdepth 1 -name 'pending-announce.tmp.*' -type d -exec rmdir {} +
   run_audit --run
   assert_failure 10
   run_audit --run
@@ -2736,23 +2798,28 @@ HOOK
   assert_success
   commit_in alpha
   findings_only alpha 1 3
+  # A delivered entry of another repo keeps the settled pending file
+  # non-empty, so settling after delivery rewrites it (an empty result just
+  # removes the file and writes nothing).
+  ghost_delivered
   # Delivery succeeds, then the pending temp path is obstructed.
-  printf '#!/bin/bash\nmkdir -p "%s"\n' "$STATE/pending-announce.tmp" >"$FIX/after_notify"
+  printf '#!/bin/bash\ntouch "%s"\n' "$FIX/obstruct" >"$FIX/after_notify"
   chmod +x "$FIX/after_notify"
+  pending_plant_hook dir flag
   : >"$CALLS"
-  run_audit --run
+  GITLEAKS_AUDIT_TEST_HOOK="$T/hook" run_audit_env --run
   assert_failure 1
   assert_output --partial "ERROR: notification delivered but $STATE/pending-announce could not be updated"
   grep -q 'ERROR: notification delivered but' "$LOGF"
   grep -q 'exit=1' "$STATE/last-run"
   [[ "$(new_notifications)" -eq 1 ]]
   rm -f "$FIX/after_notify"
-  rmdir "$STATE/pending-announce.tmp"
+  rmdir "$(cat "$FIX/planted.path")"
   # Documented exception: repeated once, then settled.
   run_audit --run
   assert_success
   [[ "$(new_notifications)" -eq 2 ]]
-  [[ ! -e "$STATE/pending-announce" ]]
+  only_ghost_pending
   run_audit --run
   assert_success
   run_audit --full
@@ -3487,4 +3554,138 @@ children_of() {
   [[ -z "$(children_of "$wd")" ]]
   proc_dead "$(cat "$FIX/leader.pid")"
   [[ ! -e "$(LOCKD)" ]]
+}
+
+# --- pending file: exclusive per-run temp ---------------------------------------
+
+# pending_record_case <kind>: a node planted at the temp path of the first
+# pending write (announce_record of a NEW finding) is never opened: the run
+# ends (bounded) with exit 1 and an ERROR, nothing planted or pending
+# changes, and the NEW finding is announced exactly once later.
+pending_record_case() {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  commit_in alpha
+  findings_only alpha 1 3
+  pending_plant_hook "$1" first
+  : >"$CALLS"
+  bg_audit "$T/b" GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --run
+  wait_bounded "$BG_PID" 20
+  [[ "$RC" -eq 1 ]]
+  grep -q "ERROR alpha: state write failed" "$T/b.out"
+  [[ "$(new_notifications)" -eq 0 ]]
+  assert_planted_intact "$1"
+  [[ ! -e "$(LOCKD)" ]]
+  rm -f "$(cat "$FIX/planted.path")"
+  run_audit --run
+  assert_failure 10
+  run_audit --run
+  assert_success
+  run_audit --full
+  assert_success
+  [[ "$(new_notifications)" -eq 1 ]]
+  [[ -z "$(find "$STATE" -maxdepth 1 -name 'pending-announce.tmp*')" ]]
+}
+
+@test "gitleaks-audit: announce_record never opens a FIFO planted at its temp path" { pending_record_case fifo; }
+@test "gitleaks-audit: announce_record never follows a symlink to a FIFO at its temp path" { pending_record_case symlink-fifo; }
+@test "gitleaks-audit: announce_record never follows a dangling symlink at its temp path" { pending_record_case dangling; }
+@test "gitleaks-audit: announce_record never writes through a symlink to a file at its temp path" { pending_record_case symlink-file; }
+
+# pending_settle_case <kind>: delivery succeeds, then a node is planted at
+# the temp path of the settling rewrite (pending_settle 1): exit 1 with the
+# documented ERROR, nothing planted or pending changes, and the
+# announcement repeats exactly once, then settles.
+pending_settle_case() {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  commit_in alpha
+  findings_only alpha 1 3
+  ghost_delivered
+  printf '#!/bin/bash\ntouch "%s"\n' "$FIX/obstruct" >"$FIX/after_notify"
+  chmod +x "$FIX/after_notify"
+  pending_plant_hook "$1" flag
+  : >"$CALLS"
+  bg_audit "$T/b" GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --run
+  wait_bounded "$BG_PID" 20
+  [[ "$RC" -eq 1 ]]
+  grep -q "ERROR: notification delivered but $STATE/pending-announce could not be updated" "$T/b.out"
+  [[ "$(new_notifications)" -eq 1 ]]
+  [[ ! -e "$FIX/pending.absent" ]]
+  assert_planted_intact "$1"
+  [[ ! -e "$(LOCKD)" ]]
+  rm -f "$FIX/after_notify" "$(cat "$FIX/planted.path")"
+  run_audit --run
+  assert_success
+  [[ "$(new_notifications)" -eq 2 ]]
+  only_ghost_pending
+  run_audit --run
+  assert_success
+  run_audit --full
+  assert_success
+  [[ "$(new_notifications)" -eq 2 ]]
+  [[ -z "$(find "$STATE" -maxdepth 1 -name 'pending-announce.tmp*')" ]]
+}
+
+@test "gitleaks-audit: pending_settle never opens a FIFO planted at its temp path" { pending_settle_case fifo; }
+@test "gitleaks-audit: pending_settle never follows a symlink to a FIFO at its temp path" { pending_settle_case symlink-fifo; }
+@test "gitleaks-audit: pending_settle never follows a dangling symlink at its temp path" { pending_settle_case dangling; }
+@test "gitleaks-audit: pending_settle never writes through a symlink to a file at its temp path" { pending_settle_case symlink-file; }
+
+@test "gitleaks-audit: TERM inside the pending temp file's critical section (created, not yet registered) exits 143 with no orphan" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  commit_in alpha
+  findings_only alpha 1 3
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == pending-created ]] || exit 0
+[[ -f "\$2" ]] && touch "$FIX/tmp.seen"
+touch "$FIX/paused"
+while [[ ! -e "$FIX/go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+  bg_audit "$T/b" GITLEAKS_AUDIT_TEST_HOOK="$T/hook" -- --run
+  wait_for test -e "$FIX/paused"
+  [[ -e "$FIX/tmp.seen" ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/go"
+  wait_bounded "$BG_PID" 20
+  [[ "$RC" -eq 143 ]]
+  [[ -z "$(find "$STATE" -maxdepth 1 -name 'pending-announce.tmp*')" ]]
+  [[ ! -e "$STATE/pending-announce" ]]
+  [[ ! -e "$(LOCKD)" ]]
+}
+
+@test "gitleaks-audit: a leftover pending-announce.tmp from an older version is ignored (never read, written, or removed)" {
+  mkrepo alpha
+  findings_only alpha 1
+  run_audit --run
+  assert_success
+  mkdir -p "$STATE"
+  printf 'left by an older version\n' >"$STATE/pending-announce.tmp"
+  /bin/chmod 600 "$STATE/pending-announce.tmp"
+  cp -p "$STATE/pending-announce.tmp" "$T/leftover.orig"
+  commit_in alpha
+  findings_only alpha 1 3
+  echo 1 >"$FIX/osascript_rc"
+  : >"$CALLS"
+  run_audit --run
+  # Not delivered: kept pending (written through the per-run temp file).
+  assert_failure 10
+  grep -q "$(fp 3)" "$STATE/pending-announce"
+  [[ "$(/usr/bin/stat -f %Lp "$STATE/pending-announce")" == 600 ]]
+  rm -f "$FIX/osascript_rc"
+  run_audit --run
+  assert_success
+  [[ "$(new_notifications)" -eq 2 ]]
+  [[ ! -e "$STATE/pending-announce" ]]
+  cmp -s "$STATE/pending-announce.tmp" "$T/leftover.orig"
+  [[ -z "$(find "$STATE" -maxdepth 1 -name 'pending-announce.tmp.*')" ]]
 }
