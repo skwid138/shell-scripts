@@ -38,10 +38,18 @@ Options:
                   error / timeout / not-attempted, or whose findings.tsv row
                   count disagrees with the manifest, are scanned again; settled
                   repos (clean / findings / empty) are kept. The inventory is
-                  re-read; without --only/--repos the scope saved in the dir's
-                  scope.txt is reused, so a limited (pilot) dir stays limited:
-                  it can never be resumed into a full scan (start a new scan
-                  dir for that). One run per dir at a time (.lock; exit 75).
+                  re-read. Scope: without --only/--repos the scope saved in
+                  the dir's scope.txt (written by a limited first run) is
+                  reused, so resuming a pilot dir scans only the pilot repos.
+                  An explicit --only/--repos replaces that scope for the run
+                  (scope.txt itself is not rewritten); there is no flag that
+                  drops a saved scope, so run a full scan in a NEW scan dir.
+                  One run per dir at a time (.lock; busy = exit 75, nothing
+                  is killed). A lock whose owner pid is alive is busy; a dead
+                  owner's lock is reclaimed; an ownerless lock only after 60s.
+                  Limitation: if the owner died and its pid was reused by an
+                  unrelated live process, the lock stays busy (conservative):
+                  check the pid and remove .lock by hand.
   --timeout SECS  Bound for each clone / git / gitleaks command (default 3600).
   --dry-run       Inventory only: print targets, skips and errors; no clones,
                   no scans, nothing written.
@@ -221,6 +229,7 @@ READY_WAIT=5
 KILL_WAIT=2
 LOCK_FILE=""
 LOCK_HELD=0
+LOCK_TMP=""
 LOCK_ERR=""
 FATAL=0
 FATAL_MSG=""
@@ -682,18 +691,25 @@ LK_STATE=""
 LK_WHY=""
 
 # lock_try: 0 = held; 3 = a lock exists; 4 = error (LOCK_ERR).
+# The temp file, the link and LOCK_HELD=1 are one critical section: a
+# TERM/INT in between is deferred until the lock is registered (so the EXIT
+# cleanup removes it) and the temp file is gone.
 lock_try() {
   local tmp="$SCAN_DIR/.lock.tmp.$$.$RANDOM$RANDOM" rc
+  begin_critical
+  LOCK_TMP="$tmp"
   if ! (
     set -C
     printf 'pid=%s\nstarted=%s\n' "$$" "$(/bin/date -u +%s)" >"$tmp"
   ) 2>/dev/null; then
+    LOCK_TMP=""
     LOCK_ERR="cannot write a lock temp file in $SCAN_DIR"
+    end_critical
     return 4
   fi
   "$PERL" -MErrno -e 'link($ARGV[0], $ARGV[1]) and exit 0; exit($!{EEXIST} ? 3 : 4)' "$tmp" "$LOCK_FILE"
   rc=$?
-  rm -f "$tmp"
+  [[ "$rc" -eq 0 ]] && test_hook lock-linked "$SCAN_DIR"
   case "$rc" in
     0) LOCK_HELD=1 ;;
     3) ;;
@@ -702,6 +718,9 @@ lock_try() {
       rc=4
       ;;
   esac
+  rm -f "$tmp"
+  LOCK_TMP=""
+  end_critical
   return "$rc"
 }
 
@@ -718,6 +737,11 @@ lock_inspect() {
   fi
   if [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]; then
     pid="$(sed -n 's/^pid=//p' "$LOCK_FILE" 2>/dev/null | head -n1)"
+  elif [[ -d "$LOCK_FILE" && ! -L "$LOCK_FILE" && -f "$LOCK_FILE/pid" && ! -L "$LOCK_FILE/pid" ]]; then
+    # Legacy lock (first version of this script): a .lock/ dir whose pid
+    # file holds the bare owner pid.
+    pid="$(head -n1 "$LOCK_FILE/pid" 2>/dev/null | tr -d '[:space:]')"
+    pid="${pid#pid=}"
   fi
   if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
     if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
@@ -823,6 +847,8 @@ acquire_lock() {
 
 # release_lock: remove the lock only if this run holds it and it still names us.
 release_lock() {
+  [[ -n "$LOCK_TMP" ]] && rm -f "$LOCK_TMP"
+  LOCK_TMP=""
   [[ "$LOCK_HELD" -eq 1 && -n "$LOCK_FILE" ]] || return 0
   if [[ -f "$LOCK_FILE" && "$(sed -n 's/^pid=//p' "$LOCK_FILE" 2>/dev/null | head -n1)" == "$$" ]]; then
     rm -f "$LOCK_FILE"
@@ -1173,6 +1199,7 @@ scan_repo() {
 # log file: created under umask 077 without following a symlink, then
 # verified before anything is written to it.
 open_log() {
+  local want got
   [[ -n "$LOG_PATH" ]] || return 0
   [[ -L "$LOG_PATH" ]] && die_usage "--log: $LOG_PATH is a symlink"
   [[ ! -e "$LOG_PATH" || -f "$LOG_PATH" ]] || die_usage "--log: $LOG_PATH is not a regular file"
@@ -1182,7 +1209,19 @@ open_log() {
     ! ls_led_ok "$LOG_PATH" -rw-------; then
     die "--log: cannot make $LOG_PATH private (600, no ACL)"
   fi
-  exec >>"$LOG_PATH" 2>&1
+  want="$(/usr/bin/stat -f '%d:%i' "$LOG_PATH" 2>/dev/null)" || die "--log: cannot stat $LOG_PATH"
+  test_hook log-verified "$LOG_PATH"
+  # The shell reopens by pathname: verify that what it opened is the file
+  # verified above (same dev:inode, still a 600 regular file without ACL).
+  exec 5>>"$LOG_PATH" || die "--log: cannot open $LOG_PATH"
+  # fstat(2) of the open descriptor (/dev/fd stat reports fdesc's device).
+  # shellcheck disable=SC2016 # perl code
+  got="$("$PERL" -e 'open(my $f, ">&=", 5) or exit 1; my @s = stat($f) or exit 1; printf "%d:%d %s %o\n", $s[0], $s[1], (-f _ ? "regular" : "other"), $s[2] & 07777' 2>/dev/null)"
+  if [[ -z "$want" || "$got" != "$want regular 600" ]] || [[ -L "$LOG_PATH" ]] || ! ls_led_ok "$LOG_PATH" -rw-------; then
+    exec 5>&-
+    die_usage "--log: $LOG_PATH changed between verification and opening; nothing written"
+  fi
+  exec 1>&5 2>&5 5>&-
 }
 
 require_cmd jq

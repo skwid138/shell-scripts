@@ -1056,3 +1056,60 @@ EOF
   grep -q "GET /$OWNER/alpha.git/info/refs" "$T/requests.log"
   [[ ! -e "$T/askpass.log" ]]
 }
+
+# --- lock: legacy directory locks and the publication seam ---------------------------
+
+@test "gh-public-history-scan: a legacy .lock/ dir with a live pid stays busy and untouched, even when old" {
+  local sd
+  sd="$(one_scan_dir)"
+  mkdir "$sd/.lock"
+  echo "$$" >"$sd/.lock/pid"
+  touch -t 200001010000 "$sd/.lock/pid" "$sd/.lock"
+  run_scan --owner "$OWNER" --resume "$sd"
+  assert_failure 75
+  [[ "$stderr" == *"live pid $$"* ]]
+  [[ -d "$sd/.lock" && "$(cat "$sd/.lock/pid")" == "$$" ]]
+}
+
+@test "gh-public-history-scan: a legacy .lock/ dir with a dead pid is reclaimed" {
+  local sd
+  sd="$(one_scan_dir)"
+  mkdir "$sd/.lock"
+  dead_pid >"$sd/.lock/pid"
+  run_scan --owner "$OWNER" --resume "$sd"
+  assert_success
+  [[ ! -e "$sd/.lock" ]]
+}
+
+@test "gh-public-history-scan: TERM at the lock publication seam leaves no lock and no lock temp" {
+  local sd
+  sd="$(one_scan_dir)"
+  printf '#!/bin/sh\n[ "$1" = lock-linked ] && kill -TERM "$PPID"\nexit 0\n' >"$T/hook"
+  chmod +x "$T/hook"
+  EXTRA_ENV=(GH_SCAN_TEST_HOOK="$T/hook")
+  run_scan --owner "$OWNER" --resume "$sd"
+  assert_failure 143
+  [[ ! -e "$sd/.lock" ]]
+  [[ -z "$(find "$sd" -name '.lock.tmp.*')" ]]
+}
+
+@test "gh-public-history-scan: --log refuses (exit 2) when the opened file is not the verified one" {
+  gh_repo alpha 101 public false disabled
+  src_repo alpha >/dev/null
+  mkdir -p "$T/logs"
+  cat >"$T/hook" <<'EOF'
+#!/bin/sh
+[ "$1" = log-verified ] || exit 0
+mv "$2" "$2.moved"
+: >"$2"
+chmod 644 "$2"
+exit 0
+EOF
+  chmod +x "$T/hook"
+  EXTRA_ENV=(GH_SCAN_TEST_HOOK="$T/hook")
+  run_scan --owner "$OWNER" --log "$T/logs/scan.log"
+  assert_failure 2
+  [[ "$stderr" == *"--log"* ]]
+  [[ ! -s "$T/logs/scan.log" && ! -s "$T/logs/scan.log.moved" ]]
+  [[ ! -d "$STATE" ]] || [[ -z "$(scan_dir)" ]]
+}
