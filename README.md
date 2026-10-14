@@ -187,6 +187,9 @@ A few scripts here are interactive launchers wired up via aliases in
   `ExitTimeOut` (30s) replace it. Killing the docker CLI does not cancel or
   roll back work the daemon already accepted: an interrupted run may leave a
   removal or prune partly done, and the next run re-inventories.
+  Inventory and report commands (du, docker inventory, pip, ...) run under
+  a watchdog in the main shell, so a TERM/INT also stops the one in flight
+  and its watchdog.
 - `personal/gitleaks-hook.sh` (no alias) — global pre-commit secret scan.
   Registered in the dotfiles `~/.gitconfig` as a git config hook
   (`hook.gitleaks.command` / `hook.gitleaks.event = pre-commit`), so it runs
@@ -212,6 +215,10 @@ A few scripts here are interactive launchers wired up via aliases in
   every later run.
   Private excludes live in `~/.config/gitleaks-audit/config`. LaunchAgent
   runs `--run` daily at 11:00. Logs to `~/Library/Logs/gitleaks-audit.log`.
+  Each scan, notification, and keychain lookup runs in its own process
+  group, which confirms itself before the command starts; a group that
+  cannot be confirmed empty after TERM and KILL stays registered, nothing
+  new starts over it, and the run exits 1.
 - **Private gitleaks suppressions** (`lib/gitleaks-private.sh`, shared by the
   hook and the audit) — per-repo false-positive suppressions that live only
   on this machine, for repos whose teammates do not run these scripts:
@@ -262,7 +269,9 @@ A few scripts here are interactive launchers wired up via aliases in
   under the audit lock, whatever known says, and keeps every other row
   byte-for-byte (the next `--run` still announces them); it never notifies,
   exits 75 when the lock is busy, and exits 1 with the pending file
-  untouched on any read/write/rename/log failure. Afterwards a pruned
+  untouched on any read/write/rename/log failure. Its temp file is created
+  with one exclusive, no-follow open, so a FIFO or symlink placed at that
+  path is an error, never opened or removed. Afterwards a pruned
   fingerprint already in its repo's known stays known (never re-announced);
   one that is not reappears as NEW if the repo has a known file, or is
   baselined if not. Preview with `--prune-delivered --dry-run` (no lock,
