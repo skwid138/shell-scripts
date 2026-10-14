@@ -48,7 +48,8 @@ teardown() {
   if [[ -n "${BG_PID:-}" ]] && [[ "$(/bin/ps -o command= -p "$BG_PID" 2>/dev/null)" == *personal/cache-prune.sh* ]]; then
     kill -KILL "$BG_PID" 2>/dev/null
   fi
-  pkill -KILL -f "$T/(tsleep|desc|slowperl|deadperl|slowps|joiner|hook|stubs/)" 2>/dev/null
+  [[ -n "${HARNESS_PID:-}" ]] && kill -KILL "$HARNESS_PID" 2>/dev/null
+  pkill -KILL -f "$T/(tsleep|desc|slowperl|deadperl|hangperl|slowps|joiner|hook|stubs/)" 2>/dev/null
   return 0
 }
 
@@ -1954,24 +1955,11 @@ wait_long() {
   done
 }
 
-# write_report_hook: $T/hook pauses at the start of the report steps
-# (touching $FIX/hook.paused) until $FIX/hook.go exists.
-write_report_hook() {
-  cat >"$T/hook" <<HOOK
-#!/bin/bash
-[[ "\$1" == report-steps ]] || exit 0
-touch "$FIX/hook.paused"
-while [[ ! -e "$FIX/hook.go" ]]; do sleep 0.05; done
-HOOK
-  chmod +x "$T/hook"
-}
-
-@test "cache-prune: a group that cannot be confirmed empty stays registered: TERM in a later report step still stops it (143)" {
-  setup_mut_fixture
-  # $T/joiner <fix> <pgid>: leaves for its own group, forks Z into <pgid>
-  # and never reaps it, so Z's zombie keeps <pgid> alive after the
-  # cleanup's KILL. On $FIX/join it joins <pgid> itself: a live member the
-  # cleanup never saw. It records a TERM in $FIX/joiner.term.
+# write_joiner: $T/joiner <fix> <pgid>: leaves for its own group, forks Z
+# into <pgid> and never reaps it, so Z's zombie keeps <pgid> alive after the
+# cleanup's KILL. On $FIX/join it joins <pgid> itself: a live member the
+# cleanup never saw. It records a TERM in $FIX/joiner.term.
+write_joiner() {
   cat >"$T/joiner" <<'EOF'
 #!/usr/bin/perl
 use POSIX ();
@@ -1989,6 +1977,23 @@ touch("$fix/joiner.joined");
 sleep 600 while 1;
 EOF
   chmod +x "$T/joiner"
+}
+
+# write_report_hook: $T/hook pauses at the start of the report steps
+# (touching $FIX/hook.paused) until $FIX/hook.go exists.
+write_report_hook() {
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == report-steps ]] || exit 0
+touch "$FIX/hook.paused"
+while [[ ! -e "$FIX/hook.go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+}
+
+@test "cache-prune: a group that cannot be confirmed empty stays registered: TERM in a later report step still stops it (143)" {
+  setup_mut_fixture
+  write_joiner
   make_stub "$STUBS/uv" \
     "T_DIR='$T'" \
     'case "$*" in' \
@@ -2031,7 +2036,7 @@ EOF
 @test "cache-prune: run_mutating refuses to start while an earlier group is still registered" {
   local fn
   : >"$T/rm.sh"
-  for fn in test_hook end_critical observe_groups group_has_members wait_group_empty stop_group abort_unready run_mutating; do
+  for fn in test_hook begin_critical end_critical obs_clock observe_groups group_has_members wait_group_empty stop_group abort_unready run_mutating; do
     fn_src "$fn" >>"$T/rm.sh"
   done
   sed -n "/^MUT_SPAWN='/,/^exit 127;'\$/p" "$SCRIPT" >>"$T/rm.sh"
@@ -2040,7 +2045,7 @@ EOF
     on_signal() { exit "$1"; }
     WORK="$T/w"; mkdir -p "$WORK"
     PERL=/usr/bin/perl PS_BIN=/bin/ps TEST_HOOK="" GRACE=1 KILL_WAIT=1 READY_WAIT=2 OBS_WAIT=2
-    IN_CRITICAL=0 PENDING_SIG="" CHILD_PGID=4242 MUT_SEQ=0 MUT_ERR="" REFUSE_MUTATIONS=0 OBS_SEQ=0
+    CRIT_DEPTH=0 SIG_CLEANUP=0 CLOCK_CMD="" PENDING_SIG="" CHILD_PGID=4242 MUT_SEQ=0 MUT_ERR="" REFUSE_MUTATIONS=0 OBS_SEQ=0
     . "$T/rm.sh"
     run_mutating "$T/o" "$T/o" touch "$T/ran"
     echo "rc=$? pgid=$CHILD_PGID refuse=$REFUSE_MUTATIONS"' </dev/null
@@ -2138,4 +2143,241 @@ HOOK
   refute_output --partial "[skip] docker:tagged-images"
   run grep -cE '^docker .* image rm ' "$CALLS"
   assert_output "1"
+}
+
+# --- nesting-safe critical sections, bounded observers, timed commands ------
+
+# write_hangperl: $T/hangperl, a CACHE_PRUNE_PERL whose FIRST spawn helper
+# (the code that calls setpgrp) leads its own group and then hangs without
+# ever writing the readiness byte; it records its pid in $FIX/hang.pid. With
+# $FIX/use_joiner it first starts $T/joiner for its group and waits for the
+# joiner's zombie-to-be member. Every other perl use is the real one.
+write_hangperl() {
+  cat >"$T/hangperl" <<EOF
+#!/usr/bin/perl
+if ((grep { /setpgrp/ } @ARGV) && ! -e "$FIX/hang.pid") {
+  setpgrp(0, 0) or exit 121;
+  open(my \$f, '>', "$FIX/hang.pid") or die; print \$f "\$\$\\n"; close \$f;
+  if (-e "$FIX/use_joiner") {
+    system("$T/joiner '$FIX' \$\$ </dev/null >/dev/null 2>&1 &");
+    select(undef, undef, undef, 0.05) until -s "$FIX/z.pid";
+  }
+  sleep 600 while 1;
+}
+exec '/usr/bin/perl', @ARGV or exit 126;
+EOF
+  chmod +x "$T/hangperl"
+}
+
+# write_first_pause_hook <phase>: $T/hook pauses at the FIRST <phase> call
+# (recording its argument in $FIX/hook.arg) until $FIX/hook.go exists.
+write_first_pause_hook() {
+  cat >"$T/hook" <<HOOK
+#!/bin/bash
+[[ "\$1" == "$1" ]] || exit 0
+[[ -e "$FIX/hook.paused" ]] && exit 0
+echo "\${2-}" >"$FIX/hook.arg"
+touch "$FIX/hook.paused"
+while [[ ! -e "$FIX/hook.go" ]]; do sleep 0.05; done
+HOOK
+  chmod +x "$T/hook"
+}
+
+# snapshot_tree <pid>: record every current descendant of <pid> (pid and
+# command) in $T/tree.snap, so the test can later check that none of them
+# (the timed command, its watchdog, the watchdog's sleep) outlived the run.
+snapshot_tree() {
+  /bin/ps -A -o pid=,ppid=,command= >"$T/ps.all" || return 2
+  awk -v root="$1" '{ par[$1] = $2; line[$1] = $0 }
+    END { for (x in par) { y = x; n = 0
+      while ((y in par) && y != root && n < 64) { y = par[y]; n++ }
+      if (y == root && x != root) print line[x] } }' "$T/ps.all" >"$T/tree.snap"
+  [[ -s "$T/tree.snap" ]]
+}
+# tree_gone: no process from the snapshot is still alive (zombies count).
+tree_gone() {
+  local pid rest left=""
+  while read -r pid _ rest; do
+    pid_gone "$pid" || left="$left [$pid $rest]"
+  done <"$T/tree.snap"
+  [[ -z "$left" ]] || {
+    echo "still running:$left" >&2
+    return 1
+  }
+}
+
+@test "cache-prune: TERM between launching a process-group observer and registering it kills that observer, exits 143" {
+  setup_mut_fixture
+  printf '#!/bin/bash\nexec "%s/tsleep" 30\n' "$T" >"$T/slowps"
+  chmod +x "$T/slowps"
+  write_first_pause_hook observer-launched
+  bg_prune "$T/b" CACHE_PRUNE_PS="$T/slowps" CACHE_PRUNE_GRACE=1 CACHE_PRUNE_TEST_HOOK="$T/hook" -- --apply --no-notify
+  wait_long 15 test -e "$FIX/hook.paused"
+  local obs
+  obs="$(cat "$FIX/hook.arg")"
+  [[ "$obs" =~ ^[0-9]+$ ]]
+  kill -0 "$obs"
+  kill -TERM "$BG_PID"
+  touch "$FIX/hook.go"
+  wait_exit "$BG_PID" 20
+  [[ "$EXIT_RC" -eq 143 ]]
+  # Independent check, before teardown's rescue: that observer is gone.
+  wait_long 2 pid_gone "$obs"
+  grep -q "signal: stopping mutation process group" "$T/b.out"
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: TERM during abort_unready's own group observation is handled after the startup section ends (group retained and stopped)" {
+  setup_mut_fixture
+  write_hangperl
+  printf '#!/bin/bash\nexit 1\n' >"$T/badps"
+  chmod +x "$T/badps"
+  write_first_pause_hook observer-launched
+  bg_prune "$T/b" CACHE_PRUNE_PERL="$T/hangperl" CACHE_PRUNE_PS="$T/badps" CACHE_PRUNE_GRACE=1 \
+    CACHE_PRUNE_TEST_HOOK="$T/hook" -- --apply --no-notify
+  wait_long 20 test -e "$FIX/hook.paused"
+  local g
+  g="$(cat "$FIX/hang.pid")"
+  [[ "$g" =~ ^[0-9]+$ ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/hook.go"
+  wait_exit "$BG_PID" 25
+  [[ "$EXIT_RC" -eq 143 ]]
+  # The signal waited for the whole startup section: abort_unready finished
+  # (and registered the unconfirmed group) before the handler ran, and the
+  # handler then went after that group.
+  local abort_line sig_line
+  abort_line="$(grep -n "ERROR: mutation not started: no readiness.*process group $g could not be confirmed empty" "$T/b.out" | cut -d: -f1)"
+  sig_line="$(grep -n "signal: stopping mutation process group $g" "$T/b.out" | cut -d: -f1)"
+  [[ -n "$abort_line" && -n "$sig_line" && "$abort_line" -lt "$sig_line" ]]
+  pid_gone "$g"
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: no readiness + an unconfirmed group: a late member that joins it is stopped by a TERM in the report steps (143)" {
+  setup_mut_fixture
+  write_joiner
+  write_hangperl
+  touch "$FIX/use_joiner"
+  printf '#!/bin/bash\nexit 1\n' >"$T/badps"
+  chmod +x "$T/badps"
+  write_report_hook
+  bg_prune "$T/b" CACHE_PRUNE_PERL="$T/hangperl" CACHE_PRUNE_PS="$T/badps" CACHE_PRUNE_GRACE=1 \
+    CACHE_PRUNE_TEST_HOOK="$T/hook" -- --apply --no-notify
+  wait_long 30 test -e "$FIX/hook.paused"
+  local g
+  g="$(cat "$FIX/hang.pid")"
+  [[ "$g" =~ ^[0-9]+$ ]]
+  grep -q "ERROR: mutation not started: no readiness.*process group $g could not be confirmed empty" "$T/b.out"
+  pid_gone "$g"
+  # A live member joins the (zombie-held) group after the abort gave up.
+  touch "$FIX/join"
+  wait_long 10 test -e "$FIX/joiner.joined"
+  [[ " $(group_members "$g")" == *" $(cat "$FIX/joiner.pid") "* ]]
+  kill -TERM "$BG_PID"
+  touch "$FIX/hook.go"
+  wait_exit "$BG_PID" 20
+  [[ "$EXIT_RC" -eq 143 ]]
+  [[ -e "$FIX/joiner.term" ]]
+  wait_long 5 pid_gone "$(cat "$FIX/joiner.pid")"
+  wait_long 5 group_empty "$g"
+  grep -q "signal: stopping mutation process group $g" "$T/b.out"
+  run mutating_calls
+  assert_output ""
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: a process-group observer is cut off at exactly OBS_WAIT whole seconds (>=, not >)" {
+  local fn
+  : >"$T/obs.sh"
+  for fn in begin_critical end_critical test_hook obs_clock observe_groups; do
+    fn_src "$fn" >>"$T/obs.sh"
+  done
+  ln -s /bin/sleep "$T/tsleep"
+  printf '#!/bin/bash\necho $$ >"%s/ps.pid"\nexec "%s/tsleep" 90\n' "$FIX" "$T" >"$T/slowps"
+  printf '#!/bin/bash\ncat "%s/clock"\n' "$FIX" >"$T/clock"
+  chmod +x "$T/slowps" "$T/clock"
+  echo 100 >"$FIX/clock"
+  env -i PATH=/usr/bin:/bin T="$T" FIX="$FIX" /bin/bash -c '
+    on_signal() { exit "$1"; }
+    WORK="$T/w"; mkdir -p "$WORK"
+    PS_BIN="$T/slowps" TEST_HOOK="" OBS_WAIT=20 CRIT_DEPTH=0 PENDING_SIG="" SIG_CLEANUP=0 OBS_PID=""
+    CLOCK_CMD="$T/clock"
+    . "$T/obs.sh"
+    observe_groups "$WORK/obs" $((SECONDS + 120))
+    echo "rc=$?" >"$FIX/obs.rc"' </dev/null >/dev/null 2>&1 &
+  HARNESS_PID=$!
+  wait_for test -s "$FIX/ps.pid"
+  local ps
+  ps="$(cat "$FIX/ps.pid")"
+  # OBS_WAIT is 20 here so real time never reaches it; the test clock does.
+  # One whole second short of it: still observing.
+  echo 119 >"$FIX/clock"
+  sleep 1
+  kill -0 "$ps"
+  [[ ! -e "$FIX/obs.rc" ]]
+  # The equality tick: cut off (killed and reaped) now, long before <until>.
+  echo 120 >"$FIX/clock"
+  wait_long 3 pid_gone "$ps"
+  wait_long 3 test -s "$FIX/obs.rc"
+  [[ "$(cat "$FIX/obs.rc")" == "rc=1" ]]
+}
+
+# write_du_stub: du that hangs (exec, one process) when an argument equals
+# the content of $FIX/du_hang, touching $FIX/du.hanging first.
+write_du_stub() {
+  ln -sf /bin/sleep "$T/tsleep"
+  make_stub "$STUBS/du" \
+    "T_DIR='$T'" \
+    'want="$(cat "$FIX/du_hang" 2>/dev/null)"' \
+    'for a in "$@"; do' \
+    '  if [[ -n "$want" && "$a" == "$want" ]]; then touch "$FIX/du.hanging"; exec "$T_DIR/tsleep" 600; fi' \
+    'done' \
+    'exec /usr/bin/du "$@"'
+}
+
+@test "cache-prune: TERM while a size check (du, formerly in a command substitution) hangs exits 143 at once and leaves nothing running" {
+  write_du_stub
+  mkdir -p "$FAKE_HOME/.cache/uv"
+  printf '%s' "$FAKE_HOME/.cache/uv" >"$FIX/du_hang"
+  bg_prune "$T/b" --
+  wait_long 15 test -e "$FIX/du.hanging"
+  sleep 0.3
+  snapshot_tree "$BG_PID"
+  grep -q "$T/tsleep 600" "$T/tree.snap"
+  local start=$SECONDS
+  kill -TERM "$BG_PID"
+  wait_exit "$BG_PID" 15
+  [[ "$EXIT_RC" -eq 143 ]]
+  [[ $((SECONDS - start)) -le 10 ]]
+  # Neither the du, nor its watchdog, nor a watchdog sleep outlives the run
+  # (a watchdog's 1s sleep may take up to 1s to end).
+  wait_long 3 tree_gone
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: TERM while a report command started directly by run_timed hangs stops it and its watchdog (143, nothing left)" {
+  write_du_stub
+  mkdir -p "$FAKE_HOME/Library/Caches/bigcache"
+  printf '%s' "$FAKE_HOME/Library/Caches/bigcache" >"$FIX/du_hang"
+  bg_prune "$T/b" --
+  wait_long 20 test -e "$FIX/du.hanging"
+  sleep 0.3
+  snapshot_tree "$BG_PID"
+  grep -q "$T/tsleep 600" "$T/tree.snap"
+  local start=$SECONDS
+  kill -TERM "$BG_PID"
+  wait_exit "$BG_PID" 15
+  [[ "$EXIT_RC" -eq 143 ]]
+  [[ $((SECONDS - start)) -le 10 ]]
+  wait_long 3 tree_gone
+  [[ ! -e "$(LOCK)" ]]
+}
+
+@test "cache-prune: watchdog-bounded commands never run inside a command substitution (structural)" {
+  run grep -nE '\$\((du_kb|run_timed)([^a-z_]|$)' "$SCRIPT"
+  assert_output ""
+  # Each watchdog sleeps in 1s foreground steps (no backgrounded sleep).
+  run grep -nE 'sleep[^&;|]*&$|sleep "\$TIMEOUT"' "$SCRIPT"
+  assert_output ""
 }

@@ -68,9 +68,13 @@ Signals and process groups:
   still cannot be confirmed empty, the step fails, no later mutation runs,
   and the run exits 1 (report steps still run); the group stays registered,
   so a TERM/INT later in the run still stops it first. The stop deadlines
-  are wall-clock, and each look at the group (ps) is cut off after 2s and
-  then counts as non-empty. A mutation whose group never confirms readiness
-  (5s) is killed before it execs and its step fails.
+  are wall-clock, and each look at the group (ps) is cut off after about
+  1-2 seconds (whole-second clock) and then counts as non-empty. A mutation
+  whose group never confirms readiness (5s) is killed before it execs and
+  its step fails.
+  Inventory and report commands run under a watchdog (CACHE_PRUNE_TIMEOUT);
+  a TERM/INT stops the running one and its watchdog too (TERM, up to 1s,
+  then KILL).
   Because these groups are not the launchd job's, launchd's job-group
   cleanup no longer reaches them: this cleanup plus the agent's ExitTimeOut
   (30s) take its place.
@@ -117,12 +121,17 @@ Environment overrides (tests/advanced use):
                          starting each mutation in its own process group
                          (default /usr/bin/perl)
   CACHE_PRUNE_PS         ps used to watch a mutation's process group (default
-                         /bin/ps); a failing or stalled (>2s) ps never counts
-                         as an empty group
+                         /bin/ps); a failing or stalled (about 1-2 seconds,
+                         whole-second clock) ps never counts as an empty group
   CACHE_PRUNE_TEST_HOOK  test-only: command run at lock decision points, when
                          a mutation's group is ready (before it is
                          registered) or being reaped after its leader
-                         exited, and before the report steps
+                         exited, when a group observer (ps) has been started
+                         (before it is registered), and before the report
+                         steps
+  CACHE_PRUNE_CLOCK_CMD  test-only/advanced: command printing the whole-second
+                         clock used for the ps observer cutoff (default: the
+                         shell's SECONDS)
 EOF
 }
 
@@ -332,6 +341,10 @@ LOCK_HELD=0
 
 # shellcheck disable=SC2329  # invoked via trap
 cleanup() {
+  # A signal during cleanup is only recorded (on_signal): cleanup always
+  # finishes, with this exit's status.
+  SIG_CLEANUP=1
+  stop_timed
   if [[ "$LOCK_HELD" -eq 1 ]]; then
     local owner_pid=""
     owner_pid="$(sed -n 's/^pid=//p' "$LOCK_DIR/owner" 2>/dev/null)"
@@ -349,13 +362,17 @@ cleanup() {
 # TERM/INT is handled at once instead of after the command exits.
 # The TERM/INT handlers are installed once and never replaced (bash 3.2
 # briefly installs SIG_IGN while a trap is replaced, which can drop a
-# signal). Inside a critical section (IN_CRITICAL=1: a mutation's group is
-# being started and not yet registered in CHILD_PGID) they only record the
-# signal; end_critical acts on it once the group is known. Outside it, a
-# registered group is stopped (stop_group: TERM, GRACE, KILL) before the run
-# exits 143/130 through the EXIT trap (lock released). A signal arriving
-# while that is under way is recorded and does not restart it.
-IN_CRITICAL=0
+# signal). Inside a critical section (CRIT_DEPTH > 0: a child has been
+# started and is not yet registered - a mutation's group before CHILD_PGID,
+# a ps observer before OBS_PID, a timed command and its watchdog before
+# RT_PID/RT_WD) they only record the signal; sections nest (a depth
+# counter), and the outermost end_critical acts on it once everything
+# started inside is registered. Outside, the handler stops what is
+# registered: an observer (KILL), a timed command and its watchdog
+# (stop_timed), then a mutation's group (stop_group: TERM, GRACE, KILL),
+# and the run exits 143/130 through the EXIT trap (lock released). A signal
+# arriving while that is under way is recorded and does not restart it.
+CRIT_DEPTH=0
 PENDING_SIG=""
 SIG_CLEANUP=0
 CHILD_PGID=""
@@ -367,15 +384,23 @@ PS_BIN="${CACHE_PRUNE_PS:-/bin/ps}"
 OBS_WAIT=2 # seconds one process-group observation may take (observe_groups)
 OBS_SEQ=0
 OBS_PID="" # an observation in flight (on_signal kills it)
+CLOCK_CMD="${CACHE_PRUNE_CLOCK_CMD:-}"
+OBS_NOW=0
+RT_PID="" # a run_timed command in flight (on_signal/cleanup stop it)
+RT_WD=""  # and its watchdog
 # shellcheck disable=SC2329  # invoked via trap
 on_signal() { # <exit code>
-  if [[ "$IN_CRITICAL" -eq 1 || "$SIG_CLEANUP" -eq 1 ]]; then
+  if [[ "$CRIT_DEPTH" -gt 0 || "$SIG_CLEANUP" -eq 1 ]]; then
     [[ -n "$PENDING_SIG" ]] || PENDING_SIG="$1"
     return 0
   fi
   SIG_CLEANUP=1
   # An observation interrupted by this signal is abandoned, not left running.
-  [[ -n "$OBS_PID" ]] && kill -KILL "$OBS_PID" 2>/dev/null
+  if [[ -n "$OBS_PID" ]]; then
+    { kill -KILL "$OBS_PID" && wait "$OBS_PID"; } 2>/dev/null
+    OBS_PID=""
+  fi
+  stop_timed
   if [[ -n "$CHILD_PGID" ]]; then
     log "  signal: stopping mutation process group $CHILD_PGID (TERM, up to ${GRACE}s, then KILL)"
     stop_group "$CHILD_PGID" ||
@@ -383,11 +408,16 @@ on_signal() { # <exit code>
   fi
   exit "$1"
 }
-# end_critical: leave the critical section; a signal recorded inside it is
-# handled now (with CHILD_PGID registered, if the group started).
+# begin_critical / end_critical: enter / leave a critical section. Sections
+# nest; a signal recorded inside is handled only when the outermost one
+# ends (with everything started inside registered by then).
+begin_critical() { CRIT_DEPTH=$((CRIT_DEPTH + 1)); }
 end_critical() {
-  IN_CRITICAL=0
-  [[ -z "$PENDING_SIG" ]] || on_signal "$PENDING_SIG"
+  [[ "$CRIT_DEPTH" -gt 0 ]] && CRIT_DEPTH=$((CRIT_DEPTH - 1))
+  if [[ "$CRIT_DEPTH" -eq 0 && -n "$PENDING_SIG" && "$SIG_CLEANUP" -eq 0 ]]; then
+    on_signal "$PENDING_SIG"
+  fi
+  return 0
 }
 trap cleanup EXIT
 trap 'on_signal 130' INT
@@ -790,31 +820,68 @@ record_step() {
 
 # --- watchdog (inventory/report commands only) -------------------------------
 
+# rt_watchdog <pid> <marker>: run in the background by run_timed. Sleeps in
+# 1s foreground steps (never a backgrounded sleep) for TIMEOUT seconds,
+# then marks the timeout and TERMs the command, and KILLs it 1s later. It
+# keeps the default TERM disposition, so stopping it is immediate; its
+# current 1s sleep may outlive it by up to a second.
+rt_watchdog() {
+  local n=0
+  while [[ $n -lt $TIMEOUT ]]; do
+    /bin/sleep 1
+    n=$((n + 1))
+  done
+  : >"$2"
+  kill -TERM "$1" 2>/dev/null
+  /bin/sleep 1
+  kill -KILL "$1" 2>/dev/null
+}
+
+# stop_timed: stop the registered run_timed command and watchdog (TERM, up
+# to 1s, then KILL; both reaped). Used on a signal and at exit.
+stop_timed() {
+  local p end
+  [[ -n "$RT_PID$RT_WD" ]] || return 0
+  for p in $RT_PID $RT_WD; do
+    kill -TERM "$p" 2>/dev/null
+  done
+  end=$((SECONDS + 1))
+  while [[ $SECONDS -le $end ]]; do
+    { [[ -n "$RT_PID" ]] && kill -0 "$RT_PID"; } 2>/dev/null ||
+      { [[ -n "$RT_WD" ]] && kill -0 "$RT_WD"; } 2>/dev/null || break
+    /bin/sleep 0.1
+  done
+  for p in $RT_PID $RT_WD; do
+    kill -KILL "$p" 2>/dev/null
+    wait "$p" 2>/dev/null
+  done
+  RT_PID=""
+  RT_WD=""
+}
+
 # run_timed <out-file> <cmd...>: stdout -> out-file, stderr -> out-file.err.
 # Returns the command's exit code, or 124 if the watchdog killed it.
-# Never used for mutating commands.
+# Never used for mutating commands. Always called in the main shell (never
+# inside a command substitution, where a TERM to the script would wait for
+# the command): callers read <out-file> afterwards. The command and its
+# watchdog are started inside a critical section and registered (RT_PID,
+# RT_WD), so a TERM/INT stops both (stop_timed).
 run_timed() {
-  local out="$1" pid wd rc marker
+  local out="$1" rc marker
   shift
   marker="$WORK/timeout.$RANDOM.$RANDOM"
-  "$@" >"$out" 2>"$out.err" </dev/null &
-  pid=$!
-  (
-    sp=""
-    trap 'kill "$sp" 2>/dev/null; exit 0' TERM
-    sleep "$TIMEOUT" &
-    sp=$!
-    wait "$sp"
-    : >"$marker"
-    kill -TERM "$pid" 2>/dev/null
-    sleep 2
-    kill -KILL "$pid" 2>/dev/null
-  ) >/dev/null 2>&1 </dev/null &
-  wd=$!
-  wait "$pid"
+  begin_critical
+  "$@" >"$out" 2>"$out.err" </dev/null 8>&- 9>&- &
+  RT_PID=$!
+  rt_watchdog "$RT_PID" "$marker" >/dev/null 2>&1 </dev/null 8>&- 9>&- &
+  RT_WD=$!
+  end_critical
+  wait "$RT_PID"
   rc=$?
-  kill -TERM "$wd" 2>/dev/null
-  wait "$wd" 2>/dev/null
+  RT_PID=""
+  kill -TERM "$RT_WD" 2>/dev/null
+  wait "$RT_WD" 2>/dev/null
+  RT_WD=""
   if [[ -e "$marker" ]]; then
     rm -f "$marker"
     return 124
@@ -832,18 +899,35 @@ status_for_rc() {
 
 # --- mutating commands: own process group ------------------------------------
 
+# obs_clock: OBS_NOW = the whole-second clock for the observer cutoff
+# (SECONDS; CACHE_PRUNE_CLOCK_CMD substitutes it in tests).
+obs_clock() {
+  OBS_NOW=$SECONDS
+  [[ -n "$CLOCK_CMD" ]] || return 0
+  OBS_NOW="$("$CLOCK_CMD" </dev/null 2>/dev/null)"
+  [[ "$OBS_NOW" =~ ^[0-9]+$ ]] || OBS_NOW=$SECONDS
+}
+
 # observe_groups <file> <until>: one bounded process listing (pid, pgid,
-# stat) into <file>. ps runs in the background and is killed if it is
-# still running OBS_WAIT seconds after it started, or once SECONDS passes
-# <until> (a phase deadline), so a stalled observer never holds up a
-# deadline. 0 = ps finished in time and succeeded; 1 = it failed, stalled,
-# or was killed.
+# stat) into <file>. ps runs in the background and is killed once OBS_WAIT
+# whole seconds have elapsed since it started (so after about OBS_WAIT-1 to
+# OBS_WAIT seconds of real time), or once SECONDS passes <until> (a phase
+# deadline), so a stalled observer never holds up a deadline. Its launch is
+# a critical section that ends once OBS_PID is registered. 0 = ps finished
+# in time and succeeded; 1 = it failed, stalled, or was killed.
 observe_groups() {
-  local file="$1" until="$2" start=$SECONDS
-  "$PS_BIN" -A -o pid= -o pgid= -o stat= >"$file" 2>/dev/null </dev/null &
-  OBS_PID=$!
+  local file="$1" until="$2" start p
+  obs_clock
+  start=$OBS_NOW
+  begin_critical
+  "$PS_BIN" -A -o pid= -o pgid= -o stat= >"$file" 2>/dev/null </dev/null 8>&- 9>&- &
+  p=$!
+  test_hook observer-launched "$p"
+  OBS_PID=$p
+  end_critical
   while kill -0 "$OBS_PID" 2>/dev/null; do
-    if [[ $((SECONDS - start)) -gt $OBS_WAIT || $SECONDS -gt $until ]]; then
+    obs_clock
+    if [[ $((OBS_NOW - start)) -ge $OBS_WAIT || $SECONDS -gt $until ]]; then
       { kill -KILL "$OBS_PID" && wait "$OBS_PID"; } 2>/dev/null
       OBS_PID=""
       return 1
@@ -981,7 +1065,7 @@ run_mutating() {
     log "  ERROR: $MUT_ERR"
     return 1
   fi
-  IN_CRITICAL=1
+  begin_critical
   if [[ "$err" == "$out" ]]; then
     "$PERL" -e "$MUT_SPAWN" "$fifo" "$@" >"$out" 2>&1 </dev/null 8>&- 9>&- &
   else
@@ -1036,18 +1120,19 @@ mut_note() {
 
 # --- size helpers -------------------------------------------------------------
 
-# du_kb <path>: KB used, or "unknown".
+# du_kb <path>: DU_KB = KB used, or "unknown". Sets a variable instead of
+# printing: run_timed must run in the main shell, never in $(...).
+DU_KB=""
 du_kb() {
   local p="$1" out="$WORK/du.$RANDOM"
-  [[ -e "$p" ]] || {
-    echo 0
-    return
-  }
+  DU_KB=0
+  [[ -e "$p" ]] || return 0
+  DU_KB=unknown
   if run_timed "$out" du -sk "$p" && [[ ! -s "$out.err" ]]; then
-    awk 'NR==1{print $1}' "$out"
-  else
-    echo unknown
+    read -r DU_KB _ <"$out" || true
+    [[ "$DU_KB" =~ ^[0-9]+$ ]] || DU_KB=unknown
   fi
+  rm -f "$out" "$out.err"
 }
 
 human_kb() {
@@ -1617,7 +1702,8 @@ uv_step() {
     dir="$(head -n1 "$out")"
   fi
   if [[ -n "$dir" ]]; then
-    before="$(du_kb "$dir")"
+    du_kb "$dir"
+    before="$DU_KB"
     envs_before="$(count_dirs "$dir/environments-v2")"
     log "  cache dir: $dir ($(human_kb "$before")); environments-v2 dirs: $envs_before"
   else
@@ -1639,7 +1725,8 @@ uv_step() {
   after="unknown"
   envs_after="unknown"
   if [[ -n "$dir" ]]; then
-    after="$(du_kb "$dir")"
+    du_kb "$dir"
+    after="$DU_KB"
     envs_after="$(count_dirs "$dir/environments-v2")"
   fi
   account_freed "$before" "$after"
@@ -1673,7 +1760,8 @@ pnpm_step() {
     return
   fi
   store="$(head -n1 "$out")"
-  before="$(du_kb "$store")"
+  du_kb "$store"
+  before="$DU_KB"
   log "  store: $store ($(human_kb "$before"))"
   if [[ "$MODE" != "apply" ]]; then
     record_step "pnpm" skip "dry-run: would run pnpm store prune; store $(human_kb "$before")"
@@ -1686,7 +1774,8 @@ pnpm_step() {
   run_mutating "$out" "$out" "$pnpm" store prune
   rc=$?
   log_file "$out"
-  after="$(du_kb "$store")"
+  du_kb "$store"
+  after="$DU_KB"
   account_freed "$before" "$after"
   if [[ $rc -eq 0 ]]; then
     record_step "pnpm" success "store $(human_kb "$before") -> $(human_kb "$after")"
@@ -1712,7 +1801,8 @@ npm_step() {
   if run_timed "$out" "$npm" config get cache && [[ -n "$(head -n1 "$out")" ]]; then
     cache="$(head -n1 "$out")"
   fi
-  before="$(du_kb "$cache/_cacache")"
+  du_kb "$cache/_cacache"
+  before="$DU_KB"
   log "  cache: $cache/_cacache ($(human_kb "$before"))"
   if [[ "$MODE" != "apply" ]]; then
     record_step "npm" skip "dry-run: would run npm cache verify; _cacache $(human_kb "$before")"
@@ -1725,7 +1815,8 @@ npm_step() {
   run_mutating "$out" "$out" "$npm" cache verify
   rc=$?
   log_file "$out"
-  after="$(du_kb "$cache/_cacache")"
+  du_kb "$cache/_cacache"
+  after="$DU_KB"
   account_freed "$before" "$after"
   if [[ $rc -eq 0 ]]; then
     record_step "npm" success "_cacache $(human_kb "$before") -> $(human_kb "$after")"
@@ -1766,10 +1857,11 @@ report_nvm() {
     [[ -d "$d" ]] || continue
     v="${d##*/}"
     n=$((n + 1))
+    du_kb "$d"
     if [[ -n "$NODE_VERSION" && "$v" == "v$NODE_VERSION" ]]; then
-      log "    $v (default)  $(human_kb "$(du_kb "$d")")"
+      log "    $v (default)  $(human_kb "$DU_KB")"
     else
-      log "    $v  $(human_kb "$(du_kb "$d")")"
+      log "    $v  $(human_kb "$DU_KB")"
     fi
   done
   record_step "report:nvm" success "$n installed node versions (remove unused ones with: nvm uninstall <v>)"
@@ -1790,7 +1882,8 @@ report_simulators() {
   local total unavailable
   total="$(grep -cE '\((Booted|Shutdown)\)' "$out")"
   unavailable="$(grep -ci 'unavailable' "$out")"
-  log "    $total simulator devices, $unavailable marked unavailable; CoreSimulator/Devices $(human_kb "$(du_kb "$HOME/Library/Developer/CoreSimulator/Devices")")"
+  du_kb "$HOME/Library/Developer/CoreSimulator/Devices"
+  log "    $total simulator devices, $unavailable marked unavailable; CoreSimulator/Devices $(human_kb "$DU_KB")"
   record_step "report:simulators" success "$total devices, $unavailable unavailable (xcrun simctl delete unavailable)"
 }
 
@@ -1831,7 +1924,8 @@ report_steps() {
   report_cmd "report:poetry" poetry cache list
   log "  npx cache (~/.npm/_npx):"
   local npx
-  npx="$(du_kb "$HOME/.npm/_npx")"
+  du_kb "$HOME/.npm/_npx"
+  npx="$DU_KB"
   log "    $(human_kb "$npx")"
   if [[ "$npx" == "unknown" ]]; then
     record_step "report:npx" fail "du failed for ~/.npm/_npx"
