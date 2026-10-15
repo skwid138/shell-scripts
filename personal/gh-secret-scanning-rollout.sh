@@ -36,10 +36,15 @@ Options:
   --dry-run         The default; accepted for explicitness.
   --only a,b        Limit the run to these repo names (comma-separated).
   --resume JOURNAL  With --apply: append to an earlier journal instead of a
-                    new one. Repos whose last journal row is verified or
-                    already-enabled are left alone (even if they were disabled
-                    again since, e.g. by a manual rollback); every other target
-                    is re-inventoried and processed again.
+                    new one. Repos whose last journal row is verified,
+                    already-enabled or done-in-journal are left alone (even if
+                    they were disabled again since, e.g. by a manual rollback;
+                    the done-in-journal row a resume appends keeps them
+                    completed on every later resume). A repo whose last row is
+                    pending or failed and that is now enabled on both fields is
+                    reconciled: a verified row ("reconciled on resume"), no
+                    PATCH. Every other target is re-inventoried and processed
+                    again.
   --owner LOGIN     Repo owner (default: the authenticated `gh api user`).
   -h, --help        Show this help.
 
@@ -56,7 +61,8 @@ Per target (with --apply):
   1. GET (refresh) - re-select from the fresh state; nothing disabled = done.
   2. PATCH the disabled fields (>= 1s between mutations).
   3. GET (verify, up to 3 tries) - verified only when both fields are
-     "enabled" and no other security_and_analysis field changed; else failed.
+     "enabled" and every other security_and_analysis field is exactly as
+     before (none changed, removed or added); else failed.
   Rate limits: 429, and 403 with Retry-After / x-ratelimit-remaining: 0 / a
   "rate limit" message, wait Retry-After, else until x-ratelimit-reset, else
   60s (secondary limits); at most 4 retries. A timeout or 5xx on PATCH is
@@ -560,8 +566,10 @@ verify() {
     if api_get "repos/$OWNER/$name" && read_state "$id"; then
       ssa="$R_SS" ppa="$R_PP"
       if [[ "$ssa" == enabled && "$ppa" == enabled ]]; then
+        # The other fields must be exactly as before: none changed, none
+        # removed, none added.
         # shellcheck disable=SC2016 # jq program
-        if jq -e --slurpfile b "$WORK/other.json" "($JQ_OTHER) as \$a | \$b[0] | to_entries | all(.value == \$a[.key])" \
+        if jq -e --slurpfile b "$WORK/other.json" "($JQ_OTHER) == \$b[0]" \
           "$API_BODY" >/dev/null 2>&1; then
           outcome "$name" "$id" "$3" "$4" "$5" verified "$ssa" "$ppa" "$6" "$detail"
         else
@@ -696,16 +704,61 @@ if [[ "$INV_PAGINATION" != ok ]]; then
 fi
 
 open_journal
+# On --resume, from each repo's LAST journal row:
+#   done-ids   verified | already-enabled | done-in-journal: completed; never
+#              written again by this journal (a later manual rollback is
+#              respected, and the done-in-journal row a resume appends keeps
+#              counting as completed on every later resume).
+#   open-ids   pending | failed (id, ss_before, pp_before): the outcome was
+#              not settled; if the repo is now enabled on both fields it is
+#              reconciled with a verified row and no PATCH.
 DONE_IDS="$WORK/done-ids"
+OPEN_IDS="$WORK/open-ids"
 : >"$DONE_IDS"
+: >"$OPEN_IDS"
 if [[ -n "$RESUME" ]]; then
   awk -F'\t' '!/^#/ && NF >= 6 { last[$2] = $6 }
-    END { for (i in last) if (last[i] == "verified" || last[i] == "already-enabled") print i }' \
+    END { for (i in last) if (last[i] == "verified" || last[i] == "already-enabled" || last[i] == "done-in-journal") print i }' \
     "$JOURNAL" >"$DONE_IDS"
+  awk -F'\t' '!/^#/ && NF >= 6 { last[$2] = $6; ssb[$2] = $3; ppb[$2] = $4 }
+    END { for (i in last) if (last[i] == "pending" || last[i] == "failed") print i "\t" ssb[i] "\t" ppb[i] }' \
+    "$JOURNAL" >"$OPEN_IDS"
 fi
+
+# reconcile_repo <repo> <id> <ss_before> <pp_before>: a resumed repo whose
+# last journal row is pending/failed and which the inventory saw enabled.
+# Refresh; still enabled on both fields => verified (no PATCH); disabled again
+# => the normal refresh/PATCH/verify path; anything else => that outcome.
+reconcile_repo() {
+  local name="$1" id="$2" ssb ppb
+  ssb="$(clean_status "$3")" ppb="$(clean_status "$4")"
+  if ! api_get "repos/$OWNER/$name"; then
+    outcome "$name" "$id" "$ssb" "$ppb" none failed unknown unknown "$API_STATUS" "reconcile on resume: refresh failed: $API_DETAIL"
+    return 0
+  fi
+  if ! read_state "$id"; then
+    outcome "$name" "$id" "$ssb" "$ppb" none error unknown unknown - "reconcile on resume: $R_DETAIL"
+    return 0
+  fi
+  case "$R_SEL" in
+    skipped-enabled)
+      outcome "$name" "$id" "$ssb" "$ppb" none verified "$R_SS" "$R_PP" - \
+        "reconciled on resume: enabled at refresh (last journal row was not settled)"
+      ;;
+    target) process_repo "$name" "$id" ;;
+    *) outcome "$name" "$id" "$ssb" "$ppb" none "$R_SEL" "$R_SS" "$R_PP" - "${R_DETAIL:-reconcile on resume: at refresh}" ;;
+  esac
+}
 
 printf '# result\trepo\tbefore -> after (secret_scanning/push_protection)\thttp\tdetail\n'
 while IFS=$'\t' read -r sel name id ss pp fields detail; do
+  if [[ "$sel" == skipped-enabled ]]; then
+    open="$(awk -F'\t' -v i="$id" '$1 == i { print; exit }' "$OPEN_IDS")"
+    [[ -n "$open" ]] || continue
+    IFS=$'\t' read -r _ open_ss open_pp <<<"$open"
+    reconcile_repo "$name" "$id" "$open_ss" "$open_pp"
+    continue
+  fi
   [[ "$sel" == target ]] || continue
   if grep -qxF -- "$id" "$DONE_IDS"; then
     outcome "$name" "$id" "$ss" "$pp" none done-in-journal "$ss" "$pp" - "verified or already enabled in $(basename "$JOURNAL")"

@@ -167,6 +167,11 @@ case "$path" in
           jq '.security_and_analysis.dependabot_security_updates.status = "enabled"' "$st" >"$st.tmp" && mv "$st.tmp" "$st"
           reply 200 OK "$(cat "$st")"
           ;;
+        add-key)
+          apply_patch
+          jq '.security_and_analysis.secret_scanning_validity_checks = {status: "disabled"}' "$st" >"$st.tmp" && mv "$st.tmp" "$st"
+          reply 200 OK "$(cat "$st")"
+          ;;
         *) fault "$f" ;;
       esac
     fi
@@ -425,6 +430,17 @@ sleeps() { grep '^sleep ' "$CALLS" | cut -d' ' -f2; }
   [[ "$(jlast beta 11)" == *"other"* ]]
 }
 
+@test "gh-secret-scanning-rollout: verification fails when an unrelated security_and_analysis key appears after the PATCH" {
+  gh_repo alpha 101 public disabled disabled
+  fault PATCH.alpha add-key
+  run_rollout --apply
+  assert_failure 1
+  [[ "$(patch_count alpha)" -eq 1 ]]
+  [[ "$(jlast alpha 7)" == enabled && "$(jlast alpha 8)" == enabled ]]
+  [[ "$(jlast alpha 6)" == failed ]]
+  [[ "$(jlast alpha 11)" == *"other security_and_analysis fields changed"* ]]
+}
+
 @test "gh-secret-scanning-rollout: a second run over completed state makes zero writes" {
   gh_repo alpha 101 public disabled disabled
   gh_repo beta 102 public enabled disabled
@@ -572,6 +588,85 @@ sleeps() { grep '^sleep ' "$CALLS" | cut -d' ' -f2; }
   [[ "$(jlast beta 6)" == verified ]]
   [[ "$(grep -vc '^#' "$j")" -gt "$rows" ]]
   [[ "$(find "$STATE" -name 'secret-scanning-*.tsv' | wc -l | tr -d ' ')" -eq 1 ]]
+}
+
+@test "gh-secret-scanning-rollout: --resume reconciles a pending or failed repo that is now enabled, without a PATCH" {
+  gh_repo alpha 101 public disabled disabled
+  gh_repo beta 102 public disabled disabled
+  # The PATCH is accepted but not visible within the verify window: failed.
+  fault PATCH.alpha noop-200
+  fault PATCH.beta noop-200
+  run_rollout --apply
+  assert_failure 1
+  local j tmp
+  j="$(journal)"
+  [[ "$(jlast alpha 6)" == failed && "$(jlast beta 6)" == failed ]]
+  # beta: the run died between its pending row and the outcome.
+  tmp="$T/j.tmp"
+  awk -F'\t' '!($1 == "beta" && $6 == "failed")' "$j" >"$tmp" && cat "$tmp" >"$j"
+  [[ "$(jlast beta 6)" == pending ]]
+  # GitHub has since applied both.
+  for n in alpha beta; do
+    jq '.security_and_analysis.secret_scanning.status = "enabled" | .security_and_analysis.secret_scanning_push_protection.status = "enabled"' \
+      "$FIX/repo/$n.json" >"$T/x" && mv "$T/x" "$FIX/repo/$n.json"
+  done
+  : >"$CALLS"
+  run_rollout --apply --resume "$j"
+  assert_success
+  [[ "$(all_patches)" -eq 0 ]]
+  for n in alpha beta; do
+    [[ "$(jlast "$n" 6)" == verified ]]
+    [[ "$(jlast "$n" 3)" == disabled && "$(jlast "$n" 4)" == disabled ]]
+    [[ "$(jlast "$n" 5)" == none ]]
+    [[ "$(jlast "$n" 7)" == enabled && "$(jlast "$n" 8)" == enabled ]]
+    [[ "$(jlast "$n" 11)" == *"reconciled on resume"* ]]
+  done
+  [[ "$output" == *"Verified: 2;"* ]]
+  # Settled: a further resume writes nothing and appends nothing for them.
+  local rows
+  rows="$(grep -vc '^#' "$j")"
+  : >"$CALLS"
+  run_rollout --apply --resume "$j"
+  assert_success
+  [[ "$(all_patches)" -eq 0 ]]
+  [[ "$(grep -vc '^#' "$j")" -eq "$rows" ]]
+}
+
+@test "gh-secret-scanning-rollout: --resume reconciliation never applies to a repo that is still disabled" {
+  gh_repo alpha 101 public disabled disabled
+  fault PATCH.alpha noop-200
+  run_rollout --apply
+  assert_failure 1
+  local j
+  j="$(journal)"
+  : >"$CALLS"
+  run_rollout --apply --resume "$j"
+  assert_success
+  [[ "$(patch_count alpha)" -eq 1 ]]
+  [[ "$(jlast alpha 6)" == verified ]]
+  [[ "$(jlast alpha 11)" != *"reconciled on resume"* ]]
+}
+
+@test "gh-secret-scanning-rollout: a done-in-journal row still counts as completed on every later resume" {
+  gh_repo alpha 101 public disabled disabled
+  run_rollout --apply
+  assert_success
+  local j
+  j="$(journal)"
+  # Completed, then rolled back by hand.
+  jq '.security_and_analysis.secret_scanning.status = "disabled" | .security_and_analysis.secret_scanning_push_protection.status = "disabled"' \
+    "$FIX/repo/alpha.json" >"$T/x" && mv "$T/x" "$FIX/repo/alpha.json"
+  : >"$CALLS"
+  run_rollout --apply --resume "$j"
+  assert_success
+  [[ "$(all_patches)" -eq 0 ]]
+  [[ "$(jlast alpha 6)" == done-in-journal ]]
+  : >"$CALLS"
+  run_rollout --apply --resume "$j"
+  assert_success
+  [[ "$(all_patches)" -eq 0 ]]
+  [[ "$(jlast alpha 6)" == done-in-journal ]]
+  [[ "$(state_of alpha secret_scanning)" == disabled ]]
 }
 
 @test "gh-secret-scanning-rollout: --resume refuses a journal that is not private or not a journal" {
