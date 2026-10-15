@@ -251,8 +251,13 @@ A few scripts here are interactive launchers wired up via aliases in
   not "disabled"; a failed list page blocks every write. Honours 403/429
   `Retry-After` / `x-ratelimit-reset` (60s fallback), bounded retries, ≥ 1s
   between writes; a timeout/5xx PATCH is reconciled by GET before any retry;
-  other 4xx are not retried. `--only a,b` scopes the run; `--resume <journal>`
-  appends to an earlier journal and leaves repos it already verified alone.
+  other 4xx are not retried. A write is verified only if both fields read
+  `enabled` and every other `security_and_analysis` key is unchanged (none
+  changed, removed or added). `--only a,b` scopes the run;
+  `--apply --resume <journal>` appends to an earlier journal, leaves repos it
+  already completed alone (including on later resumes), and reconciles a repo
+  whose last row is pending/failed but which is now enabled (a `verified`
+  row, no PATCH).
   The journal (`~/Library/Application Support/gh-security-rollout/secret-scanning-<UTC>.tsv`,
   600, no ACL) records before/after states per repo; rollback is by hand
   from those before-states.
