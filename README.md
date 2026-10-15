@@ -242,6 +242,20 @@ A few scripts here are interactive launchers wired up via aliases in
   `--log <file>`
   writes all output to a 600, ACL-free file. Known blind spot: gitleaks logs a
   failure of the `git log` it spawns only at debug level.
+- `personal/gh-secret-scanning-rollout.sh` (no alias) — enables secret
+  scanning and push protection on every public, non-archived repo you own
+  where either is `disabled`. Dry-run by default (GETs only, nothing written);
+  `--apply` PATCHes only the disabled fields (never private repos, never an
+  already-enabled field, no other setting), with a refresh GET right before
+  and a verifying GET right after each write. Missing/null states are errors,
+  not "disabled"; a failed list page blocks every write. Honours 403/429
+  `Retry-After` / `x-ratelimit-reset` (60s fallback), bounded retries, ≥ 1s
+  between writes; a timeout/5xx PATCH is reconciled by GET before any retry;
+  other 4xx are not retried. `--only a,b` scopes the run; `--resume <journal>`
+  appends to an earlier journal and leaves repos it already verified alone.
+  The journal (`~/Library/Application Support/gh-security-rollout/secret-scanning-<UTC>.tsv`,
+  600, no ACL) records before/after states per repo; rollback is by hand
+  from those before-states.
 - **Private gitleaks suppressions** (`lib/gitleaks-private.sh`, shared by the
   hook and the audit) — per-repo false-positive suppressions that live only
   on this machine, for repos whose teammates do not run these scripts:
