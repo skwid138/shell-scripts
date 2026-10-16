@@ -153,6 +153,7 @@ For local-only overrides or extra non-secret env vars, create
 # Standalone tools
 agent/gh-pr-comments.sh wpromote/polaris-web#275
 agent/jira-fetch-ticket.sh BIXB-18835 --all
+agent/jira-sprint-tickets.sh --project BIXB --status 'Ready for Release'
 agent/sonar-pr-issues.sh --severity MAJOR 275
 agent/branch-to-ticket.sh
 agent/chrome_mcp.sh --check
