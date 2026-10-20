@@ -41,12 +41,10 @@ write_valid_config() {
         "baseURL": "http://127.0.0.1:1234/v1" // comment after string URL
       },
       "models": {
-        "local/ministral-3b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3-vl-8b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3-vl-30b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
         "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
       },
     },
   },
@@ -62,7 +60,7 @@ write_drifted_config() {
       "npm": "@ai-sdk/openai-compatible",
       "options": { "baseURL": "http://127.0.0.1:1234/v1" },
       "models": {
-        "local/ministral-3b": { "limit": { "context": 32768, "output": 8192 } }
+        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } }
       }
     }
   }
@@ -70,6 +68,8 @@ write_drifted_config() {
 EOF
 }
 
+# The ls fixture uses LM Studio's plain modelKey values (no @6bit/@8bit
+# variant suffix); the script maps aliases to these plain keys.
 write_lms_stub() {
   cat >"$LOCAL_MODELS_LMS_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -88,7 +88,7 @@ case "$1 ${2-}" in
     ;;
   "ls --json")
     cat <<'JSON'
-[{"type":"llm","modelKey":"mistralai/ministral-3-3b"},{"type":"llm","modelKey":"qwen/qwen3-vl-8b"},{"type":"llm","modelKey":"qwen/qwen3-vl-30b"},{"type":"llm","modelKey":"qwen3-coder-next-0"},{"type":"llm","modelKey":"qwen_qwen3.5-122b-a10b"},{"type":"llm","modelKey":"gpt-oss-120b"},{"type":"embedding","modelKey":"text-embedding-nomic-embed-text-v1.5"}]
+[{"type":"llm","modelKey":"gpt-oss-120b"},{"type":"llm","modelKey":"qwen_qwen3.5-122b-a10b"},{"type":"llm","modelKey":"qwen/qwen3.8-27b"},{"type":"llm","modelKey":"qwen/qwen3-coder-next"},{"type":"embedding","modelKey":"text-embedding-nomic-embed-text-v1.5"}]
 JSON
     ;;
   "ps --json")
@@ -96,11 +96,12 @@ JSON
       printf '%s\n' "$LMS_PS_JSON"
     else
       cat <<'JSON'
-[{"identifier":"local/ministral-3b"},{"identifier":"not-local"}]
+[{"identifier":"local/gpt-oss-120b"},{"identifier":"not-local"}]
 JSON
     fi
     ;;
-  "load mistralai/ministral-3-3b")
+  "load gpt-oss-120b")
+    # Synthetic HIGH/favorable estimate: exercises the auto-load branch.
     if [[ "$*" == *"--estimate-only"* ]]; then
       cat <<'ESTIMATE'
 Estimated Total Memory: 4.96 GiB
@@ -111,10 +112,21 @@ ESTIMATE
       exit "${LMS_LOAD_EXIT:-0}"
     fi
     ;;
-  "load qwen/qwen3-vl-8b")
+  "load qwen/qwen3.8-27b")
     if [[ "$*" == *"--estimate-only"* ]]; then
       cat <<'ESTIMATE'
-Estimated Total Memory: 24 GiB
+Estimated Total Memory: 38.50 GiB
+Confidence: LOW
+Estimate: This model may not fit within your resource guardrails.
+ESTIMATE
+    else
+      exit "${LMS_LOAD_EXIT:-0}"
+    fi
+    ;;
+  "load qwen/qwen3-coder-next")
+    if [[ "$*" == *"--estimate-only"* ]]; then
+      cat <<'ESTIMATE'
+Estimated Total Memory: 84.44 GiB
 Confidence: LOW
 Estimate: This model may not fit within your resource guardrails.
 ESTIMATE
@@ -138,7 +150,7 @@ write_curl_stub_success() {
   cat >"$LOCAL_MODELS_CURL_BIN" <<'EOF'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$STATEFILE"
-printf '{"data":[{"id":"local/ministral-3b"}]}\n'
+printf '{"data":[{"id":"local/gpt-oss-120b"}]}\n'
 EOF
   chmod +x "$LOCAL_MODELS_CURL_BIN"
 }
@@ -166,14 +178,44 @@ EOF
   assert_output --partial "load <alias>"
 }
 
-@test "local-models: list shows aliases with installed and loaded status" {
+@test "local-models: --help alias table lists exactly the four-model roster" {
+  run "$SCRIPT" --help
+  assert_success
+  assert_line --regexp '^  gpt-oss-120b +-> gpt-oss-120b +-> local/gpt-oss-120b$'
+  assert_line --regexp '^  qwen3\.5-122b-a10b +-> qwen_qwen3\.5-122b-a10b +-> local/qwen3\.5-122b-a10b$'
+  assert_line --regexp '^  qwen3\.8-27b +-> qwen/qwen3\.8-27b +-> local/qwen3\.8-27b$'
+  assert_line --regexp '^  qwen3-coder-next +-> qwen/qwen3-coder-next +-> local/qwen3-coder-next$'
+  [ "$(printf '%s\n' "$output" | grep -c -- '-> local/')" -eq 4 ]
+}
+
+@test "local-models: list shows exactly the four-model roster with status" {
   run "$SCRIPT" list
   assert_success
-  assert_output --partial "ministral-3b"
-  assert_output --partial "mistralai/ministral-3-3b"
-  assert_output --partial "local/ministral-3b"
-  assert_output --partial "installed=yes"
-  assert_output --partial "loaded=yes"
+  assert_line --regexp '^gpt-oss-120b +gpt-oss-120b +local/gpt-oss-120b +installed=yes loaded=yes$'
+  assert_line --regexp '^qwen3\.5-122b-a10b +qwen_qwen3\.5-122b-a10b +local/qwen3\.5-122b-a10b +installed=yes loaded=no$'
+  assert_line --regexp '^qwen3\.8-27b +qwen/qwen3\.8-27b +local/qwen3\.8-27b +installed=yes loaded=no$'
+  assert_line --regexp '^qwen3-coder-next +qwen/qwen3-coder-next +local/qwen3-coder-next +installed=yes loaded=no$'
+  # Header plus exactly four roster rows.
+  [ "${#lines[@]}" -eq 5 ]
+  refute_output --partial "ministral"
+  refute_output --partial "qwen3-vl"
+  refute_output --partial "qwen3-coder-next-0"
+}
+
+@test "local-models: retired aliases are rejected by load and unload" {
+  local retired
+  for retired in ministral-3b qwen3-vl-8b qwen3-vl-30b; do
+    run "$SCRIPT" load "$retired" --yes
+    assert_failure 2
+    assert_output --partial "unknown local model alias: $retired"
+    run "$SCRIPT" unload "$retired"
+    assert_failure 2
+    assert_output --partial "unknown local model alias: $retired"
+  done
+  if grep -qE '^lms (load|unload) ' "$STATEFILE"; then
+    echo "retired alias reached lms load/unload" >&2
+    return 1
+  fi
 }
 
 @test "local-models: start starts pinned server when endpoint is down" {
@@ -204,12 +246,10 @@ EOF
       "npm": "@ai-sdk/openai-compatible",
       "options": { "baseURL": "http://127.0.0.1:1234/v1" },
       "models": {
-        "local/ministral-3b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3-vl-8b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3-vl-30b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
         "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
       }
     }
   },
@@ -226,36 +266,78 @@ EOF
   run "$SCRIPT" verify
   assert_failure 1
   assert_output --partial "OpenCode lmstudio model keys do not match"
-  assert_output --partial "local/qwen3-vl-8b"
+  assert_output --partial "local/qwen3.8-27b"
+  assert_output --partial "local/qwen3-coder-next"
+}
+
+@test "local-models: verify reports a retired model left in OpenCode config as extra" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "provider": {
+    "lmstudio": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
+        "local/ministral-3b": { "limit": { "context": 32768, "output": 8192 } }
+      }
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "Extra:"
+  assert_output --partial "local/ministral-3b"
 }
 
 @test "local-models: load passes stable identifier and context length" {
-  run "$SCRIPT" load ministral-3b --context-length 4096 --ttl 60 --yes
+  run "$SCRIPT" load gpt-oss-120b --context-length 4096 --ttl 60 --yes
   assert_success
-  grep -qE '^lms load mistralai/ministral-3-3b --identifier local/ministral-3b --context-length 4096 --ttl 60 --yes$' "$STATEFILE"
+  grep -qE '^lms load gpt-oss-120b --identifier local/gpt-oss-120b --context-length 4096 --ttl 60 --yes$' "$STATEFILE"
+}
+
+@test "local-models: load auto-loads without prompt when estimate is HIGH and favorable" {
+  run "$SCRIPT" load gpt-oss-120b
+  assert_success
+  grep -qxF 'lms load gpt-oss-120b --identifier local/gpt-oss-120b --context-length 32768' "$STATEFILE"
 }
 
 @test "local-models: load fails non-interactively when estimate needs prompt" {
-  run "$SCRIPT" load qwen3-vl-8b
+  run "$SCRIPT" load qwen3.8-27b
   assert_failure 1
   assert_output --partial "requires confirmation"
-  if grep -qE '^lms load qwen/qwen3-vl-8b --identifier local/qwen3-vl-8b --context-length 32768$' "$STATEFILE"; then
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 32768 --estimate-only' "$STATEFILE"
+  if grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 32768' "$STATEFILE"; then
     echo "load ran despite required prompt" >&2
     return 1
   fi
 }
 
-@test "local-models: unload alias unloads exact stable identifier only" {
-  run "$SCRIPT" unload ministral-3b
+@test "local-models: load qwen3-coder-next estimates then loads plain modelKey as stable identifier" {
+  run "$SCRIPT" load qwen3-coder-next --yes
   assert_success
-  grep -qE '^lms unload local/ministral-3b$' "$STATEFILE"
+  assert_output --partial "Estimated Total Memory: 84.44 GiB"
+  assert_output --partial "loaded qwen3-coder-next as local/qwen3-coder-next"
+  grep -qxF 'lms load qwen/qwen3-coder-next --identifier local/qwen3-coder-next --context-length 32768 --estimate-only' "$STATEFILE"
+  grep -qxF 'lms load qwen/qwen3-coder-next --identifier local/qwen3-coder-next --context-length 32768 --yes' "$STATEFILE"
+}
+
+@test "local-models: unload alias unloads exact stable identifier only" {
+  run "$SCRIPT" unload qwen3-coder-next
+  assert_success
+  grep -qxF 'lms unload local/qwen3-coder-next' "$STATEFILE"
+  [ "$(grep -c '^lms unload ' "$STATEFILE")" -eq 1 ]
 }
 
 @test "local-models: unload --all-local unloads only identifiers beginning local/" {
-  LMS_PS_JSON='[{"identifier":"local/ministral-3b"},{"identifier":"not-local"},{"identifier":"local/qwen3-vl-8b"}]' run "$SCRIPT" unload --all-local
+  LMS_PS_JSON='[{"identifier":"local/gpt-oss-120b"},{"identifier":"not-local"},{"identifier":"local/qwen3.8-27b"}]' run "$SCRIPT" unload --all-local
   assert_success
-  grep -qE '^lms unload local/ministral-3b$' "$STATEFILE"
-  grep -qE '^lms unload local/qwen3-vl-8b$' "$STATEFILE"
+  grep -qE '^lms unload local/gpt-oss-120b$' "$STATEFILE"
+  grep -qE '^lms unload local/qwen3\.8-27b$' "$STATEFILE"
   if grep -qE '^lms unload not-local$|^lms unload --all' "$STATEFILE"; then
     echo "unsafe unload detected" >&2
     return 1
@@ -263,7 +345,7 @@ EOF
 }
 
 @test "local-models: unload --all-local propagates exact-id unload failures" {
-  LMS_PS_JSON='[{"identifier":"local/ministral-3b"}]' LMS_UNLOAD_EXIT=5 run "$SCRIPT" unload --all-local
+  LMS_PS_JSON='[{"identifier":"local/gpt-oss-120b"}]' LMS_UNLOAD_EXIT=5 run "$SCRIPT" unload --all-local
   assert_failure 5
   assert_output --partial "one or more local model unloads failed"
 }
@@ -271,5 +353,6 @@ EOF
 @test "local-models: runs cleanly under /bin/bash 3.2" {
   run /bin/bash "$SCRIPT" list
   assert_success
-  assert_output --partial "ministral-3b"
+  assert_output --partial "qwen3-coder-next"
+  assert_output --partial "qwen/qwen3.8-27b"
 }

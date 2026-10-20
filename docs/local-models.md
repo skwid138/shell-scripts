@@ -27,9 +27,9 @@ local-models list
 local-models status
 local-models start
 local-models verify
-local-models load ministral-3b
-local-models load ministral-3b --context-length 4096 --ttl 600 --yes
-local-models unload ministral-3b
+local-models load qwen3.8-27b
+local-models load qwen3.8-27b --context-length 4096 --ttl 600 --yes
+local-models unload qwen3.8-27b
 local-models unload --all-local
 ```
 
@@ -46,7 +46,7 @@ local-models unload --all-local
 Default context length is `32768` tokens. Override with:
 
 ```bash
-local-models load ministral-3b --context-length 8192
+local-models load qwen3-coder-next --context-length 8192
 ```
 
 Before loading, the script runs `lms load ... --estimate-only` and parses:
@@ -62,14 +62,15 @@ passed.
 
 ## V1 mapping
 
-| Alias | LM Studio source | Stable identifier / OpenCode model ID |
-| --- | --- | --- |
-| `ministral-3b` | `mistralai/ministral-3-3b` | `local/ministral-3b` |
-| `qwen3-vl-8b` | `qwen/qwen3-vl-8b` | `local/qwen3-vl-8b` |
-| `qwen3-vl-30b` | `qwen/qwen3-vl-30b` | `local/qwen3-vl-30b` |
-| `qwen3-coder-next` | `qwen3-coder-next-0` | `local/qwen3-coder-next` |
-| `qwen3.5-122b-a10b` | `qwen_qwen3.5-122b-a10b` | `local/qwen3.5-122b-a10b` |
-| `gpt-oss-120b` | `gpt-oss-120b` | `local/gpt-oss-120b` |
+| Alias | LM Studio source | Stable identifier / OpenCode model ID | Format |
+| --- | --- | --- | --- |
+| `gpt-oss-120b` | `gpt-oss-120b` | `local/gpt-oss-120b` | GGUF |
+| `qwen3.5-122b-a10b` | `qwen_qwen3.5-122b-a10b` | `local/qwen3.5-122b-a10b` | GGUF |
+| `qwen3.8-27b` | `qwen/qwen3.8-27b` | `local/qwen3.8-27b` | MLX 8-bit |
+| `qwen3-coder-next` | `qwen/qwen3-coder-next` | `local/qwen3-coder-next` | MLX 6-bit |
+
+The LM Studio source is the plain `modelKey` from `lms ls --json`, without the
+`@6bit`/`@8bit` variant suffix LM Studio shows for MLX models.
 
 Embedding models are intentionally excluded from OpenCode v1.
 
