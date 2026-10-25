@@ -43,7 +43,7 @@ write_valid_config() {
       "models": {
         "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
         "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
         "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
       },
     },
@@ -127,6 +127,17 @@ ESTIMATE
     if [[ "$*" == *"--estimate-only"* ]]; then
       cat <<'ESTIMATE'
 Estimated Total Memory: 84.44 GiB
+Confidence: LOW
+Estimate: This model may not fit within your resource guardrails.
+ESTIMATE
+    else
+      exit "${LMS_LOAD_EXIT:-0}"
+    fi
+    ;;
+  "load qwen_qwen3.5-122b-a10b")
+    if [[ "$*" == *"--estimate-only"* ]]; then
+      cat <<'ESTIMATE'
+Estimated Total Memory: 70.00 GiB
 Confidence: LOW
 Estimate: This model may not fit within your resource guardrails.
 ESTIMATE
@@ -248,7 +259,7 @@ EOF
       "models": {
         "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
         "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
         "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
       }
     }
@@ -280,7 +291,7 @@ EOF
       "models": {
         "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
         "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
         "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
         "local/ministral-3b": { "limit": { "context": 32768, "output": 8192 } }
       }
@@ -310,8 +321,8 @@ EOF
   run "$SCRIPT" load qwen3.8-27b
   assert_failure 1
   assert_output --partial "requires confirmation"
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 32768 --estimate-only' "$STATEFILE"
-  if grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 32768' "$STATEFILE"; then
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
+  if grep -qE '^lms load qwen3\.8-27b --identifier local/qwen3\.8-27b --context-length [0-9]+$' "$STATEFILE"; then
     echo "load ran despite required prompt" >&2
     return 1
   fi
@@ -355,4 +366,108 @@ EOF
   assert_success
   assert_output --partial "qwen3-coder-next"
   assert_output --partial "qwen/qwen3.8-27b"
+}
+
+# Writes a valid-shape OpenCode config with per-model limits so tests can
+# exercise the per-alias expected-context mapping in verify.
+# Args: gpt-oss-120b ctx, qwen3.5-122b-a10b ctx, qwen3.8-27b ctx,
+#       qwen3-coder-next ctx, output limit applied to all four.
+write_config_limits() {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<EOF_CONFIG
+{
+  "provider": {
+    "lmstudio": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/gpt-oss-120b": { "limit": { "context": $1, "output": $5 } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": $2, "output": $5 } },
+        "local/qwen3.8-27b": { "limit": { "context": $3, "output": $5 } },
+        "local/qwen3-coder-next": { "limit": { "context": $4, "output": $5 } }
+      }
+    }
+  }
+}
+EOF_CONFIG
+}
+
+@test "local-models: verify rejects qwen3.8-27b context left at the old 32768 default" {
+  write_config_limits 32768 32768 32768 32768 8192
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "unexpected limits for local/qwen3.8-27b: context=32768 output=8192 (expected 131072/8192)"
+  assert_output --partial "OpenCode lmstudio model limits drifted"
+}
+
+@test "local-models: verify under /bin/bash 3.2 accepts Qwen 131072 and others 32768" {
+  run /bin/bash "$SCRIPT" verify
+  assert_success
+  assert_output --partial "verification passed"
+}
+
+@test "local-models: load qwen3.8-27b defaults to 131072 for estimate and actual load" {
+  run "$SCRIPT" load qwen3.8-27b --yes
+  assert_success
+  assert_output --partial "loaded qwen3.8-27b as local/qwen3.8-27b"
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --yes' "$STATEFILE"
+  if grep -qE '^lms load .*--context-length 32768' "$STATEFILE"; then
+    echo "qwen3.8-27b load used the 32768 default" >&2
+    return 1
+  fi
+}
+
+@test "local-models: load qwen3.8-27b under /bin/bash 3.2 defaults to 131072" {
+  run /bin/bash "$SCRIPT" load qwen3.8-27b --yes
+  assert_success
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --yes' "$STATEFILE"
+}
+
+@test "local-models: non-Qwen3.8 aliases keep the 32768 default for estimate and actual load" {
+  local alias source
+  for alias in gpt-oss-120b qwen3.5-122b-a10b qwen3-coder-next; do
+    : >"$STATEFILE"
+    case "$alias" in
+      gpt-oss-120b) source="gpt-oss-120b" ;;
+      qwen3.5-122b-a10b) source="qwen_qwen3.5-122b-a10b" ;;
+      qwen3-coder-next) source="qwen/qwen3-coder-next" ;;
+    esac
+    run "$SCRIPT" load "$alias" --yes
+    assert_success
+    grep -qxF "lms load $source --identifier local/$alias --context-length 32768 --estimate-only" "$STATEFILE"
+    grep -qxF "lms load $source --identifier local/$alias --context-length 32768 --yes" "$STATEFILE"
+  done
+}
+
+@test "local-models: explicit --context-length overrides the Qwen 131072 default without touching config" {
+  local before after
+  before="$(cksum <"$LOCAL_MODELS_OPENCODE_CONFIG")"
+  run "$SCRIPT" load qwen3.8-27b --context-length 65536 --yes
+  assert_success
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 65536 --estimate-only' "$STATEFILE"
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 65536 --yes' "$STATEFILE"
+  if grep -qE '^lms load .*--context-length 131072' "$STATEFILE"; then
+    echo "default context leaked past explicit override" >&2
+    return 1
+  fi
+  after="$(cksum <"$LOCAL_MODELS_OPENCODE_CONFIG")"
+  [ "$before" = "$after" ]
+}
+
+@test "local-models: verify rejects an unchanged model whose context was raised to 131072" {
+  write_config_limits 131072 32768 131072 32768 8192
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "unexpected limits for local/gpt-oss-120b: context=131072 output=8192 (expected 32768/8192)"
+  refute_output --partial "unexpected limits for local/qwen3.8-27b"
+}
+
+@test "local-models: verify rejects a wrong output limit" {
+  write_config_limits 32768 32768 131072 32768 4096
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "unexpected limits for local/qwen3.8-27b: context=131072 output=4096 (expected 131072/8192)"
+  assert_output --partial "unexpected limits for local/gpt-oss-120b: context=32768 output=4096 (expected 32768/8192)"
+  assert_output --partial "OpenCode lmstudio model limits drifted"
 }

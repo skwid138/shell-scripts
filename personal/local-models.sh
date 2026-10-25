@@ -44,7 +44,11 @@ Commands:
       drift. Loaded models are not required.
   load <alias> [--context-length N] [--ttl seconds] [-y|--yes]
       Estimate first, then load the source model as the exact stable identifier.
-      Default context length is 32768. A prompt is required for large, low-
+      Default context length is per alias and matches the OpenCode limit.context
+      that verify expects: 131072 for qwen3.8-27b, 32768 for the others.
+      --context-length N overrides this load only; it does not change OpenCode
+      config, and a value below OpenCode's configured context can make OpenCode
+      overrun the loaded model. A prompt is required for large, low-
       confidence, missing-confidence, or unfavorable estimates unless --yes is
       passed. Non-interactive prompt-required runs fail cleanly.
   unload <alias>
@@ -96,6 +100,30 @@ model_identifier() {
     qwen3-coder-next) echo "local/qwen3-coder-next" ;;
     *) return 1 ;;
   esac
+}
+
+# Per-alias default load context. This is the single source of truth for both
+# `load` defaults and the expected OpenCode limit.context checked by verify.
+model_context_length() {
+  case "$1" in
+    qwen3.8-27b) echo "131072" ;;
+    gpt-oss-120b | qwen3.5-122b-a10b | qwen3-coder-next) echo "$DEFAULT_CONTEXT_LENGTH" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Reverse lookup: stable local/... identifier -> alias.
+identifier_alias() {
+  local alias
+  while IFS= read -r alias; do
+    if [[ "$(model_identifier "$alias")" == "$1" ]]; then
+      echo "$alias"
+      return 0
+    fi
+  done <<EOF
+$(all_aliases)
+EOF
+  return 1
 }
 
 require_runtime_deps() {
@@ -453,7 +481,7 @@ expected_identifiers() {
 validate_config() {
   [[ -f "$OPENCODE_CONFIG" ]] || die "OpenCode config not found: $OPENCODE_CONFIG"
 
-  local report npm base expected actual missing extra bad_limits line key ctx out
+  local report npm base expected actual missing extra bad_limits line key ctx out alias expected_ctx
   report="$(jsonc_config_report)"
   if printf '%s\n' "$report" | awk -F '\t' '$1=="ERROR" {found=1} END {exit !found}'; then
     die "cannot parse OpenCode JSONC config: $(printf '%s\n' "$report" | awk -F '\t' '$1=="ERROR" {print $3; exit}')"
@@ -480,8 +508,10 @@ validate_config() {
   bad_limits=0
   while IFS=$'\t' read -r line key ctx out; do
     [[ "$line" == "MODEL" ]] || continue
-    if [[ "$ctx" != "$DEFAULT_CONTEXT_LENGTH" || "$out" != "$DEFAULT_OUTPUT_LIMIT" ]]; then
-      warn "unexpected limits for $key: context=$ctx output=$out (expected ${DEFAULT_CONTEXT_LENGTH}/${DEFAULT_OUTPUT_LIMIT})"
+    alias="$(identifier_alias "$key")" || die "no alias maps to OpenCode lmstudio model key: $key"
+    expected_ctx="$(model_context_length "$alias")" || die "no default context length for alias: $alias"
+    if [[ "$ctx" != "$expected_ctx" || "$out" != "$DEFAULT_OUTPUT_LIMIT" ]]; then
+      warn "unexpected limits for $key: context=$ctx output=$out (expected ${expected_ctx}/${DEFAULT_OUTPUT_LIMIT})"
       bad_limits=1
     fi
   done <<EOF
@@ -644,7 +674,7 @@ cmd_load() {
   require_alias "$alias"
 
   local context_length ttl yes source identifier estimate decision decision_kind answer
-  context_length="$DEFAULT_CONTEXT_LENGTH"
+  context_length="$(model_context_length "$alias")" || die "no default context length for alias: $alias"
   ttl=""
   yes=0
   while [[ $# -gt 0 ]]; do
