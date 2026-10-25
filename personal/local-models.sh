@@ -461,13 +461,81 @@ except Exception as exc:
     print(f"ERROR\tparse\t{exc}")
     sys.exit(0)
 
-provider = (config.get('provider') or {}).get('lmstudio') or {}
-print('NPM\t' + str(provider.get('npm', '')))
-print('BASEURL\t' + str((provider.get('options') or {}).get('baseURL', '')))
-models = provider.get('models') or {}
+def fail(message):
+    print('ERROR\tconfig\t' + message)
+    sys.exit(0)
+
+def report_field(value, field):
+    text = str(value)
+    if any(character in text for character in ('\t', '\n', '\r', '\x00')):
+        fail('{} contains a tab, line break, or NUL'.format(field))
+    return text
+
+if not isinstance(config, dict):
+    fail('OpenCode config root must be an object')
+
+native_providers = config.get('providers')
+if isinstance(native_providers, dict) and 'lmstudio' in native_providers:
+    provider_format = 'native'
+    provider_path = 'providers.lmstudio'
+    provider = native_providers['lmstudio']
+    adapter_field = 'package'
+    settings_field = 'settings'
+    url_field = 'baseURL'
+    if not isinstance(provider, dict):
+        fail('providers.lmstudio must be an object')
+    if 'npm' in provider or 'options' in provider:
+        fail('providers.lmstudio mixes native package/settings with legacy npm/options fields')
+    adapter = provider.get('package', '')
+    settings = provider.get('settings')
+else:
+    legacy_providers = config.get('provider')
+    if isinstance(legacy_providers, dict) and 'lmstudio' in legacy_providers:
+        provider = legacy_providers['lmstudio']
+        if not isinstance(provider, dict):
+            fail('provider.lmstudio must be an object')
+    else:
+        provider = {}
+    provider_format = 'legacy'
+    provider_path = 'provider.lmstudio'
+    adapter_field = 'npm'
+    settings_field = 'options'
+    url_field = 'baseURL'
+    if 'package' in provider or 'settings' in provider:
+        fail('provider.lmstudio mixes legacy npm/options with native package/settings fields')
+    adapter = provider.get('npm', '')
+    settings = provider.get('options')
+
+if not isinstance(adapter, str):
+    fail('{}.{} must be a string'.format(provider_path, adapter_field))
+if not isinstance(settings, dict):
+    fail('{}.{} must be an object'.format(provider_path, settings_field))
+base_url = settings.get(url_field, '')
+if not isinstance(base_url, str):
+    fail('{}.{}.{} must be a string'.format(provider_path, settings_field, url_field))
+adapter = report_field(adapter, '{}.{}'.format(provider_path, adapter_field))
+base_url = report_field(base_url, '{}.{}.{}'.format(provider_path, settings_field, url_field))
+
+models = provider.get('models')
+if not isinstance(models, dict):
+    fail('{}.models must be an object'.format(provider_path))
+
+print('FORMAT\t' + provider_format)
+print('ADAPTER\t' + adapter)
+print('BASEURL\t' + base_url)
 for key in sorted(models):
-    limit = models.get(key, {}).get('limit') or {}
-    print('MODEL\t{}\t{}\t{}'.format(key, limit.get('context', ''), limit.get('output', '')))
+    key = report_field(key, '{}.models key'.format(provider_path))
+    model = models[key]
+    if not isinstance(model, dict):
+        fail('{}.models.{} must be an object'.format(provider_path, key))
+    limit = model.get('limit')
+    if not isinstance(limit, dict):
+        fail('{}.models.{}.limit must be an object'.format(provider_path, key))
+    if 'context' not in limit or 'output' not in limit:
+        fail('{}.models.{}.limit must include context and output'.format(provider_path, key))
+    context = report_field(limit['context'], '{}.models.limit.context'.format(provider_path))
+    output = report_field(limit['output'], '{}.models.limit.output'.format(provider_path))
+    print('MODEL\t{}\t{}\t{}'.format(key, context, output))
 PY
 }
 
@@ -481,16 +549,36 @@ expected_identifiers() {
 validate_config() {
   [[ -f "$OPENCODE_CONFIG" ]] || die "OpenCode config not found: $OPENCODE_CONFIG"
 
-  local report npm base expected actual missing extra bad_limits line key ctx out alias expected_ctx
+  local report report_error_kind report_error_message provider_format adapter base expected actual missing extra bad_limits line key ctx out alias expected_ctx
   report="$(jsonc_config_report)"
-  if printf '%s\n' "$report" | awk -F '\t' '$1=="ERROR" {found=1} END {exit !found}'; then
-    die "cannot parse OpenCode JSONC config: $(printf '%s\n' "$report" | awk -F '\t' '$1=="ERROR" {print $3; exit}')"
+  report_error_kind="$(printf '%s\n' "$report" | awk -F '\t' '$1=="ERROR" {print $2; exit}')"
+  if [[ -n "$report_error_kind" ]]; then
+    report_error_message="$(printf '%s\n' "$report" | awk -F '\t' '$1=="ERROR" {print $3; exit}')"
+    case "$report_error_kind" in
+      parse) die "cannot parse OpenCode JSONC config: $report_error_message" ;;
+      *) die "invalid OpenCode LM Studio config: $report_error_message" ;;
+    esac
   fi
 
-  npm="$(printf '%s\n' "$report" | awk -F '\t' '$1=="NPM" {print $2; exit}')"
+  provider_format="$(printf '%s\n' "$report" | awk -F '\t' '$1=="FORMAT" {print $2; exit}')"
+  adapter="$(printf '%s\n' "$report" | awk -F '\t' '$1=="ADAPTER" {print $2; exit}')"
   base="$(printf '%s\n' "$report" | awk -F '\t' '$1=="BASEURL" {print $2; exit}')"
-  [[ "$npm" == "@ai-sdk/openai-compatible" ]] || die "OpenCode provider.lmstudio.npm must be @ai-sdk/openai-compatible (found: ${npm:-<missing>})"
-  [[ "$base" == "$BASE_URL" ]] || die "OpenCode provider.lmstudio.options.baseURL mismatch: expected $BASE_URL, found ${base:-<missing>}"
+  case "$provider_format" in
+    legacy)
+      [[ "$adapter" == "@ai-sdk/openai-compatible" ]] || die "OpenCode provider.lmstudio.npm must be @ai-sdk/openai-compatible (found: ${adapter:-<missing>})"
+      [[ "$base" == "$BASE_URL" ]] || die "OpenCode provider.lmstudio.options.baseURL mismatch: expected $BASE_URL, found ${base:-<missing>}"
+      ;;
+    native)
+      case "$adapter" in
+        @opencode/ai/providers/openai-compatible | aisdk:@ai-sdk/openai-compatible) ;;
+        *) die "OpenCode providers.lmstudio.package must be @opencode/ai/providers/openai-compatible or aisdk:@ai-sdk/openai-compatible (found: ${adapter:-<missing>})" ;;
+      esac
+      [[ "$base" == "$BASE_URL" ]] || die "OpenCode providers.lmstudio.settings.baseURL mismatch: expected $BASE_URL, found ${base:-<missing>}"
+      ;;
+    *)
+      die "cannot select OpenCode LM Studio provider config format"
+      ;;
+  esac
 
   expected="$(expected_identifiers | sort)"
   actual="$(printf '%s\n' "$report" | awk -F '\t' '$1=="MODEL" {print $2}' | sort)"
@@ -595,9 +683,9 @@ check_installed_models() {
 
 cmd_verify() {
   require_runtime_deps
+  validate_config
   cmd_start
   check_installed_models || die "one or more mapped source models are not installed in LM Studio"
-  validate_config
   info "verification passed: LM Studio CLI, endpoint, installed source models, and OpenCode config are aligned"
 }
 

@@ -52,6 +52,72 @@ write_valid_config() {
 EOF
 }
 
+write_native_config() {
+  local package="${1:-@opencode/ai/providers/openai-compatible}"
+  local base_url="${2:-http://127.0.0.1:1234/v1}"
+  local gpt_context="${3:-32768}"
+  local qwen35_context="${4:-32768}"
+  local qwen38_context="${5:-131072}"
+  local coder_context="${6:-32768}"
+  local output_limit="${7:-8192}"
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<EOF
+{
+  "providers": {
+    "lmstudio": {
+      "package": "$package",
+      "settings": { "baseURL": "$base_url" },
+      "models": {
+        "local/gpt-oss-120b": { "limit": { "context": $gpt_context, "output": $output_limit } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": $qwen35_context, "output": $output_limit } },
+        "local/qwen3.8-27b": { "limit": { "context": $qwen38_context, "output": $output_limit } },
+        "local/qwen3-coder-next": { "limit": { "context": $coder_context, "output": $output_limit } }
+      }
+    }
+  }
+}
+EOF
+}
+
+write_both_provider_configs() {
+  local native_package="$1"
+  local legacy_package="$2"
+  local native_package_field
+  native_package_field=""
+  if [[ -n "$native_package" ]]; then
+    native_package_field="$(printf '"package": "%s",' "$native_package")"
+  fi
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<EOF
+{
+  "provider": {
+    "other": { "npm": "unrelated-provider" },
+    "lmstudio": {
+      "npm": "$legacy_package",
+      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
+        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
+      }
+    }
+  },
+  "providers": {
+    "other": { "package": "unrelated-provider" },
+    "lmstudio": {
+      $native_package_field
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
+        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
+      }
+    }
+  }
+}
+EOF
+}
+
 write_drifted_config() {
   cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
 {
@@ -272,6 +338,239 @@ EOF
   assert_output --partial "verification passed"
 }
 
+@test "local-models: verify accepts native OpenCode v2 LM Studio provider config" {
+  write_native_config
+  run "$SCRIPT" verify
+  assert_success
+  assert_output --partial "verification passed"
+}
+
+@test "local-models: verify accepts aisdk native package identifier" {
+  write_native_config "aisdk:@ai-sdk/openai-compatible"
+  run "$SCRIPT" verify
+  assert_success
+  assert_output --partial "verification passed"
+}
+
+@test "local-models: adapter identifiers are rejected in the other config format" {
+  local adapter
+  write_native_config "@ai-sdk/openai-compatible"
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.package must be"
+  [ ! -s "$STATEFILE" ]
+
+  for adapter in "@opencode/ai/providers/openai-compatible" "aisdk:@ai-sdk/openai-compatible"; do
+    write_config_limits 32768 32768 131072 32768 8192 "$adapter"
+    run "$SCRIPT" verify
+    assert_failure 1
+    assert_output --partial "provider.lmstudio.npm must be @ai-sdk/openai-compatible"
+    [ ! -s "$STATEFILE" ]
+  done
+}
+
+@test "local-models: native package with escaped newline is rejected before stub calls" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible\nnot-a-package",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
+        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
+      }
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.package contains a tab, line break, or NUL"
+  refute_output --partial "not-a-package"
+
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible\u0000nul-suffix",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
+        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
+        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
+      }
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.package contains a tab, line break, or NUL"
+  refute_output --partial "nul-suffix"
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: report fields reject escaped delimiters without echoing values" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1\turl-suffix" },
+      "models": {}
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.settings.baseURL contains a tab, line break, or NUL"
+  refute_output --partial "url-suffix"
+
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/gpt-oss-120b\rmodel-suffix": { "limit": { "context": 32768, "output": 8192 } }
+      }
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.models key contains a tab, line break, or NUL"
+  refute_output --partial "model-suffix"
+
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/gpt-oss-120b": { "limit": { "context": "32768\nlimit-suffix", "output": 8192 } }
+      }
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.models.limit.context contains a tab, line break, or NUL"
+  refute_output --partial "limit-suffix"
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: native LM Studio provider takes precedence over invalid legacy provider" {
+  write_both_provider_configs "@opencode/ai/providers/openai-compatible" "unsupported-legacy-adapter"
+  run "$SCRIPT" verify
+  assert_success
+  assert_output --partial "verification passed"
+}
+
+@test "local-models: invalid native provider does not fall back to valid legacy provider" {
+  write_both_provider_configs "unsupported-native-adapter" "@ai-sdk/openai-compatible"
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "OpenCode providers.lmstudio.package must be"
+  assert_output --partial "unsupported-native-adapter"
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: missing native adapter does not fall back to valid legacy provider" {
+  write_both_provider_configs "" "@ai-sdk/openai-compatible"
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "OpenCode providers.lmstudio.package must be"
+  assert_output --partial "found: <missing>"
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: native provider rejects mixed legacy fields" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {}
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio mixes native package/settings with legacy npm/options fields"
+  refute_output --partial "Traceback"
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: legacy provider rejects mixed native fields" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "provider": {
+    "lmstudio": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {}
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "provider.lmstudio mixes legacy npm/options with native package/settings fields"
+  refute_output --partial "Traceback"
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: malformed native settings and model entries fail without traceback" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": [],
+      "models": {}
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.settings must be an object"
+  refute_output --partial "Traceback"
+
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": { "local/gpt-oss-120b": {} }
+    }
+  }
+}
+EOF
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.models.local/gpt-oss-120b.limit must be an object"
+  refute_output --partial "Traceback"
+  [ ! -s "$STATEFILE" ]
+}
+
 @test "local-models: verify fails on OpenCode config drift" {
   write_drifted_config
   run "$SCRIPT" verify
@@ -322,7 +621,7 @@ EOF
   assert_failure 1
   assert_output --partial "requires confirmation"
   grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
-  if grep -qE '^lms load qwen3\.8-27b --identifier local/qwen3\.8-27b --context-length [0-9]+$' "$STATEFILE"; then
+  if grep -qE '^lms load qwen/qwen3\.8-27b --identifier local/qwen3\.8-27b --context-length [0-9]+$' "$STATEFILE"; then
     echo "load ran despite required prompt" >&2
     return 1
   fi
@@ -373,12 +672,14 @@ EOF
 # Args: gpt-oss-120b ctx, qwen3.5-122b-a10b ctx, qwen3.8-27b ctx,
 #       qwen3-coder-next ctx, output limit applied to all four.
 write_config_limits() {
+  local package="${6:-@ai-sdk/openai-compatible}"
+  local base_url="${7:-http://127.0.0.1:1234/v1}"
   cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<EOF_CONFIG
 {
   "provider": {
     "lmstudio": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "npm": "$package",
+      "options": { "baseURL": "$base_url" },
       "models": {
         "local/gpt-oss-120b": { "limit": { "context": $1, "output": $5 } },
         "local/qwen3.5-122b-a10b": { "limit": { "context": $2, "output": $5 } },
@@ -470,4 +771,69 @@ EOF_CONFIG
   assert_output --partial "unexpected limits for local/qwen3.8-27b: context=131072 output=4096 (expected 131072/8192)"
   assert_output --partial "unexpected limits for local/gpt-oss-120b: context=32768 output=4096 (expected 32768/8192)"
   assert_output --partial "OpenCode lmstudio model limits drifted"
+}
+
+@test "local-models: legacy config rejects wrong adapter and base URL before startup" {
+  write_config_limits 32768 32768 131072 32768 8192 "unsupported-adapter"
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "provider.lmstudio.npm must be @ai-sdk/openai-compatible"
+  [ ! -s "$STATEFILE" ]
+
+  write_config_limits 32768 32768 131072 32768 8192 "@ai-sdk/openai-compatible" "http://127.0.0.1:9999/v1"
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "provider.lmstudio.options.baseURL mismatch"
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: native config rejects URL, model roster, and limit drift" {
+  write_native_config "@opencode/ai/providers/openai-compatible" "http://127.0.0.1:9999/v1"
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.settings.baseURL mismatch"
+
+  write_native_config "@opencode/ai/providers/openai-compatible" "http://127.0.0.1:1234/v1" 32768 32768 32768
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "unexpected limits for local/qwen3.8-27b: context=32768 output=8192 (expected 131072/8192)"
+  assert_output --partial "OpenCode lmstudio model limits drifted"
+
+  write_native_config
+  sed 's/local\/qwen3-coder-next/local\/retired-model/' "$LOCAL_MODELS_OPENCODE_CONFIG" >"$STUBDIR/config.jsonc"
+  mv "$STUBDIR/config.jsonc" "$LOCAL_MODELS_OPENCODE_CONFIG"
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial "OpenCode lmstudio model keys do not match script mapping"
+  assert_output --partial "local/qwen3-coder-next"
+  assert_output --partial "local/retired-model"
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: native config load uses stable identifier and configured context" {
+  write_native_config
+  run "$SCRIPT" load qwen3.8-27b --yes
+  assert_success
+  assert_output --partial "loaded qwen3.8-27b as local/qwen3.8-27b"
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
+  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --yes' "$STATEFILE"
+}
+
+@test "local-models: invalid native config blocks load before startup estimate or load" {
+  write_native_config "unsupported-adapter"
+  run "$SCRIPT" load qwen3.8-27b --yes
+  assert_failure 1
+  assert_output --partial "providers.lmstudio.package must be"
+  if grep -qE '^lms (server start|load )' "$STATEFILE"; then
+    echo "startup or load ran despite invalid config" >&2
+    return 1
+  fi
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "local-models: native provider config verifies under /bin/bash 3.2" {
+  write_native_config "aisdk:@ai-sdk/openai-compatible"
+  run /bin/bash "$SCRIPT" verify
+  assert_success
+  assert_output --partial "verification passed"
 }
