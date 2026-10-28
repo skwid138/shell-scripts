@@ -1,7 +1,8 @@
 #!/usr/bin/env bats
 bats_require_minimum_version 1.5.0
-# CLI tests for personal/local-models.sh.
-# External LM Studio state is fully stubbed via LOCAL_MODELS_* overrides.
+
+# CLI tests for personal/local-models.sh. LM Studio, curl, and OpenCode config
+# are stubbed; no test loads a real model or calls inference.
 
 setup() {
   load 'test_helper/bats-support/load'
@@ -21,96 +22,35 @@ setup() {
   export LOCAL_MODELS_START_WAIT_ATTEMPTS=1
   export LOCAL_MODELS_START_WAIT_SLEEP=0
 
-  write_valid_config
+  write_model_config "local/catalog-name" "org/model-z" 8192
   write_lms_stub
-  write_curl_stub_success
+  write_curl_stub
 }
 
 teardown() {
   [[ -d "$STUBDIR" ]] && rm -rf "$STUBDIR"
 }
 
-write_valid_config() {
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  // JSONC comments and trailing commas are intentional test coverage.
-  "provider": {
-    "lmstudio": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "http://127.0.0.1:1234/v1" // comment after string URL
-      },
-      "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
-      },
-    },
-  },
-}
-EOF
-}
-
-write_native_config() {
-  local package="${1:-@opencode/ai/providers/openai-compatible}"
-  local base_url="${2:-http://127.0.0.1:1234/v1}"
-  local gpt_context="${3:-32768}"
-  local qwen35_context="${4:-32768}"
-  local qwen38_context="${5:-131072}"
-  local coder_context="${6:-32768}"
-  local output_limit="${7:-8192}"
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<EOF
-{
-  "providers": {
-    "lmstudio": {
-      "package": "$package",
-      "settings": { "baseURL": "$base_url" },
-      "models": {
-        "local/gpt-oss-120b": { "limit": { "context": $gpt_context, "output": $output_limit } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": $qwen35_context, "output": $output_limit } },
-        "local/qwen3.8-27b": { "limit": { "context": $qwen38_context, "output": $output_limit } },
-        "local/qwen3-coder-next": { "limit": { "context": $coder_context, "output": $output_limit } }
-      }
-    }
-  }
-}
-EOF
-}
-
-write_both_provider_configs() {
-  local native_package="$1"
-  local legacy_package="$2"
-  local native_package_field
-  native_package_field=""
-  if [[ -n "$native_package" ]]; then
-    native_package_field="$(printf '"package": "%s",' "$native_package")"
+write_model_config() {
+  local catalog_key="$1"
+  local model_id="$2"
+  local context="${3:-}"
+  local limit_field=""
+  if [[ -n "$context" ]]; then
+    limit_field="\"limit\": { \"context\": $context, \"output\": 4096 },"
   fi
   cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<EOF
 {
-  "provider": {
-    "other": { "npm": "unrelated-provider" },
-    "lmstudio": {
-      "npm": "$legacy_package",
-      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
-      }
-    }
-  },
   "providers": {
-    "other": { "package": "unrelated-provider" },
     "lmstudio": {
-      $native_package_field
+      "package": "@opencode/ai/providers/openai-compatible",
       "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
       "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
+        "$catalog_key": {
+          "modelID": "$model_id",
+          $limit_field
+          "body": { "temperature": 1 }
+        }
       }
     }
   }
@@ -118,24 +58,6 @@ write_both_provider_configs() {
 EOF
 }
 
-write_drifted_config() {
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "provider": {
-    "lmstudio": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } }
-      }
-    }
-  }
-}
-EOF
-}
-
-# The ls fixture uses LM Studio's plain modelKey values (no @6bit/@8bit
-# variant suffix); the script maps aliases to these plain keys.
 write_lms_stub() {
   cat >"$LOCAL_MODELS_LMS_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -143,697 +65,618 @@ printf 'lms %s\n' "$*" >>"$STATEFILE"
 case "$1 ${2-}" in
   "server status")
     running="${LMS_RUNNING:-true}"
-    if [[ -f "$(dirname "$0")/lms-started" ]]; then
-      running=true
-    fi
-    printf '{"running":%s,"port":%s,"host":"%s"}\n' "$running" "${LMS_STATUS_PORT:-1234}" "${LMS_STATUS_HOST:-127.0.0.1}"
+    if [[ -f "$(dirname "$0")/server-started" ]]; then running=true; fi
+    printf '{"running":%s,"port":%s,"host":"%s"}\n' \
+      "$running" "${LMS_STATUS_PORT:-1234}" "${LMS_STATUS_HOST:-127.0.0.1}"
     ;;
   "server start")
-    touch "$(dirname "$0")/lms-started"
+    touch "$(dirname "$0")/server-started"
     exit "${LMS_START_EXIT:-0}"
     ;;
   "ls --json")
-    cat <<'JSON'
-[{"type":"llm","modelKey":"gpt-oss-120b"},{"type":"llm","modelKey":"qwen_qwen3.5-122b-a10b"},{"type":"llm","modelKey":"qwen/qwen3.8-27b"},{"type":"llm","modelKey":"qwen/qwen3-coder-next"},{"type":"embedding","modelKey":"text-embedding-nomic-embed-text-v1.5"}]
-JSON
+    if [[ "${LMS_LS_EXIT:-0}" -ne 0 ]]; then
+      echo "synthetic lms ls failure" >&2
+      exit "$LMS_LS_EXIT"
+    fi
+    if [[ -n "${LMS_LS_JSON:-}" ]]; then
+      printf '%s\n' "$LMS_LS_JSON"
+    else
+      printf '[{"type":"llm","modelKey":"org/model-z"},{"type":"embedding","modelKey":"org/embed"}]\n'
+    fi
     ;;
   "ps --json")
-    if [[ -n "${LMS_PS_JSON:-}" ]]; then
-      printf '%s\n' "$LMS_PS_JSON"
-    else
-      cat <<'JSON'
-[{"identifier":"local/gpt-oss-120b"},{"identifier":"not-local"}]
-JSON
+    if [[ "${LMS_PS_EXIT:-0}" -ne 0 ]]; then
+      echo "synthetic lms ps failure" >&2
+      exit "$LMS_PS_EXIT"
     fi
+    printf '%s\n' "${LMS_PS_JSON:-[]}"
     ;;
-  "load gpt-oss-120b")
-    # Synthetic HIGH/favorable estimate: exercises the auto-load branch.
+  "load "*)
     if [[ "$*" == *"--estimate-only"* ]]; then
-      cat <<'ESTIMATE'
-Estimated Total Memory: 4.96 GiB
-Confidence: HIGH
-Estimate: This model may be loaded based on your resource guardrails settings.
-ESTIMATE
+      if [[ -n "${LMS_ESTIMATE_OUTPUT:-}" ]]; then
+        printf '%s\n' "$LMS_ESTIMATE_OUTPUT"
+      else
+        printf 'Estimated Total Memory: 4 GiB\nConfidence: HIGH\nEstimate: This model may be loaded.\n'
+      fi
     else
+      touch "$(dirname "$0")/model-loaded"
       exit "${LMS_LOAD_EXIT:-0}"
     fi
     ;;
-  "load qwen/qwen3.8-27b")
-    if [[ "$*" == *"--estimate-only"* ]]; then
-      cat <<'ESTIMATE'
-Estimated Total Memory: 38.50 GiB
-Confidence: LOW
-Estimate: This model may not fit within your resource guardrails.
-ESTIMATE
-    else
-      exit "${LMS_LOAD_EXIT:-0}"
-    fi
-    ;;
-  "load qwen/qwen3-coder-next")
-    if [[ "$*" == *"--estimate-only"* ]]; then
-      cat <<'ESTIMATE'
-Estimated Total Memory: 84.44 GiB
-Confidence: LOW
-Estimate: This model may not fit within your resource guardrails.
-ESTIMATE
-    else
-      exit "${LMS_LOAD_EXIT:-0}"
-    fi
-    ;;
-  "load qwen_qwen3.5-122b-a10b")
-    if [[ "$*" == *"--estimate-only"* ]]; then
-      cat <<'ESTIMATE'
-Estimated Total Memory: 70.00 GiB
-Confidence: LOW
-Estimate: This model may not fit within your resource guardrails.
-ESTIMATE
-    else
-      exit "${LMS_LOAD_EXIT:-0}"
-    fi
-    ;;
-  unload*)
-    exit "${LMS_UNLOAD_EXIT:-0}"
-    ;;
-  *)
-    echo "unexpected lms args: $*" >&2
-    exit 99
-    ;;
+  unload*) exit "${LMS_UNLOAD_EXIT:-0}" ;;
+  *) echo "unexpected lms args: $*" >&2; exit 99 ;;
 esac
 EOF
   chmod +x "$LOCAL_MODELS_LMS_BIN"
 }
 
-write_curl_stub_success() {
+write_curl_stub() {
   cat >"$LOCAL_MODELS_CURL_BIN" <<'EOF'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$STATEFILE"
-printf '{"data":[{"id":"local/gpt-oss-120b"}]}\n'
-EOF
-  chmod +x "$LOCAL_MODELS_CURL_BIN"
-}
-
-write_curl_stub_fail_then_success() {
-  cat >"$LOCAL_MODELS_CURL_BIN" <<'EOF'
-#!/usr/bin/env bash
-printf 'curl %s\n' "$*" >>"$STATEFILE"
-count_file="$(dirname "$0")/curl-count"
-count=$(cat "$count_file" 2>/dev/null || echo 0)
-count=$((count + 1))
-printf '%s\n' "$count" >"$count_file"
-if [[ "$count" -eq 1 ]]; then
-  exit 7
+if [[ "$*" == *"/api/v1/models"* ]]; then
+  if [[ "${LMS_NATIVE_MODELS_FAIL:-0}" == "1" ]]; then
+    exit 7
+  fi
+  if [[ -f "$(dirname "$0")/model-loaded" && -n "${LMS_NATIVE_MODELS_AFTER_LOAD_JSON:-}" ]]; then
+    printf '%s\n' "$LMS_NATIVE_MODELS_AFTER_LOAD_JSON"
+  elif [[ -n "${LMS_NATIVE_MODELS_JSON:-}" ]]; then
+    printf '%s\n' "$LMS_NATIVE_MODELS_JSON"
+  else
+    printf '{"models":[]}\n'
+  fi
+else
+  if [[ "${CURL_FAIL_UNTIL_START:-0}" == "1" && ! -f "$(dirname "$0")/server-started" ]]; then
+    exit 7
+  fi
+  printf '{"data":[]}\n'
 fi
-printf '{"data":[]}\n'
 EOF
   chmod +x "$LOCAL_MODELS_CURL_BIN"
 }
 
-@test "local-models: --help exits 0 and prints usage" {
+@test "help describes dynamic model keys rather than a fixed alias roster" {
   run "$SCRIPT" --help
   assert_success
-  assert_output --partial "Usage: local-models"
-  assert_output --partial "load <alias>"
+  assert_output --partial 'load [model-key|catalog-key]'
+  refute_output --partial 'Aliases:'
+  refute_output --partial 'qwen3.8-27b'
 }
 
-@test "local-models: --help alias table lists exactly the four-model roster" {
-  run "$SCRIPT" --help
+@test "list discovers arbitrary model keys and retains decision models but filters embeddings" {
+  LMS_LS_JSON='[{"type":"llm","modelKey":"org/model-z"},{"type":"decision","modelKey":"org/decision-q"},{"type":"llm","path":"org/guessed-path"},{"type":"embedding","modelKey":"org/embed"}]' \
+    run "$SCRIPT" list
   assert_success
-  assert_line --regexp '^  gpt-oss-120b +-> gpt-oss-120b +-> local/gpt-oss-120b$'
-  assert_line --regexp '^  qwen3\.5-122b-a10b +-> qwen_qwen3\.5-122b-a10b +-> local/qwen3\.5-122b-a10b$'
-  assert_line --regexp '^  qwen3\.8-27b +-> qwen/qwen3\.8-27b +-> local/qwen3\.8-27b$'
-  assert_line --regexp '^  qwen3-coder-next +-> qwen/qwen3-coder-next +-> local/qwen3-coder-next$'
-  [ "$(printf '%s\n' "$output" | grep -c -- '-> local/')" -eq 4 ]
-}
-
-@test "local-models: list shows exactly the four-model roster with status" {
-  run "$SCRIPT" list
-  assert_success
-  assert_line --regexp '^gpt-oss-120b +gpt-oss-120b +local/gpt-oss-120b +installed=yes loaded=yes$'
-  assert_line --regexp '^qwen3\.5-122b-a10b +qwen_qwen3\.5-122b-a10b +local/qwen3\.5-122b-a10b +installed=yes loaded=no$'
-  assert_line --regexp '^qwen3\.8-27b +qwen/qwen3\.8-27b +local/qwen3\.8-27b +installed=yes loaded=no$'
-  assert_line --regexp '^qwen3-coder-next +qwen/qwen3-coder-next +local/qwen3-coder-next +installed=yes loaded=no$'
-  # Header plus exactly four roster rows.
-  [ "${#lines[@]}" -eq 5 ]
-  refute_output --partial "ministral"
-  refute_output --partial "qwen3-vl"
-  refute_output --partial "qwen3-coder-next-0"
-}
-
-@test "local-models: retired aliases are rejected by load and unload" {
-  local retired
-  for retired in ministral-3b qwen3-vl-8b qwen3-vl-30b; do
-    run "$SCRIPT" load "$retired" --yes
-    assert_failure 2
-    assert_output --partial "unknown local model alias: $retired"
-    run "$SCRIPT" unload "$retired"
-    assert_failure 2
-    assert_output --partial "unknown local model alias: $retired"
-  done
-  if grep -qE '^lms (load|unload) ' "$STATEFILE"; then
-    echo "retired alias reached lms load/unload" >&2
+  assert_output --partial 'org/model-z'
+  assert_output --partial 'org/decision-q'
+  refute_output --partial 'org/embed'
+  refute_output --partial 'org/guessed-path'
+  if grep -q '^lms server start ' "$STATEFILE"; then
+    echo "list started LM Studio" >&2
     return 1
   fi
 }
 
-@test "local-models: start starts pinned server when endpoint is down" {
-  write_curl_stub_fail_then_success
-  LMS_RUNNING=false run "$SCRIPT" start
+@test "list is read-only and works under macOS bash 3.2" {
+  run /bin/bash "$SCRIPT" list
   assert_success
-  grep -qE '^lms server start --bind 127\.0\.0\.1 --port 1234$' "$STATEFILE"
-  assert_output --partial "LM Studio server ready"
-}
-
-@test "local-models: start refuses responding endpoint when LM Studio status is elsewhere" {
-  LMS_STATUS_PORT=5678 run "$SCRIPT" start
-  assert_failure 5
-  assert_output --partial "responds, but LM Studio CLI status does not match configured http://127.0.0.1:1234/v1"
-  assert_output --partial "expected host=127.0.0.1 port=1234"
-  if grep -qE '^lms server start ' "$STATEFILE"; then
-    echo "server start ran despite endpoint/status mismatch" >&2
+  assert_output --partial 'org/model-z'
+  if grep -q '^lms server start ' "$STATEFILE" || grep -q '^curl ' "$STATEFILE"; then
+    echo "list queried or started an HTTP endpoint" >&2
     return 1
   fi
 }
 
-@test "local-models: verify accepts JSONC comments, block comments, strings, and trailing commas" {
+@test "load resolves friendly catalog keys through exact modelID and uses configured context" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[]}]}' \
+    LMS_NATIVE_MODELS_AFTER_LOAD_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"org/model-z","config":{"context_length":8192}}]}]}' \
+    run "$SCRIPT" load local/catalog-name
+  assert_success
+  grep -qxF 'lms load org/model-z --identifier org/model-z --context-length 8192 --estimate-only' "$STATEFILE"
+  grep -qxF 'lms load org/model-z --identifier org/model-z --context-length 8192' "$STATEFILE"
+  assert_output --partial 'runtime compatibility verified for local/catalog-name'
+}
+
+@test "unconfigured load defaults to the exact source key and requires explicit context" {
+  rm "$LOCAL_MODELS_OPENCODE_CONFIG"
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":8192,"loaded_instances":[]}]}' \
+    LMS_NATIVE_MODELS_AFTER_LOAD_JSON='{"models":[{"key":"org/model-z","max_context_length":8192,"loaded_instances":[{"id":"org/model-z","config":{"context_length":4096}}]}]}' \
+    run "$SCRIPT" load org/model-z --context-length 4096 --yes
+  assert_success
+  grep -qxF 'lms load org/model-z --identifier org/model-z --context-length 4096 --yes' "$STATEFILE"
+  assert_output --partial '"status": "PARTIAL_REVIEW_REQUIRED"'
+  assert_output --partial '"modelID": "org/model-z"'
+  assert_output --partial '"context": 4096'
+  refute_output --partial '"output"'
+  refute_output --partial '"capabilities"'
+  refute_output --partial '"name"'
+  assert_output --partial 'OpenCode custom-model defaults include 200000 context and 32000 output'
+}
+
+@test "unconfigured load without a context fails before server or model side effects" {
+  rm "$LOCAL_MODELS_OPENCODE_CONFIG"
+  run "$SCRIPT" load org/model-z
+  assert_failure 2
+  assert_output --partial 'pass --context-length N'
+  if grep -q '^lms server start\|^lms load ' "$STATEFILE"; then
+    echo "load without a context caused a side effect" >&2
+    return 1
+  fi
+}
+
+@test "a catalog model without usable context requires an explicit context" {
+  write_model_config "local/catalog-name" "org/model-z"
+  run "$SCRIPT" load local/catalog-name
+  assert_failure 2
+  assert_output --partial 'no configured context for local/catalog-name'
+  if grep -q '^lms server start\|^lms load ' "$STATEFILE"; then
+    echo "load without configured or explicit context caused a side effect" >&2
+    return 1
+  fi
+}
+
+@test "load allows an explicit identifier override" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[]}]}' \
+    LMS_NATIVE_MODELS_AFTER_LOAD_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"custom/served-id","config":{"context_length":8192}}]}]}' \
+    run "$SCRIPT" load local/catalog-name --identifier custom/served-id
+  assert_success
+  grep -qxF 'lms load org/model-z --identifier custom/served-id --context-length 8192 --estimate-only' "$STATEFILE"
+  grep -qxF 'lms load org/model-z --identifier custom/served-id --context-length 8192' "$STATEFILE"
+}
+
+@test "load rejects control characters in an explicit identifier before runtime calls" {
+  run "$SCRIPT" load local/catalog-name --identifier $'custom/id\ninjected'
+  assert_failure 2
+  assert_output --partial 'identifier must not contain tabs or line breaks'
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "duplicate configured modelIDs are rejected without loading" {
   cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
 {
-  /* block comment */
-  "provider": {
+  "providers": {
     "lmstudio": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
       "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
+        "local/catalog-one": { "modelID": "org/model-z", "limit": { "context": 8192 } },
+        "local/catalog-two": { "modelID": "org/model-z", "limit": { "context": 8192 } }
       }
     }
-  },
-  "note": "not // a comment and not /* a block */",
+  }
 }
 EOF
-  run "$SCRIPT" verify
-  assert_success
-  assert_output --partial "verification passed"
+  run "$SCRIPT" load local/catalog-one
+  assert_failure 2
+  assert_output --partial 'ambiguous configured modelID: org/model-z'
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "ambiguous configured ID reached load" >&2
+    return 1
+  fi
 }
 
-@test "local-models: verify accepts native OpenCode v2 LM Studio provider config" {
-  write_native_config
-  run "$SCRIPT" verify
-  assert_success
-  assert_output --partial "verification passed"
+@test "duplicate installed source keys are rejected without guessing" {
+  LMS_LS_JSON='[{"type":"llm","modelKey":"org/model-z"},{"type":"llm","modelKey":"org/model-z"}]' \
+    run "$SCRIPT" load local/catalog-name
+  assert_failure 2
+  assert_output --partial 'ambiguous installed model key: org/model-z'
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "duplicate installed key reached load" >&2
+    return 1
+  fi
 }
 
-@test "local-models: verify accepts aisdk native package identifier" {
-  write_native_config "aisdk:@ai-sdk/openai-compatible"
-  run "$SCRIPT" verify
-  assert_success
-  assert_output --partial "verification passed"
-}
-
-@test "local-models: adapter identifiers are rejected in the other config format" {
-  local adapter
-  write_native_config "@ai-sdk/openai-compatible"
-  run "$SCRIPT" verify
+@test "load refuses a context above LM Studio's reported maximum before estimating" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":4096,"loaded_instances":[]}]}' \
+    run "$SCRIPT" load local/catalog-name
   assert_failure 1
-  assert_output --partial "providers.lmstudio.package must be"
-  [ ! -s "$STATEFILE" ]
+  assert_output --partial 'exceeds LM Studio maximum context 4096'
+  if grep -q '^lms load org/model-z ' "$STATEFILE"; then
+    echo "load estimate or load ran above reported maximum" >&2
+    return 1
+  fi
+}
 
-  for adapter in "@opencode/ai/providers/openai-compatible" "aisdk:@ai-sdk/openai-compatible"; do
-    write_config_limits 32768 32768 131072 32768 8192 "$adapter"
+@test "low context threshold is advisory and does not block a load" {
+  write_model_config "local/catalog-name" "org/model-z" 4096
+  LOCAL_MODELS_LOW_CONTEXT_THRESHOLD=65536 \
+    LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":8192,"loaded_instances":[]}]}' \
+    run "$SCRIPT" load local/catalog-name --yes
+  assert_success
+  assert_output --partial 'below advisory threshold 65536; this is not a load restriction'
+  grep -q '^lms load org/model-z --identifier org/model-z --context-length 4096 --yes$' "$STATEFILE"
+}
+
+@test "load reuses a compatible exact loaded instance without estimating or reloading" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"org/model-z","config":{"context_length":16384}}]}]}' \
+    run "$SCRIPT" load local/catalog-name
+  assert_success
+  assert_output --partial 'reusing loaded instance org/model-z with runtime context 16384'
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "compatible loaded instance was loaded a second time" >&2
+    return 1
+  fi
+}
+
+@test "load refuses an existing loaded instance below configured context without repairing it" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"org/model-z","config":{"context_length":4096}}]}]}' \
+    run "$SCRIPT" load local/catalog-name
+  assert_failure 1
+  assert_output --partial 'below requested context 8192'
+  refute_output --partial 'lms unload'
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "incompatible existing instance was automatically reloaded" >&2
+    return 1
+  fi
+}
+
+@test "load refuses an existing legacy ID mismatch instead of silently reloading" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"local/catalog-name","config":{"context_length":8192}}]}]}' \
+    run "$SCRIPT" load local/catalog-name
+  assert_failure 1
+  assert_output --partial 'uses ID local/catalog-name, expected org/model-z'
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "legacy ID mismatch reached load" >&2
+    return 1
+  fi
+}
+
+@test "load rejects duplicate loaded runtime IDs across model-key associations" {
+  LMS_LS_JSON='[{"type":"llm","modelKey":"org/model-z"},{"type":"llm","modelKey":"org/other"}]' \
+    LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"org/model-z","config":{"context_length":8192}}]},{"key":"org/other","max_context_length":16384,"loaded_instances":[{"id":"org/model-z","config":{"context_length":8192}}]}]}' \
+    run "$SCRIPT" load local/catalog-name
+  assert_failure 1
+  assert_output --partial 'ambiguous loaded runtime ID org/model-z'
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "duplicate runtime ID reached load" >&2
+    return 1
+  fi
+}
+
+@test "load refuses to risk duplicate loading when loaded-instance association is missing" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384}]}' \
+    run "$SCRIPT" load local/catalog-name
+  assert_failure 1
+  assert_output --partial 'loaded-instance association for org/model-z is unverified'
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "load proceeded without a loaded-instance association" >&2
+    return 1
+  fi
+}
+
+@test "a successful load with a smaller actual context is not reported compatible" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[]}]}' \
+    LMS_NATIVE_MODELS_AFTER_LOAD_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"org/model-z","config":{"context_length":4096}}]}]}' \
+    run "$SCRIPT" load local/catalog-name --yes
+  assert_failure 1
+  assert_output --partial 'load succeeded, but actual context 4096 is below required OpenCode/requested context 8192'
+  grep -q '^lms load org/model-z --identifier org/model-z --context-length 8192 --yes$' "$STATEFILE"
+  refute_output --partial 'runtime compatibility verified'
+}
+
+@test "verify is read-only and reports unknown compatibility when the server is stopped" {
+  LMS_RUNNING=false CURL_FAIL_UNTIL_START=1 run "$SCRIPT" verify
+  assert_success
+  assert_output --partial 'runtime compatibility: unverified (server stopped)'
+  if grep -q '^lms server start\|^curl ' "$STATEFILE"; then
+    echo "read-only verify started the server or queried its HTTP endpoint" >&2
+    return 1
+  fi
+}
+
+@test "verify returns nonzero for exact loaded context below OpenCode's configured context" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"org/model-z","config":{"context_length":4096}}]}]}' \
     run "$SCRIPT" verify
-    assert_failure 1
-    assert_output --partial "provider.lmstudio.npm must be @ai-sdk/openai-compatible"
-    [ ! -s "$STATEFILE" ]
-  done
-}
-
-@test "local-models: native package with escaped newline is rejected before stub calls" {
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "providers": {
-    "lmstudio": {
-      "package": "@opencode/ai/providers/openai-compatible\nnot-a-package",
-      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
-      }
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
   assert_failure 1
-  assert_output --partial "providers.lmstudio.package contains a tab, line break, or NUL"
-  refute_output --partial "not-a-package"
-
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "providers": {
-    "lmstudio": {
-      "package": "@opencode/ai/providers/openai-compatible\u0000nul-suffix",
-      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
-      }
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "providers.lmstudio.package contains a tab, line break, or NUL"
-  refute_output --partial "nul-suffix"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: report fields reject escaped delimiters without echoing values" {
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "providers": {
-    "lmstudio": {
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "http://127.0.0.1:1234/v1\turl-suffix" },
-      "models": {}
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "providers.lmstudio.settings.baseURL contains a tab, line break, or NUL"
-  refute_output --partial "url-suffix"
-
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "providers": {
-    "lmstudio": {
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {
-        "local/gpt-oss-120b\rmodel-suffix": { "limit": { "context": 32768, "output": 8192 } }
-      }
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "providers.lmstudio.models key contains a tab, line break, or NUL"
-  refute_output --partial "model-suffix"
-
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "providers": {
-    "lmstudio": {
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {
-        "local/gpt-oss-120b": { "limit": { "context": "32768\nlimit-suffix", "output": 8192 } }
-      }
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "providers.lmstudio.models.limit.context contains a tab, line break, or NUL"
-  refute_output --partial "limit-suffix"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: native LM Studio provider takes precedence over invalid legacy provider" {
-  write_both_provider_configs "@opencode/ai/providers/openai-compatible" "unsupported-legacy-adapter"
-  run "$SCRIPT" verify
-  assert_success
-  assert_output --partial "verification passed"
-}
-
-@test "local-models: invalid native provider does not fall back to valid legacy provider" {
-  write_both_provider_configs "unsupported-native-adapter" "@ai-sdk/openai-compatible"
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "OpenCode providers.lmstudio.package must be"
-  assert_output --partial "unsupported-native-adapter"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: missing native adapter does not fall back to valid legacy provider" {
-  write_both_provider_configs "" "@ai-sdk/openai-compatible"
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "OpenCode providers.lmstudio.package must be"
-  assert_output --partial "found: <missing>"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: native provider rejects mixed legacy fields" {
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "providers": {
-    "lmstudio": {
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {}
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "providers.lmstudio mixes native package/settings with legacy npm/options fields"
-  refute_output --partial "Traceback"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: legacy provider rejects mixed native fields" {
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "provider": {
-    "lmstudio": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {}
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "provider.lmstudio mixes legacy npm/options with native package/settings fields"
-  refute_output --partial "Traceback"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: malformed native settings and model entries fail without traceback" {
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "providers": {
-    "lmstudio": {
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": [],
-      "models": {}
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "providers.lmstudio.settings must be an object"
-  refute_output --partial "Traceback"
-
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "providers": {
-    "lmstudio": {
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": { "local/gpt-oss-120b": {} }
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "providers.lmstudio.models.local/gpt-oss-120b.limit must be an object"
-  refute_output --partial "Traceback"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: verify fails on OpenCode config drift" {
-  write_drifted_config
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "OpenCode lmstudio model keys do not match"
-  assert_output --partial "local/qwen3.8-27b"
-  assert_output --partial "local/qwen3-coder-next"
-}
-
-@test "local-models: verify reports a retired model left in OpenCode config as extra" {
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
-{
-  "provider": {
-    "lmstudio": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
-      "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } },
-        "local/ministral-3b": { "limit": { "context": 32768, "output": 8192 } }
-      }
-    }
-  }
-}
-EOF
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "Extra:"
-  assert_output --partial "local/ministral-3b"
-}
-
-@test "local-models: load passes stable identifier and context length" {
-  run "$SCRIPT" load gpt-oss-120b --context-length 4096 --ttl 60 --yes
-  assert_success
-  grep -qE '^lms load gpt-oss-120b --identifier local/gpt-oss-120b --context-length 4096 --ttl 60 --yes$' "$STATEFILE"
-}
-
-@test "local-models: load auto-loads without prompt when estimate is HIGH and favorable" {
-  run "$SCRIPT" load gpt-oss-120b
-  assert_success
-  grep -qxF 'lms load gpt-oss-120b --identifier local/gpt-oss-120b --context-length 32768' "$STATEFILE"
-}
-
-@test "local-models: load fails non-interactively when estimate needs prompt" {
-  run "$SCRIPT" load qwen3.8-27b
-  assert_failure 1
-  assert_output --partial "requires confirmation"
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
-  if grep -qE '^lms load qwen/qwen3\.8-27b --identifier local/qwen3\.8-27b --context-length [0-9]+$' "$STATEFILE"; then
-    echo "load ran despite required prompt" >&2
+  assert_output --partial 'runtime compatibility local/catalog-name: incompatible (actual context 4096 is below configured 8192)'
+  if grep -q '^lms server start ' "$STATEFILE"; then
+    echo "verify started LM Studio" >&2
     return 1
   fi
 }
 
-@test "local-models: load qwen3-coder-next estimates then loads plain modelKey as stable identifier" {
-  run "$SCRIPT" load qwen3-coder-next --yes
+@test "verify returns zero when actual context meets or exceeds configured context" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"org/model-z","config":{"context_length":16384}}]}]}' \
+    run "$SCRIPT" verify
   assert_success
-  assert_output --partial "Estimated Total Memory: 84.44 GiB"
-  assert_output --partial "loaded qwen3-coder-next as local/qwen3-coder-next"
-  grep -qxF 'lms load qwen/qwen3-coder-next --identifier local/qwen3-coder-next --context-length 32768 --estimate-only' "$STATEFILE"
-  grep -qxF 'lms load qwen/qwen3-coder-next --identifier local/qwen3-coder-next --context-length 32768 --yes' "$STATEFILE"
+  assert_output --partial 'runtime compatibility local/catalog-name: compatible (actual context 16384)'
+  if grep -q '^lms server start ' "$STATEFILE"; then
+    echo "verify started LM Studio" >&2
+    return 1
+  fi
 }
 
-@test "local-models: unload alias unloads exact stable identifier only" {
-  run "$SCRIPT" unload qwen3-coder-next
+@test "verify returns nonzero for exact modelID association mismatch" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[{"id":"legacy/id","config":{"context_length":8192}}]}]}' \
+    run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial 'runtime compatibility local/catalog-name: incompatible (loaded ID legacy/id, configured modelID org/model-z)'
+  if grep -q '^lms server start\|^lms load\|^lms unload ' "$STATEFILE"; then
+    echo "verify started or mutated the runtime after detecting an ID mismatch" >&2
+    return 1
+  fi
+}
+
+@test "verify reports a missing loaded-instance field as unknown rather than unloaded" {
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384}]}' \
+    run "$SCRIPT" verify
   assert_success
-  grep -qxF 'lms unload local/qwen3-coder-next' "$STATEFILE"
+  assert_output --partial 'runtime compatibility local/catalog-name: unverified (loaded-instance association unavailable)'
+  refute_output --partial 'model is not loaded'
+}
+
+@test "status reports all runtime IDs and remains read-only" {
+  LMS_PS_JSON='[{"identifier":"runtime/model-z"},{"identifier":"local/legacy-model"}]' \
+    LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[]}]}' \
+    run "$SCRIPT" status
+  assert_success
+  assert_output --partial 'runtime/model-z'
+  assert_output --partial 'local/legacy-model'
+  if grep -q '^lms server start ' "$STATEFILE"; then
+    echo "status started LM Studio" >&2
+    return 1
+  fi
+}
+
+@test "load refuses a foreign service on the configured endpoint" {
+  LMS_STATUS_PORT=5678 run "$SCRIPT" load local/catalog-name
+  assert_failure 5
+  assert_output --partial 'refusing to treat a random OpenAI-compatible service as LM Studio'
+  if grep -q '^lms server start\|^lms load ' "$STATEFILE"; then
+    echo "load started or mutated a foreign endpoint" >&2
+    return 1
+  fi
+}
+
+@test "start may start a stopped LM Studio server but does not load a model" {
+  LMS_RUNNING=false CURL_FAIL_UNTIL_START=1 run "$SCRIPT" start
+  assert_success
+  grep -qxF 'lms server start --bind 127.0.0.1 --port 1234' "$STATEFILE"
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "start loaded a model" >&2
+    return 1
+  fi
+}
+
+@test "unfavorable estimate still requires confirmation in noninteractive mode" {
+  LMS_ESTIMATE_OUTPUT='Estimated Total Memory: 80 GiB
+Confidence: LOW
+Estimate: This model may not fit.' \
+    run "$SCRIPT" load local/catalog-name
+  assert_failure 1
+  assert_output --partial 'requires confirmation'
+  grep -q '^lms load org/model-z --identifier org/model-z --context-length 8192 --estimate-only$' "$STATEFILE"
+  if grep -q '^lms load org/model-z --identifier org/model-z --context-length 8192$' "$STATEFILE"; then
+    echo "unconfirmed estimate reached actual load" >&2
+    return 1
+  fi
+}
+
+@test "unload accepts one exact loaded runtime identifier" {
+  LMS_PS_JSON='[{"identifier":"runtime/model-z"},{"identifier":"not-local"}]' run "$SCRIPT" unload runtime/model-z
+  assert_success
+  grep -qxF 'lms unload runtime/model-z' "$STATEFILE"
   [ "$(grep -c '^lms unload ' "$STATEFILE")" -eq 1 ]
 }
 
-@test "local-models: unload --all-local unloads only identifiers beginning local/" {
-  LMS_PS_JSON='[{"identifier":"local/gpt-oss-120b"},{"identifier":"not-local"},{"identifier":"local/qwen3.8-27b"}]' run "$SCRIPT" unload --all-local
-  assert_success
-  grep -qE '^lms unload local/gpt-oss-120b$' "$STATEFILE"
-  grep -qE '^lms unload local/qwen3\.8-27b$' "$STATEFILE"
-  if grep -qE '^lms unload not-local$|^lms unload --all' "$STATEFILE"; then
-    echo "unsafe unload detected" >&2
+@test "unload ignores loaded identifiers containing control characters" {
+  LMS_PS_JSON='[{"identifier":"runtime/id\ninjected"}]' run "$SCRIPT" unload runtime/id
+  assert_failure 1
+  assert_output --partial 'no unique exact loaded runtime ID associated with runtime/id'
+  if grep -q '^lms unload ' "$STATEFILE"; then
+    echo "malformed loaded identifier reached unload" >&2
     return 1
   fi
 }
 
-@test "local-models: unload --all-local propagates exact-id unload failures" {
-  LMS_PS_JSON='[{"identifier":"local/gpt-oss-120b"}]' LMS_UNLOAD_EXIT=5 run "$SCRIPT" unload --all-local
-  assert_failure 5
-  assert_output --partial "one or more local model unloads failed"
-}
-
-@test "local-models: runs cleanly under /bin/bash 3.2" {
-  run /bin/bash "$SCRIPT" list
+@test "unload resolves model keys only through exact loaded-instance associations" {
+  LMS_PS_JSON='[{"identifier":"runtime-id-z"}]' \
+    LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","loaded_instances":[{"id":"runtime-id-z","config":{"context_length":8192}}]}]}' \
+    run "$SCRIPT" unload org/model-z
   assert_success
-  assert_output --partial "qwen3-coder-next"
-  assert_output --partial "qwen/qwen3.8-27b"
+  grep -qxF 'lms unload runtime-id-z' "$STATEFILE"
 }
 
-# Writes a valid-shape OpenCode config with per-model limits so tests can
-# exercise the per-alias expected-context mapping in verify.
-# Args: gpt-oss-120b ctx, qwen3.5-122b-a10b ctx, qwen3.8-27b ctx,
-#       qwen3-coder-next ctx, output limit applied to all four.
-write_config_limits() {
-  local package="${6:-@ai-sdk/openai-compatible}"
-  local base_url="${7:-http://127.0.0.1:1234/v1}"
-  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<EOF_CONFIG
+@test "legacy --all-local remains limited to identifiers beginning local/" {
+  LMS_PS_JSON='[{"identifier":"local/first"},{"identifier":"runtime/model-z"},{"identifier":"local/second"}]' \
+    run "$SCRIPT" unload --all-local
+  assert_success
+  grep -qxF 'lms unload local/first' "$STATEFILE"
+  grep -qxF 'lms unload local/second' "$STATEFILE"
+  [ "$(grep -c '^lms unload ' "$STATEFILE")" -eq 2 ]
+  if grep -q '^lms unload runtime/model-z\|^lms unload --all' "$STATEFILE"; then
+    echo "legacy --all-local broadened beyond local/ IDs" >&2
+    return 1
+  fi
+}
+
+@test "native V2 provider accepts JSONC and non-roster model entries" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
 {
-  "provider": {
+  "providers": {
     "lmstudio": {
-      "npm": "$package",
-      "options": { "baseURL": "$base_url" },
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
       "models": {
-        "local/gpt-oss-120b": { "limit": { "context": $1, "output": $5 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": $2, "output": $5 } },
-        "local/qwen3.8-27b": { "limit": { "context": $3, "output": $5 } },
-        "local/qwen3-coder-next": { "limit": { "context": $4, "output": $5 } }
+        "local/one": { "modelID": "org/one", "limit": { "context": 8192, "output": 4096 } },
+        "local/two": { "modelID": "org/two" },
+      },
+    },
+  },
+}
+EOF
+  run "$SCRIPT" verify
+  assert_success
+  assert_output --partial 'runtime compatibility local/one: unverified'
+  assert_output --partial 'runtime compatibility local/two: unverified'
+}
+
+@test "selected load is not blocked by an unrelated uninstalled catalog model" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/catalog-name": { "modelID": "org/model-z", "limit": { "context": 8192 } },
+        "local/unrelated": { "modelID": "org/not-installed", "limit": { "context": 131072 } }
       }
     }
   }
 }
-EOF_CONFIG
+EOF
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":16384,"loaded_instances":[]}]}' \
+    run "$SCRIPT" load local/catalog-name --yes
+  assert_success
+  grep -q '^lms load org/model-z --identifier org/model-z --context-length 8192 --yes$' "$STATEFILE"
 }
 
-@test "local-models: verify rejects qwen3.8-27b context left at the old 32768 default" {
-  write_config_limits 32768 32768 32768 32768 8192
+@test "config parser rejects escaped delimiters instead of silently dropping context" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/catalog-name": { "modelID": "org/model-z", "limit": { "context": "8192\n-injected", "output": 4096 } }
+      }
+    }
+  }
+}
+EOF
   run "$SCRIPT" verify
   assert_failure 1
-  assert_output --partial "unexpected limits for local/qwen3.8-27b: context=32768 output=8192 (expected 131072/8192)"
-  assert_output --partial "OpenCode lmstudio model limits drifted"
+  assert_output --partial 'models.limit.context contains a tab, line break, or NUL'
+  refute_output --partial '-injected'
+  [ ! -s "$STATEFILE" ]
 }
 
-@test "local-models: verify under /bin/bash 3.2 accepts Qwen 131072 and others 32768" {
-  run /bin/bash "$SCRIPT" verify
+@test "partial fragment omits context when runtime context cannot be verified" {
+  rm "$LOCAL_MODELS_OPENCODE_CONFIG"
+  LMS_NATIVE_MODELS_JSON='{"models":[{"key":"org/model-z","max_context_length":8192,"loaded_instances":[]}]}' \
+    LMS_NATIVE_MODELS_AFTER_LOAD_JSON='{"models":[{"key":"org/model-z","max_context_length":8192,"loaded_instances":[{"id":"org/model-z","config":{}}]}]}' \
+    run "$SCRIPT" load org/model-z --context-length 4096 --yes
   assert_success
-  assert_output --partial "verification passed"
+  assert_output --partial '"status": "PARTIAL_REVIEW_REQUIRED"'
+  assert_output --partial 'Actual served ID or runtime context is unverified'
+  refute_output --partial '"context": 4096'
+  refute_output --partial '"output"'
 }
 
-@test "local-models: load qwen3.8-27b defaults to 131072 for estimate and actual load" {
-  run "$SCRIPT" load qwen3.8-27b --yes
+@test "legacy provider shape remains supported while invalid adapters fail closed" {
+  cat >"$LOCAL_MODELS_OPENCODE_CONFIG" <<'EOF'
+{
+  "provider": {
+    "lmstudio": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "local/catalog-name": { "modelID": "org/model-z", "limit": { "context": 8192 } },
+      },
+    },
+  },
+}
+EOF
+  run "$SCRIPT" verify
   assert_success
-  assert_output --partial "loaded qwen3.8-27b as local/qwen3.8-27b"
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --yes' "$STATEFILE"
-  if grep -qE '^lms load .*--context-length 32768' "$STATEFILE"; then
-    echo "qwen3.8-27b load used the 32768 default" >&2
+  assert_output --partial 'read-only verification complete'
+
+  sed 's/@ai-sdk\/openai-compatible/unsupported-adapter/' "$LOCAL_MODELS_OPENCODE_CONFIG" >"$STUBDIR/invalid.jsonc"
+  mv "$STUBDIR/invalid.jsonc" "$LOCAL_MODELS_OPENCODE_CONFIG"
+  : >"$STATEFILE"
+  run "$SCRIPT" verify
+  assert_failure 1
+  assert_output --partial 'provider.lmstudio.npm must be @ai-sdk/openai-compatible'
+  [ ! -s "$STATEFILE" ]
+}
+
+@test "load preserves TTL and explicit estimate confirmation flags" {
+  run "$SCRIPT" load local/catalog-name --ttl 60 --yes
+  assert_success
+  grep -qxF 'lms load org/model-z --identifier org/model-z --context-length 8192 --ttl 60 --yes' "$STATEFILE"
+}
+
+@test "legacy --all-local reports exact-ID unload failures" {
+  LMS_PS_JSON='[{"identifier":"local/first"}]' LMS_UNLOAD_EXIT=5 run "$SCRIPT" unload --all-local
+  assert_failure 5
+  assert_output --partial 'one or more local model unloads failed'
+}
+
+@test "load fails closed when native metadata and lms ps are unavailable" {
+  LMS_NATIVE_MODELS_FAIL=1 LMS_PS_EXIT=5 run "$SCRIPT" load local/catalog-name --yes
+  assert_failure 5
+  assert_output --partial 'lms ps --json failed'
+  if grep -q '^lms load ' "$STATEFILE"; then
+    echo "load estimate or load ran after lms ps failed" >&2
+    return 1
+  fi
+  if grep -q '^lms unload ' "$STATEFILE"; then
+    echo "unload ran after lms ps failed" >&2
     return 1
   fi
 }
 
-@test "local-models: load qwen3.8-27b under /bin/bash 3.2 defaults to 131072" {
-  run /bin/bash "$SCRIPT" load qwen3.8-27b --yes
-  assert_success
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --yes' "$STATEFILE"
+@test "status fails closed instead of reporting no loaded IDs when lms ps fails" {
+  LMS_PS_EXIT=5 run "$SCRIPT" status
+  assert_failure 5
+  assert_output --partial 'lms ps --json failed'
+  refute_output --partial 'loaded_runtime_identifiers: none'
 }
 
-@test "local-models: non-Qwen3.8 aliases keep the 32768 default for estimate and actual load" {
-  local alias source
-  for alias in gpt-oss-120b qwen3.5-122b-a10b qwen3-coder-next; do
-    : >"$STATEFILE"
-    case "$alias" in
-      gpt-oss-120b) source="gpt-oss-120b" ;;
-      qwen3.5-122b-a10b) source="qwen_qwen3.5-122b-a10b" ;;
-      qwen3-coder-next) source="qwen/qwen3-coder-next" ;;
-    esac
-    run "$SCRIPT" load "$alias" --yes
-    assert_success
-    grep -qxF "lms load $source --identifier local/$alias --context-length 32768 --estimate-only" "$STATEFILE"
-    grep -qxF "lms load $source --identifier local/$alias --context-length 32768 --yes" "$STATEFILE"
-  done
-}
-
-@test "local-models: explicit --context-length overrides the Qwen 131072 default without touching config" {
-  local before after
-  before="$(cksum <"$LOCAL_MODELS_OPENCODE_CONFIG")"
-  run "$SCRIPT" load qwen3.8-27b --context-length 65536 --yes
-  assert_success
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 65536 --estimate-only' "$STATEFILE"
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 65536 --yes' "$STATEFILE"
-  if grep -qE '^lms load .*--context-length 131072' "$STATEFILE"; then
-    echo "default context leaked past explicit override" >&2
+@test "unload --all-local fails closed when lms ps fails" {
+  LMS_PS_EXIT=5 run "$SCRIPT" unload --all-local
+  assert_failure 5
+  assert_output --partial 'lms ps --json failed'
+  refute_output --partial 'unloaded loaded local/ identifiers'
+  if grep -q '^lms unload ' "$STATEFILE"; then
+    echo "unload ran after lms ps failed" >&2
     return 1
   fi
-  after="$(cksum <"$LOCAL_MODELS_OPENCODE_CONFIG")"
-  [ "$before" = "$after" ]
 }
 
-@test "local-models: verify rejects an unchanged model whose context was raised to 131072" {
-  write_config_limits 131072 32768 131072 32768 8192
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "unexpected limits for local/gpt-oss-120b: context=131072 output=8192 (expected 32768/8192)"
-  refute_output --partial "unexpected limits for local/qwen3.8-27b"
-}
-
-@test "local-models: verify rejects a wrong output limit" {
-  write_config_limits 32768 32768 131072 32768 4096
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "unexpected limits for local/qwen3.8-27b: context=131072 output=4096 (expected 131072/8192)"
-  assert_output --partial "unexpected limits for local/gpt-oss-120b: context=32768 output=4096 (expected 32768/8192)"
-  assert_output --partial "OpenCode lmstudio model limits drifted"
-}
-
-@test "local-models: legacy config rejects wrong adapter and base URL before startup" {
-  write_config_limits 32768 32768 131072 32768 8192 "unsupported-adapter"
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "provider.lmstudio.npm must be @ai-sdk/openai-compatible"
-  [ ! -s "$STATEFILE" ]
-
-  write_config_limits 32768 32768 131072 32768 8192 "@ai-sdk/openai-compatible" "http://127.0.0.1:9999/v1"
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "provider.lmstudio.options.baseURL mismatch"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: native config rejects URL, model roster, and limit drift" {
-  write_native_config "@opencode/ai/providers/openai-compatible" "http://127.0.0.1:9999/v1"
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "providers.lmstudio.settings.baseURL mismatch"
-
-  write_native_config "@opencode/ai/providers/openai-compatible" "http://127.0.0.1:1234/v1" 32768 32768 32768
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "unexpected limits for local/qwen3.8-27b: context=32768 output=8192 (expected 131072/8192)"
-  assert_output --partial "OpenCode lmstudio model limits drifted"
-
-  write_native_config
-  sed 's/local\/qwen3-coder-next/local\/retired-model/' "$LOCAL_MODELS_OPENCODE_CONFIG" >"$STUBDIR/config.jsonc"
-  mv "$STUBDIR/config.jsonc" "$LOCAL_MODELS_OPENCODE_CONFIG"
-  run "$SCRIPT" verify
-  assert_failure 1
-  assert_output --partial "OpenCode lmstudio model keys do not match script mapping"
-  assert_output --partial "local/qwen3-coder-next"
-  assert_output --partial "local/retired-model"
-  [ ! -s "$STATEFILE" ]
-}
-
-@test "local-models: native config load uses stable identifier and configured context" {
-  write_native_config
-  run "$SCRIPT" load qwen3.8-27b --yes
-  assert_success
-  assert_output --partial "loaded qwen3.8-27b as local/qwen3.8-27b"
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --estimate-only' "$STATEFILE"
-  grep -qxF 'lms load qwen/qwen3.8-27b --identifier local/qwen3.8-27b --context-length 131072 --yes' "$STATEFILE"
-}
-
-@test "local-models: invalid native config blocks load before startup estimate or load" {
-  write_native_config "unsupported-adapter"
-  run "$SCRIPT" load qwen3.8-27b --yes
-  assert_failure 1
-  assert_output --partial "providers.lmstudio.package must be"
-  if grep -qE '^lms (server start|load )' "$STATEFILE"; then
-    echo "startup or load ran despite invalid config" >&2
+@test "exact-ID unload fails closed when lms ps fails" {
+  LMS_PS_EXIT=5 run "$SCRIPT" unload runtime/model-z
+  assert_failure 5
+  assert_output --partial 'lms ps --json failed'
+  if grep -q '^lms unload ' "$STATEFILE"; then
+    echo "exact-ID unload ran after lms ps failed" >&2
     return 1
   fi
-  [ ! -s "$STATEFILE" ]
 }
 
-@test "local-models: native provider config verifies under /bin/bash 3.2" {
-  write_native_config "aisdk:@ai-sdk/openai-compatible"
-  run /bin/bash "$SCRIPT" verify
-  assert_success
-  assert_output --partial "verification passed"
+@test "list fails upstream when lms ls exits unsuccessfully" {
+  LMS_LS_EXIT=7 run "$SCRIPT" list
+  assert_failure 5
+  assert_output --partial 'lms ls --json failed: synthetic lms ls failure'
+  refute_output --partial '  none'
+}
+
+@test "list rejects malformed lms ls JSON instead of reporting an empty inventory" {
+  LMS_LS_JSON='not-json' run "$SCRIPT" list
+  assert_failure 5
+  assert_output --partial 'could not parse lms ls --json output'
+  refute_output --partial '  none'
+}
+
+@test "load fails upstream when lms ls exits unsuccessfully before any runtime action" {
+  LMS_LS_EXIT=7 run "$SCRIPT" load local/catalog-name --yes
+  assert_failure 5
+  assert_output --partial 'lms ls --json failed: synthetic lms ls failure'
+  if grep -q '^lms server start\|^lms load\|^lms unload ' "$STATEFILE"; then
+    echo "runtime action ran after lms ls failed" >&2
+    return 1
+  fi
+}
+
+@test "load rejects malformed lms ls JSON before any runtime action" {
+  LMS_LS_JSON='not-json' run "$SCRIPT" load local/catalog-name --yes
+  assert_failure 5
+  assert_output --partial 'could not parse lms ls --json output'
+  refute_output --partial 'model key is not installed'
+  if grep -q '^lms server start\|^lms load\|^lms unload ' "$STATEFILE"; then
+    echo "runtime action ran after malformed lms ls JSON" >&2
+    return 1
+  fi
 }

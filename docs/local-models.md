@@ -1,23 +1,22 @@
 # LM Studio local models for OpenCode
 
-`personal/local-models.sh` manages the LM Studio runtime for four explicitly
-configured OpenCode models. It starts/verifies the server and loads/unloads
-models under stable `local/...` identifiers. The config may use either the
-legacy `provider.lmstudio` shape or native OpenCode v2 `providers.lmstudio`;
-model discovery remains based on the configured model entries, not on a dynamic
-LM Studio listing.
+`personal/local-models.sh` discovers installed LM Studio models and reconciles
+exact runtime identities with the OpenCode LM Studio catalog. It does not keep a
+second hardcoded model roster. Discovery/status commands are read-only; only
+explicit `start`, `load`, or `unload` commands can have runtime side effects.
 
 ## OpenCode provider config
 
 The default config is `~/.config/opencode/opencode.jsonc`. The helper accepts
-these complete LM Studio provider shapes:
+the native OpenCode V2 `providers.lmstudio` shape and the existing legacy
+`provider.lmstudio` shape. In either form, the selected provider must use the
+OpenAI-compatible adapter and the matching `http://127.0.0.1:1234/v1` endpoint.
+JSONC comments and trailing commas are accepted. When the native provider exists
+it takes precedence; provider fields are not combined across shapes.
 
-| Config shape | Adapter field | Accepted value | Endpoint field |
-| --- | --- | --- | --- |
-| Legacy `provider.lmstudio` | `npm` | `@ai-sdk/openai-compatible` | `options.baseURL` |
-| Native v2 `providers.lmstudio` | `package` | `@opencode/ai/providers/openai-compatible` or `aisdk:@ai-sdk/openai-compatible` | `settings.baseURL` |
-
-For example, the native v2 provider uses:
+OpenCode catalog keys can be friendly names. `modelID`, when present, is the
+exact ID sent to LM Studio; otherwise the catalog key is the effective API ID.
+For example:
 
 ```jsonc
 {
@@ -26,161 +25,148 @@ For example, the native v2 provider uses:
       "package": "@opencode/ai/providers/openai-compatible",
       "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
       "models": {
-        "local/gpt-oss-120b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.5-122b-a10b": { "limit": { "context": 32768, "output": 8192 } },
-        "local/qwen3.8-27b": { "limit": { "context": 131072, "output": 8192 } },
-        "local/qwen3-coder-next": { "limit": { "context": 32768, "output": 8192 } }
+        "local/catalog-name": {
+          "modelID": "org/model-z",
+          "limit": { "context": 8192, "output": 4096 }
+        }
       }
     }
   }
 }
 ```
 
-If `providers.lmstudio` is present, it takes precedence and is validated as a
-whole. The helper does not fall back to the legacy entry or combine fields
-between formats. Do not mix legacy `npm`/`options` fields into a native entry,
-or native `package`/`settings` fields into a legacy entry. The selected
-provider's `baseURL` must match the runtime endpoint below. JSONC comments and
-trailing commas are accepted. In either format, `models` is keyed by the exact
-`local/...` identifiers and each entry needs `limit.context` and `limit.output`.
+The curated config contains six friendly `local/...` entries. The helper also
+allows loading other installed non-embedding models without adding them to the
+picker. It resolves a catalog entry to an installed model only by exact IDs and
+the LM Studio model-key association; it never matches display names or uses
+fuzzy matching. Duplicate or ambiguous IDs are reported rather than guessed.
 
-`verify` validates this config before starting or checking the LM Studio
-server. An invalid config therefore stops `verify` and `load` before runtime
-startup, memory estimation, or model loading.
+## Discovery and compatibility
 
-## LM Studio API endpoint
+`list` reads `lms ls --json`, shows every installed non-embedding model key,
+and does not start LM Studio. Decision-type models are not excluded based on
+unverified chat-compatibility assumptions.
 
-The v1 endpoint is pinned to:
+When the server is already running, `status` and `verify` can read LM Studio's
+documented `GET /api/v1/models` metadata. The helper uses exact `models[].key`
+and `loaded_instances[].id` associations, plus reported maximum and loaded
+context where available. That documented response shape has not been measured
+against every LM Studio runtime; missing or malformed metadata is reported as
+unverified, not treated as compatible.
 
-```text
-http://127.0.0.1:1234/v1
-```
+For a configured model, OpenCode's `limit.context` is the minimum runtime
+context needed for compatibility. A larger actual runtime context is okay; a
+smaller one is incompatible. The helper checks a known LM Studio maximum before
+loading and compares actual context after loading. It refuses to reload an
+existing instance with a mismatched ID, unknown context, or insufficient
+context; resolve it manually rather than relying on automatic unload/reload.
 
-`local-models.sh start` uses `lms server start --bind 127.0.0.1 --port 1234` and
-then verifies `/v1/models` with curl. It also checks LM Studio CLI status so a
-random OpenAI-compatible service on the same port does not silently pass.
+`list`, `status`, and `verify` are read-only and never start the server. `verify`
+does not require every installed or configured model to be loaded and does not
+let an unrelated model block loading the selected model. When the server is
+stopped, compatibility is reported as unverified. `start` is the explicit
+command that may start the LM Studio server; it preserves the existing endpoint
+identity check and refuses to treat a foreign service as LM Studio.
 
-If LM Studio is already running somewhere else, the script does not kill or
-restart it. It fails with guidance instead.
+`verify` exits nonzero for a known incompatibility, such as a loaded context
+below the configured context or a loaded ID that differs from the configured
+`modelID`. Missing runtime metadata, an unloaded model, or a stopped server is
+reported as unverified and is not treated as a compatibility success or a
+known incompatibility.
 
 ## Commands
 
 ```bash
 local-models list
 local-models status
-local-models start
 local-models verify
-local-models load qwen3.8-27b
-local-models load qwen3.8-27b --context-length 4096 --ttl 600 --yes
-local-models unload qwen3.8-27b
+local-models start
+local-models load org/model-z
+local-models load local/catalog-name --context-length 131072 --ttl 600 --yes
+local-models unload org/model-z
 local-models unload --all-local
 ```
 
-- `list` shows aliases, LM Studio source keys, stable identifiers, and best-effort installed/loaded status.
-- `status` shows server/endpoint state, loaded `local/...` identifiers, and config alignment.
-- `start` starts/verifies the server only; it never loads a model.
-- `verify` checks CLI dependencies, validates OpenCode config, then checks the endpoint and installed source models. Invalid config is rejected before any `lms` or curl runtime call. Loaded models are not required.
-- `load` estimates first, then loads with `--identifier local/...` so the API ID exactly matches OpenCode's configured model ID.
-- `unload <alias>` unloads only the exact stable ID for that alias.
-- `unload --all-local` unloads loaded IDs beginning `local/`; it does not call `lms unload --all`.
+- `list` prints installed non-embedding LM Studio model keys.
+- `status` reports server/endpoint state, every loaded runtime ID, config state,
+  and best-effort compatibility.
+- `verify` checks config validity and reports exact runtime compatibility when
+  metadata is available. It does not start the server.
+- `start` may start the pinned server but never loads models.
+- `load [model-key|catalog-key]` accepts an exact installed model key or exact
+  configured catalog key. If omitted in a TTY, a numbered model menu is shown.
+- `--identifier ID` overrides the API identifier for a new load. Without a
+  configured catalog mapping, the default identifier is the exact source model
+  key and is passed explicitly to `lms load --identifier`.
+- `unload <identifier|model-key>` unloads one exact runtime ID. A model key is
+  resolved only through the exact loaded-instance association.
+- Legacy `unload --all-local` retains its existing `local/` prefix scope. It
+  does not claim ownership of every discovered model or unload every model.
 
-## Context sizing and estimate prompts
+## Context and loading guardrails
 
-Default load context is per alias. `verify` checks the selected provider's
-`models["local/..."]` entries against these context and output limits, so the
-load default and OpenCode limits cannot silently diverge:
+For a configured catalog entry, `load` uses its positive `limit.context` by
+default. If no usable context is configured, pass `--context-length N` or make
+an explicit choice at the TTY prompt. A missing config is allowed only with an
+explicit context (or interactive context choice), with a warning that OpenCode
+compatibility is not established. The helper never edits OpenCode config.
 
-| Alias | Default load context / expected OpenCode `limit.context` | OpenCode `limit.output` |
-| --- | --- | --- |
-| `qwen3.8-27b` | `131072` | `8192` |
-| `gpt-oss-120b` | `32768` | `8192` |
-| `qwen3.5-122b-a10b` | `32768` | `8192` |
-| `qwen3-coder-next` | `32768` | `8192` |
+`--context-length N` is the requested context for this load. It cannot be lower
+than a configured OpenCode context because that would create a known-incompatible
+load. If LM Studio reports a maximum context, values above it are rejected. An
+advisory low-context threshold defaults to `65536`; set
+`LOCAL_MODELS_LOW_CONTEXT_THRESHOLD` to change it. Falling below the threshold
+warns but does not block the load.
 
-`verify` maps each OpenCode `local/...` key back to its alias and fails if
-`limit.context` differs from that alias's default or if `limit.output` is not
-`8192`. The context value lives in `model_context_length` in
-`personal/local-models.sh`.
+Before a new load, the helper keeps the existing estimate and confirmation
+guardrails. It auto-loads only when memory is parseable, at most `16 GiB`, the
+estimate is favorable, and confidence is recognized as high or medium. Other
+estimates require a TTY confirmation or `--yes`; noninteractive prompt-required
+loads fail cleanly. `--ttl` is passed to the specific load. An unambiguously
+matching loaded instance with enough runtime context is reused without a second
+load. Existing mismatches are reported; the helper does not silently unload or
+reload them.
 
-Override for a single load with:
+A load command's success is not proof of OpenCode compatibility. The helper
+reports verified, incompatible, or unverified runtime identity/context after a
+load. If the requested model loaded but its actual context is below the
+configured context, it reports incompatibility and leaves the instance for an
+explicit user decision.
 
-```bash
-local-models load qwen3-coder-next --context-length 8192
-```
+## Partial model-map output
 
-`--context-length N` affects only that load. It does not edit OpenCode config.
-A runtime context **lower** than the OpenCode `limit.context` for that model
-creates a mismatch: OpenCode will budget against the configured window and can
-send requests the loaded model cannot hold. Prefer the default unless you are
-deliberately testing a smaller window.
+When loading a model without a matching OpenCode catalog entry, the helper can
+print a JSON envelope labeled `PARTIAL_REVIEW_REQUIRED`. Its `providers` model
+fragment is keyed by the actual served ID and includes context only when that
+context was verified. Unknown ID/context claims are omitted. The fragment does
+not invent a name, output limit, or capabilities, and is not a complete
+OpenCode-ready model profile.
 
-Before loading, the script runs `lms load ... --estimate-only` and parses:
+OpenCode's custom-model fallback assumptions include 200000 context, 32000
+output, tools, and images. Review the real output limit and capabilities before
+manually copying the model fragment into `opencode.jsonc`. The helper never
+writes config automatically.
 
-- `Estimated Total Memory`
-- `Confidence:`
-- favorable/unfavorable estimate prose
+## Curated local catalog baseline
 
-It auto-loads only when memory is parseable, at most `16 GiB`, the estimate text
-is clearly favorable, and confidence is recognized and not `LOW`. Otherwise it
-prompts. In non-interactive shells, prompt-required loads fail unless `--yes` is
-passed.
+The config preserves friendly keys and maps them to exact LM Studio model IDs:
 
-### Applying config and context changes
+| OpenCode key | LM Studio `modelID` | Context | Output | Sampling (`temperature`, `top_p`, `top_k`) |
+| --- | --- | ---: | ---: | --- |
+| `local/qwen3.8-27b` | `qwen/qwen3.8-27b` | 131072 | 16384 | `1`, `0.95`, `20` |
+| `local/qwen3.8-27b-splash` | `qwen3.8-27b-splash` | 131072 | 16384 | `1`, `0.95`, `20` |
+| `local/qwen3.8-flash-next-gsq-rco` | `qwen3.8-flash-next-gsq-rco` | 131072* | 16384 | `1`, `0.95`, `20` |
+| `local/qwen3-coder-next` | `qwen/qwen3-coder-next` | 131072 | 8192 | `1`, `0.95`, `40` |
+| `local/qwen3.5-122b-a10b` | `qwen_qwen3.5-122b-a10b` | 131072 | 16384 | `0.6`, `0.95`, `20` |
+| `local/gpt-oss-120b` | `gpt-oss-120b` | 131072 | 16384 | `1`, `1`, `0` |
 
-OpenCode reloads config changes automatically. If an edit is not reflected,
-use `/reload` in OpenCode. Reloading config does not change the context of a
-model already loaded in LM Studio. To change a loaded model's context, unload
-that alias and load it again with the desired context; the helper does not do
-this automatically. For example:
+`*` Flash's 131072 context is an experimental config target, not a verified
+runtime fit. No live model load or inference was performed for this change.
+CoderNext and GPT-OSS explicitly declare text input/output so OpenCode does not
+implicitly advertise image input for those known text-only models. Native
+reasoning-effort forwarding is not asserted.
 
-```bash
-local-models unload qwen3.8-27b
-local-models load qwen3.8-27b
-```
-
-The second command uses the configured `131072` default, runs the memory
-estimate, and may ask for confirmation. Configured context is not a guarantee
-of runtime memory use or performance.
-
-## Managed model mapping
-
-| Alias | LM Studio source | Stable identifier / OpenCode model ID | Format |
-| --- | --- | --- | --- |
-| `gpt-oss-120b` | `gpt-oss-120b` | `local/gpt-oss-120b` | GGUF |
-| `qwen3.5-122b-a10b` | `qwen_qwen3.5-122b-a10b` | `local/qwen3.5-122b-a10b` | GGUF |
-| `qwen3.8-27b` | `qwen/qwen3.8-27b` | `local/qwen3.8-27b` | MLX 8-bit |
-| `qwen3-coder-next` | `qwen/qwen3-coder-next` | `local/qwen3-coder-next` | MLX 6-bit |
-
-The LM Studio source is the plain `modelKey` from `lms ls --json`, without the
-`@6bit`/`@8bit` variant suffix LM Studio shows for MLX models.
-
-Embedding models are not part of this script-managed OpenCode roster.
-
-## Adding, removing, or updating a managed model
-
-There is no dynamic `local-models.sh add` command yet. For now:
-
-1. Edit the hardcoded mapping functions in `personal/local-models.sh`
-   (including `model_context_length` for the alias's default context).
-2. Add/remove the matching `models."local/..."` entry under the selected
-   `provider.lmstudio` or `providers.lmstudio` block in
-   `~/.config/opencode/opencode.jsonc`. Set `limit.context` to the alias's
-   default and `limit.output` to `8192`.
-3. Keep the selected provider shape and adapter consistent with the table
-   above, and set its format-specific endpoint field to
-   `http://127.0.0.1:1234/v1`.
-4. Run:
-
-   ```bash
-   local-models verify
-   ./tests/test_helper/bats-core/bin/bats tests/local-models.bats
-   ```
-
-5. OpenCode reloads config edits automatically. If the change is not visible,
-   use `/reload` in OpenCode. Reloading the config does not reload an already
-   loaded LM Studio model; unload and load that alias again if its runtime
-   context needs to change.
-
-Future work: add `local-models.sh add` to inspect installed LM Studio models,
-generate a safe stable identifier, update OpenCode config, and extend the drift
-guard tests automatically.
+Earlier helper versions loaded friendly `local/...` IDs directly. The current
+catalog maps those friendly keys to actual model IDs. If a legacy ID is already
+loaded, inspect `lms ps --json` and unload only the exact old ID before loading
+the selected model again; the helper will not silently perform that transition.

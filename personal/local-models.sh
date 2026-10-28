@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # local-models.sh — manage LM Studio local models used by OpenCode.
 #
-# The OpenCode config statically lists stable local/... model identifiers.
-# This script owns the runtime side: start/verify LM Studio, load models under
-# those exact identifiers, and unload only the local identifiers it owns.
+# Discover installed LM Studio models and reconcile selected IDs with OpenCode.
+# Runtime actions are explicit; discovery/status do not start the server.
 
 set -uo pipefail
 
@@ -17,50 +16,37 @@ OPENCODE_CONFIG="${LOCAL_MODELS_OPENCODE_CONFIG:-$HOME/.config/opencode/opencode
 LMS_BIN="${LOCAL_MODELS_LMS_BIN:-lms}"
 CURL_BIN="${LOCAL_MODELS_CURL_BIN:-curl}"
 PYTHON_BIN="${LOCAL_MODELS_PYTHON_BIN:-python3}"
-DEFAULT_CONTEXT_LENGTH=32768
-DEFAULT_OUTPUT_LIMIT=8192
 MEMORY_AUTO_LIMIT_GIB=16
+LOW_CONTEXT_THRESHOLD="${LOCAL_MODELS_LOW_CONTEXT_THRESHOLD:-65536}"
 
 usage() {
   cat <<'EOF'
 Usage: local-models <command> [OPTIONS]
 
-Manage LM Studio local models for OpenCode's static lmstudio provider config.
-The runtime is explicit: start/verify never loads a model; load always uses the
-stable local/... identifier that OpenCode is configured to show in the TUI.
+Manage installed non-embedding LM Studio models for OpenCode.
+Discovery is dynamic; configured catalog IDs take precedence, otherwise a load
+uses the exact LM Studio model key as its API identifier.
 
 Commands:
   help, -h, --help
       Show this help.
   list
-      Show aliases, LM Studio source keys, stable identifiers, and status.
+      Show every installed non-embedding LM Studio model key.
   status
-      Show endpoint/server status, loaded local identifiers, and config status.
+      Show endpoint/server status, loaded runtime identifiers, and compatibility.
   start
       Start LM Studio server on http://127.0.0.1:1234/v1 if needed and verify
       /v1/models responds. Does not load models.
   verify
-      Strictly check CLI, endpoint, installed source models, and OpenCode config
-      drift. Loaded models are not required.
-  load <alias> [--context-length N] [--ttl seconds] [-y|--yes]
-      Estimate first, then load the source model as the exact stable identifier.
-      Default context length is per alias and matches the OpenCode limit.context
-      that verify expects: 131072 for qwen3.8-27b, 32768 for the others.
-      --context-length N overrides this load only; it does not change OpenCode
-      config, and a value below OpenCode's configured context can make OpenCode
-      overrun the loaded model. A prompt is required for large, low-
-      confidence, missing-confidence, or unfavorable estimates unless --yes is
-      passed. Non-interactive prompt-required runs fail cleanly.
-  unload <alias>
-      Unload only that alias's exact stable identifier.
+      Check configuration and runtime compatibility without starting LM Studio.
+  load [model-key|catalog-key] [--identifier ID] [--context-length N]
+       [--ttl seconds] [-y|--yes]
+      Load one discovered model. If the key is omitted, choose from a numbered
+      TTY menu. Estimate and confirm before loading.
+  unload <identifier|model-key>
+      Unload only the exact resolved runtime identifier.
   unload --all-local
       Unload only loaded identifiers beginning with local/.
-
-Aliases:
-  gpt-oss-120b        -> gpt-oss-120b                   -> local/gpt-oss-120b
-  qwen3.5-122b-a10b   -> qwen_qwen3.5-122b-a10b         -> local/qwen3.5-122b-a10b
-  qwen3.8-27b         -> qwen/qwen3.8-27b               -> local/qwen3.8-27b
-  qwen3-coder-next    -> qwen/qwen3-coder-next          -> local/qwen3-coder-next
 
 Environment overrides for tests/advanced use:
   LOCAL_MODELS_LMS_BIN          lms binary path/name
@@ -68,62 +54,10 @@ Environment overrides for tests/advanced use:
   LOCAL_MODELS_PYTHON_BIN       python3 binary path/name
   LOCAL_MODELS_OPENCODE_CONFIG  OpenCode JSONC config path
   LOCAL_MODELS_BASE_URL         OpenAI-compatible base URL
+  LOCAL_MODELS_LOW_CONTEXT_THRESHOLD  Advisory context threshold (default 65536)
 
 Exit codes follow lib/common.sh: 1 runtime, 2 usage, 3 missing dep, 5 upstream.
 EOF
-}
-
-all_aliases() {
-  cat <<'EOF'
-gpt-oss-120b
-qwen3.5-122b-a10b
-qwen3.8-27b
-qwen3-coder-next
-EOF
-}
-
-model_source() {
-  case "$1" in
-    gpt-oss-120b) echo "gpt-oss-120b" ;;
-    qwen3.5-122b-a10b) echo "qwen_qwen3.5-122b-a10b" ;;
-    qwen3.8-27b) echo "qwen/qwen3.8-27b" ;;
-    qwen3-coder-next) echo "qwen/qwen3-coder-next" ;;
-    *) return 1 ;;
-  esac
-}
-
-model_identifier() {
-  case "$1" in
-    gpt-oss-120b) echo "local/gpt-oss-120b" ;;
-    qwen3.5-122b-a10b) echo "local/qwen3.5-122b-a10b" ;;
-    qwen3.8-27b) echo "local/qwen3.8-27b" ;;
-    qwen3-coder-next) echo "local/qwen3-coder-next" ;;
-    *) return 1 ;;
-  esac
-}
-
-# Per-alias default load context. This is the single source of truth for both
-# `load` defaults and the expected OpenCode limit.context checked by verify.
-model_context_length() {
-  case "$1" in
-    qwen3.8-27b) echo "131072" ;;
-    gpt-oss-120b | qwen3.5-122b-a10b | qwen3-coder-next) echo "$DEFAULT_CONTEXT_LENGTH" ;;
-    *) return 1 ;;
-  esac
-}
-
-# Reverse lookup: stable local/... identifier -> alias.
-identifier_alias() {
-  local alias
-  while IFS= read -r alias; do
-    if [[ "$(model_identifier "$alias")" == "$1" ]]; then
-      echo "$alias"
-      return 0
-    fi
-  done <<EOF
-$(all_aliases)
-EOF
-  return 1
 }
 
 require_runtime_deps() {
@@ -135,12 +69,6 @@ require_runtime_deps() {
   fi
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     die_missing_dep "'python3' is required but not found, or set LOCAL_MODELS_PYTHON_BIN."
-  fi
-}
-
-require_alias() {
-  if ! model_source "$1" >/dev/null 2>&1; then
-    die_usage "unknown local model alias: $1 (run: local-models list)"
   fi
 }
 
@@ -165,6 +93,13 @@ configured_port() {
 
 models_url() {
   printf '%s/models\n' "${BASE_URL%/}"
+}
+
+native_models_url() {
+  local server_url
+  server_url="${BASE_URL%/}"
+  server_url="${server_url%/v1}"
+  printf '%s/api/v1/models\n' "${server_url%/}"
 }
 
 endpoint_responds() {
@@ -348,25 +283,40 @@ require_status_matches_config() {
 }
 
 installed_sources() {
-  local out
+  local out sources
   if ! out="$({ "$LMS_BIN" ls --json; } 2>&1)"; then
     die_upstream "lms ls --json failed: $out"
   fi
-  LOCAL_MODELS_JSON="$out" python_json_helper <<'PY'
+  if ! sources="$(
+    LOCAL_MODELS_JSON="$out" python_json_helper <<'PY'
 import json, sys
 import os
 try:
     data = json.loads(os.environ.get('LOCAL_MODELS_JSON', ''))
 except Exception:
     sys.exit(1)
-for item in data if isinstance(data, list) else []:
-    if item.get("type") == "embedding":
+if isinstance(data, dict):
+    if isinstance(data.get("models"), list):
+        data = data["models"]
+    elif isinstance(data.get("data"), list):
+        data = data["data"]
+    else:
+        sys.exit(1)
+if not isinstance(data, list):
+    sys.exit(1)
+for item in data:
+    if not isinstance(item, dict):
         continue
-    for key in ("modelKey", "indexedModelIdentifier", "path"):
-        value = item.get(key)
-        if value:
-            print(value)
+    if str(item.get("type", "")).lower() == "embedding":
+        continue
+    value = item.get("modelKey")
+    if isinstance(value, str) and value and not any(ch in value for ch in "\t\r\n\x00"):
+        print(value)
 PY
+  )"; then
+    die_upstream "could not parse lms ls --json output"
+  fi
+  printf '%s\n' "$sources"
 }
 
 loaded_identifiers() {
@@ -383,17 +333,81 @@ except Exception:
     sys.exit(1)
 if isinstance(data, dict):
     data = data.get("models") or data.get("data") or []
+
+def safe_identifier(value):
+    return isinstance(value, str) and value and not any(ch in value for ch in "\t\r\n\x00")
+
 for item in data if isinstance(data, list) else []:
     if isinstance(item, str):
-        print(item)
+        if safe_identifier(item):
+            print(item)
         continue
     if not isinstance(item, dict):
         continue
     for key in ("identifier", "id", "modelIdentifier", "loadedIdentifier"):
         value = item.get(key)
-        if value:
+        if safe_identifier(value):
             print(value)
             break
+PY
+}
+
+native_models_report() {
+  local raw
+  if ! raw="$({ "$CURL_BIN" -fsS "$(native_models_url)"; } 2>/dev/null)"; then
+    return 1
+  fi
+  LOCAL_MODELS_JSON="$raw" python_json_helper <<'PY'
+import json
+import os
+import sys
+
+try:
+    data = json.loads(os.environ.get("LOCAL_MODELS_JSON", ""))
+except Exception:
+    sys.exit(1)
+
+models = data.get("models") if isinstance(data, dict) else data
+if not isinstance(models, list):
+    sys.exit(1)
+print("NATIVE\tavailable")
+
+def safe(value):
+    return isinstance(value, str) and value and not any(ch in value for ch in "\t\r\n\x00")
+
+def positive_integer(value):
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int) and value > 0:
+        return str(value)
+    return ""
+
+for model in models:
+    if not isinstance(model, dict):
+        continue
+    key = model.get("key")
+    if not safe(key):
+        continue
+    maximum = positive_integer(model.get("max_context_length"))
+    print("MODEL\t{}\t{}".format(key, maximum))
+    if "loaded_instances" not in model:
+        print("ASSOCIATION_UNKNOWN\t{}".format(key))
+        continue
+    instances = model.get("loaded_instances")
+    if not isinstance(instances, list):
+        print("ASSOCIATION_UNKNOWN\t{}".format(key))
+        continue
+    for instance in instances:
+        if not isinstance(instance, dict):
+            print("ASSOCIATION_UNKNOWN\t{}".format(key))
+            continue
+        identifier = instance.get("id")
+        if not safe(identifier):
+            print("ASSOCIATION_UNKNOWN\t{}".format(key))
+            continue
+        config = instance.get("config")
+        context = positive_integer(config.get("context_length")) if isinstance(config, dict) else ""
+        print("INSTANCE\t{}\t{}\t{}".format(key, identifier, context))
 PY
 }
 
@@ -516,7 +530,7 @@ if not isinstance(base_url, str):
 adapter = report_field(adapter, '{}.{}'.format(provider_path, adapter_field))
 base_url = report_field(base_url, '{}.{}.{}'.format(provider_path, settings_field, url_field))
 
-models = provider.get('models')
+models = provider.get('models', {})
 if not isinstance(models, dict):
     fail('{}.models must be an object'.format(provider_path))
 
@@ -528,28 +542,47 @@ for key in sorted(models):
     model = models[key]
     if not isinstance(model, dict):
         fail('{}.models.{} must be an object'.format(provider_path, key))
-    limit = model.get('limit')
+    model_id = model.get('modelID') or key
+    if not isinstance(model_id, str):
+        fail('{}.models.{}.modelID must be a string'.format(provider_path, key))
+    limit = model.get('limit', {})
     if not isinstance(limit, dict):
         fail('{}.models.{}.limit must be an object'.format(provider_path, key))
-    if 'context' not in limit or 'output' not in limit:
-        fail('{}.models.{}.limit must include context and output'.format(provider_path, key))
-    context = report_field(limit['context'], '{}.models.limit.context'.format(provider_path))
-    output = report_field(limit['output'], '{}.models.limit.output'.format(provider_path))
-    print('MODEL\t{}\t{}\t{}'.format(key, context, output))
+    context_value = limit.get('context')
+    output_value = limit.get('output')
+    context = ''
+    output = ''
+    if context_value not in (None, ''):
+        if isinstance(context_value, str):
+            context_value = report_field(context_value, '{}.models.limit.context'.format(provider_path))
+            if not re.fullmatch(r'[0-9]+', context_value) or int(context_value) < 1:
+                fail('{}.models.limit.context must be a positive integer'.format(provider_path))
+            context = context_value
+        elif isinstance(context_value, int) and not isinstance(context_value, bool) and context_value > 0:
+            context = str(context_value)
+        else:
+            fail('{}.models.limit.context must be a positive integer'.format(provider_path))
+    if output_value not in (None, ''):
+        if isinstance(output_value, str):
+            output_value = report_field(output_value, '{}.models.limit.output'.format(provider_path))
+            if not re.fullmatch(r'[0-9]+', output_value) or int(output_value) < 1:
+                fail('{}.models.limit.output must be a positive integer'.format(provider_path))
+            output = output_value
+        elif isinstance(output_value, int) and not isinstance(output_value, bool) and output_value > 0:
+            output = str(output_value)
+        else:
+            fail('{}.models.limit.output must be a positive integer'.format(provider_path))
+    model_id = report_field(model_id, '{}.models.{}.modelID'.format(provider_path, key))
+    context = report_field(context, '{}.models.limit.context'.format(provider_path))
+    output = report_field(output, '{}.models.limit.output'.format(provider_path))
+    print('MODEL\t{}\t{}\t{}\t{}'.format(key, model_id, context, output))
 PY
-}
-
-expected_identifiers() {
-  local alias
-  all_aliases | while IFS= read -r alias; do
-    model_identifier "$alias"
-  done
 }
 
 validate_config() {
   [[ -f "$OPENCODE_CONFIG" ]] || die "OpenCode config not found: $OPENCODE_CONFIG"
 
-  local report report_error_kind report_error_message provider_format adapter base expected actual missing extra bad_limits line key ctx out alias expected_ctx
+  local report report_error_kind report_error_message provider_format adapter base
   report="$(jsonc_config_report)"
   report_error_kind="$(printf '%s\n' "$report" | awk -F '\t' '$1=="ERROR" {print $2; exit}')"
   if [[ -n "$report_error_kind" ]]; then
@@ -580,32 +613,213 @@ validate_config() {
       ;;
   esac
 
-  expected="$(expected_identifiers | sort)"
-  actual="$(printf '%s\n' "$report" | awk -F '\t' '$1=="MODEL" {print $2}' | sort)"
-  missing="$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))"
-  extra="$(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))"
-  if [[ -n "$missing" || -n "$extra" ]]; then
-    {
-      printf 'OpenCode lmstudio model keys do not match script mapping.\n'
-      [[ -z "$missing" ]] || printf 'Missing:\n%s\n' "$missing"
-      [[ -z "$extra" ]] || printf 'Extra:\n%s\n' "$extra"
-    } >&2
-    exit 1
-  fi
+  info "OpenCode LM Studio provider config is valid; model catalog is not roster-locked"
+}
 
-  bad_limits=0
-  while IFS=$'\t' read -r line key ctx out; do
-    [[ "$line" == "MODEL" ]] || continue
-    alias="$(identifier_alias "$key")" || die "no alias maps to OpenCode lmstudio model key: $key"
-    expected_ctx="$(model_context_length "$alias")" || die "no default context length for alias: $alias"
-    if [[ "$ctx" != "$expected_ctx" || "$out" != "$DEFAULT_OUTPUT_LIMIT" ]]; then
-      warn "unexpected limits for $key: context=$ctx output=$out (expected ${expected_ctx}/${DEFAULT_OUTPUT_LIMIT})"
-      bad_limits=1
+report_compatibility() {
+  local config_report="$1"
+  local runtime_report="$2"
+  LOCAL_MODELS_CONFIG_REPORT="$config_report" LOCAL_MODELS_RUNTIME_REPORT="$runtime_report" python_json_helper <<'PY'
+import os
+import sys
+
+configured = []
+for line in os.environ.get("LOCAL_MODELS_CONFIG_REPORT", "").splitlines():
+    fields = line.split("\t")
+    if fields[0] == "MODEL" and len(fields) == 5:
+        configured.append({"key": fields[1], "id": fields[2], "context": fields[3]})
+
+runtime_models = []
+instances = []
+unknown_associations = set()
+runtime_available = False
+for line in os.environ.get("LOCAL_MODELS_RUNTIME_REPORT", "").splitlines():
+    fields = line.split("\t")
+    if fields[0] == "NATIVE":
+        runtime_available = True
+    elif fields[0] == "MODEL" and len(fields) == 3:
+        runtime_models.append({"key": fields[1], "max": fields[2]})
+    elif fields[0] == "INSTANCE" and len(fields) == 4:
+        instances.append({"key": fields[1], "id": fields[2], "context": fields[3]})
+    elif fields[0] == "ASSOCIATION_UNKNOWN" and len(fields) == 2:
+        unknown_associations.add(fields[1])
+
+if not configured:
+    print("runtime compatibility: unverified (no configured model entries)")
+known_incompatible = False
+for model in configured:
+    label = model["key"]
+    matches = [item for item in runtime_models if item["key"] == model["id"]]
+    if not matches:
+        reason = "native metadata unavailable" if not runtime_available else "no exact LM Studio model-key association"
+        print("runtime compatibility {}: unverified ({})".format(label, reason))
+        continue
+    if len(matches) != 1:
+        print("runtime compatibility {}: ambiguous duplicate runtime model key".format(label))
+        continue
+    loaded = [item for item in instances if item["key"] == model["id"]]
+    if not loaded:
+        if model["id"] in unknown_associations:
+            print("runtime compatibility {}: unverified (loaded-instance association unavailable)".format(label))
+        else:
+            print("runtime compatibility {}: unverified (model is not loaded)".format(label))
+        continue
+    if len(loaded) != 1:
+        print("runtime compatibility {}: ambiguous loaded instances".format(label))
+        continue
+    instance = loaded[0]
+    duplicate_ids = [item for item in instances if item["id"] == instance["id"]]
+    if len(duplicate_ids) != 1:
+        print("runtime compatibility {}: ambiguous duplicate loaded runtime ID {}".format(label, instance["id"]))
+        continue
+    if instance["id"] != model["id"]:
+        print("runtime compatibility {}: incompatible (loaded ID {}, configured modelID {})".format(label, instance["id"], model["id"]))
+        known_incompatible = True
+        continue
+    if not model["context"] or not instance["context"]:
+        print("runtime compatibility {}: unverified (configured or actual context is missing)".format(label))
+        continue
+    if int(instance["context"]) < int(model["context"]):
+        print("runtime compatibility {}: incompatible (actual context {} is below configured {})".format(label, instance["context"], model["context"]))
+        known_incompatible = True
+    else:
+        print("runtime compatibility {}: compatible (actual context {})".format(label, instance["context"]))
+sys.exit(1 if known_incompatible else 0)
+PY
+}
+
+print_partial_model_fragment() {
+  local identifier="$1"
+  local context="$2"
+  LOCAL_MODELS_FRAGMENT_ID="$identifier" LOCAL_MODELS_FRAGMENT_CONTEXT="$context" python_json_helper <<'PY'
+import json
+import os
+
+identifier = os.environ.get("LOCAL_MODELS_FRAGMENT_ID", "")
+context = os.environ.get("LOCAL_MODELS_FRAGMENT_CONTEXT", "")
+warning = "PARTIAL_REVIEW_REQUIRED: OpenCode custom-model defaults include 200000 context and 32000 output, plus tools and images; verify output and capabilities before use."
+result = {"status": "PARTIAL_REVIEW_REQUIRED", "review_warning": warning}
+if identifier and context.isdigit():
+    result["providers"] = {"lmstudio": {"models": {identifier: {"modelID": identifier, "limit": {"context": int(context)}}}}}
+else:
+    result["verification"] = "Actual served ID or runtime context is unverified; no model claims are emitted."
+print(json.dumps(result, indent=2, sort_keys=True))
+PY
+}
+
+report_loaded_result() {
+  local source="$1"
+  local identifier="$2"
+  local requested_context="$3"
+  local configured_context="$4"
+  local catalog_key="$5"
+  local runtime_report="$6"
+  local instance_count actual_id actual_context required_context compatibility_status runtime_id_count
+  compatibility_status=0
+
+  instance_count="$(printf '%s\n' "$runtime_report" | awk -F '\t' -v key="$source" '$1=="INSTANCE" && $2==key {count++} END {print count+0}')"
+  if [[ "$instance_count" -ne 1 ]]; then
+    warn "load succeeded, but runtime compatibility is unverified: expected one exact loaded instance for $source, found $instance_count"
+    [[ -n "$catalog_key" ]] || print_partial_model_fragment "" ""
+    return 0
+  fi
+  actual_id="$(printf '%s\n' "$runtime_report" | awk -F '\t' -v key="$source" '$1=="INSTANCE" && $2==key {print $3; exit}')"
+  actual_context="$(printf '%s\n' "$runtime_report" | awk -F '\t' -v key="$source" '$1=="INSTANCE" && $2==key {print $4; exit}')"
+  runtime_id_count="$(printf '%s\n' "$runtime_report" | awk -F '\t' -v id="$actual_id" '$1=="INSTANCE" && $3==id {count++} END {print count+0}')"
+  if [[ "$runtime_id_count" -gt 1 ]]; then
+    warn "load succeeded, but loaded runtime ID $actual_id is associated with multiple model keys"
+    [[ -n "$catalog_key" ]] || print_partial_model_fragment "" ""
+    return 1
+  fi
+  if [[ "$actual_id" != "$identifier" ]]; then
+    warn "load succeeded, but runtime served ID $actual_id differs from requested ID $identifier"
+    compatibility_status=1
+  elif [[ -z "$actual_context" ]]; then
+    warn "load succeeded, but actual runtime context is unverified"
+  else
+    required_context="$requested_context"
+    if [[ -n "$configured_context" && "$configured_context" -gt "$required_context" ]]; then
+      required_context="$configured_context"
     fi
-  done <<EOF
-$report
-EOF
-  [[ "$bad_limits" == "0" ]] || die "OpenCode lmstudio model limits drifted"
+    if [[ "$actual_context" -lt "$required_context" ]]; then
+      warn "load succeeded, but actual context $actual_context is below required OpenCode/requested context $required_context"
+      compatibility_status=1
+    elif [[ -n "$configured_context" ]]; then
+      info "runtime compatibility verified for $catalog_key (actual context $actual_context)"
+    else
+      warn "actual runtime context $actual_context is verified, but OpenCode compatibility is unverified without a configured context"
+    fi
+  fi
+  if [[ -z "$catalog_key" ]]; then
+    print_partial_model_fragment "$actual_id" "$actual_context"
+  fi
+  return "$compatibility_status"
+}
+
+resolve_model() {
+  local selection="$1"
+  local installed="$2"
+  local report="$3"
+  LOCAL_MODELS_SELECTION="$selection" LOCAL_MODELS_INSTALLED="$installed" LOCAL_MODELS_CONFIG_REPORT="$report" python_json_helper <<'PY'
+import os
+import sys
+
+selection = os.environ.get("LOCAL_MODELS_SELECTION", "")
+installed = [line for line in os.environ.get("LOCAL_MODELS_INSTALLED", "").splitlines() if line]
+report = os.environ.get("LOCAL_MODELS_CONFIG_REPORT", "")
+models = []
+for line in report.splitlines():
+    fields = line.split("\t")
+    if fields[0] == "MODEL" and len(fields) == 5:
+        models.append({"key": fields[1], "id": fields[2], "context": fields[3]})
+
+def fail(message):
+    print("ERROR\t" + message)
+    sys.exit(0)
+
+if not selection:
+    fail("model selection is required")
+
+catalog = [model for model in models if model["key"] == selection]
+if catalog:
+    if len(catalog) != 1:
+        fail("ambiguous OpenCode catalog key: " + selection)
+    chosen = catalog[0]
+    source_matches = [key for key in installed if key == chosen["id"]]
+    if len(source_matches) != 1:
+        if not source_matches:
+            fail("catalog modelID has no exact installed LM Studio model key: " + chosen["id"])
+        fail("ambiguous installed model key: " + chosen["id"])
+    id_matches = [model for model in models if model["id"] == chosen["id"]]
+    if len(id_matches) != 1:
+        fail("ambiguous configured modelID: " + chosen["id"])
+    print("SOURCE\t" + source_matches[0])
+    print("IDENTIFIER\t" + chosen["id"])
+    print("CONTEXT\t" + chosen["context"])
+    print("CATALOG\t" + chosen["key"])
+    sys.exit(0)
+
+source_matches = [key for key in installed if key == selection]
+if len(source_matches) != 1:
+    if not source_matches:
+        fail("model key is not installed: " + selection)
+    fail("ambiguous installed model key: " + selection)
+
+id_matches = [model for model in models if model["id"] == selection]
+if len(id_matches) > 1:
+    fail("ambiguous configured modelID: " + selection)
+if id_matches:
+    chosen = id_matches[0]
+    print("SOURCE\t" + source_matches[0])
+    print("IDENTIFIER\t" + chosen["id"])
+    print("CONTEXT\t" + chosen["context"])
+    print("CATALOG\t" + chosen["key"])
+else:
+    print("SOURCE\t" + source_matches[0])
+    print("IDENTIFIER\t" + source_matches[0])
+    print("CONTEXT\t")
+    print("CATALOG\t")
+PY
 }
 
 cmd_start() {
@@ -648,50 +862,58 @@ cmd_start() {
 
 cmd_list() {
   require_runtime_deps
-  local installed loaded alias source identifier installed_status loaded_status
-  installed="$(installed_sources)"
-  loaded="$(loaded_identifiers)"
-  printf '%-22s %-34s %-32s %s %s\n' "alias" "source" "identifier" "installed" "loaded"
-  all_aliases | while IFS= read -r alias; do
-    source="$(model_source "$alias")"
-    identifier="$(model_identifier "$alias")"
-    installed_status="no"
-    loaded_status="no"
-    if printf '%s\n' "$installed" | contains_line "$source"; then
-      installed_status="yes"
-    fi
-    if printf '%s\n' "$loaded" | contains_line "$identifier"; then
-      loaded_status="yes"
-    fi
-    printf '%-22s %-34s %-32s installed=%s loaded=%s\n' "$alias" "$source" "$identifier" "$installed_status" "$loaded_status"
-  done
-}
-
-check_installed_models() {
-  local installed alias source missing
-  installed="$(installed_sources)"
-  missing=0
-  all_aliases | while IFS= read -r alias; do
-    source="$(model_source "$alias")"
-    if ! printf '%s\n' "$installed" | contains_line "$source"; then
-      printf 'Missing installed LM Studio source model for %s: %s\n' "$alias" "$source" >&2
-      missing=1
-    fi
-    [[ "$missing" == "0" ]] || exit 1
-  done
+  local installed source
+  installed="$(installed_sources)" || exit $?
+  printf '%s\n' "LM Studio non-embedding model keys:"
+  if [[ -z "$installed" ]]; then
+    printf '%s\n' "  none"
+    return 0
+  fi
+  while IFS= read -r source; do
+    [[ -n "$source" ]] && printf '  %s\n' "$source"
+  done <<EOF
+$installed
+EOF
 }
 
 cmd_verify() {
   require_runtime_deps
-  validate_config
-  cmd_start
-  check_installed_models || die "one or more mapped source models are not installed in LM Studio"
-  info "verification passed: LM Studio CLI, endpoint, installed source models, and OpenCode config are aligned"
+  local config_report runtime_report status running
+  if [[ -f "$OPENCODE_CONFIG" ]]; then
+    validate_config
+    config_report="$(jsonc_config_report)"
+  else
+    config_report=""
+    warn "OpenCode config is missing; compatibility cannot be established"
+  fi
+  status="$(server_status_report)" || exit $?
+  running="$(printf '%s\n' "$status" | status_field RUNNING)"
+  printf 'server_running: %s\n' "$running"
+  if [[ "$running" != "yes" ]]; then
+    printf '%s\n' "runtime compatibility: unverified (server stopped)"
+    return 0
+  fi
+  if ! status_matches_config "$status"; then
+    printf '%s\n' "runtime compatibility: unverified (LM Studio endpoint identity does not match configured endpoint)"
+    return 0
+  fi
+  if runtime_report="$(native_models_report)"; then
+    if ! report_compatibility "$config_report" "$runtime_report"; then
+      info "read-only verification complete; a known compatibility mismatch was found"
+      return 1
+    fi
+  else
+    if ! report_compatibility "$config_report" ""; then
+      info "read-only verification complete; a known compatibility mismatch was found"
+      return 1
+    fi
+  fi
+  info "read-only verification complete; no model or server was started"
 }
 
 cmd_status() {
   require_runtime_deps
-  local status running loaded config_status server_host server_port
+  local status running loaded config_status server_host server_port config_report runtime_report
   status="$(server_status_report)" || exit $?
   running="$(printf '%s\n' "$status" | status_field RUNNING)"
   server_host="$(printf '%s\n' "$status" | status_field HOST)"
@@ -705,23 +927,33 @@ cmd_status() {
   else
     printf 'endpoint: not responding\n'
   fi
-  loaded="$(loaded_identifiers)"
+  loaded="$(loaded_identifiers)" || exit $?
   if [[ -n "$loaded" ]]; then
-    printf 'loaded_local_identifiers:\n'
+    printf 'loaded_runtime_identifiers:\n'
     printf '%s\n' "$loaded" | while IFS= read -r line; do
-      case "$line" in
-        local/*) printf '  %s\n' "$line" ;;
-      esac
+      [[ -n "$line" ]] && printf '  %s\n' "$line"
     done
   else
-    printf 'loaded_local_identifiers: none\n'
+    printf 'loaded_runtime_identifiers: none\n'
   fi
-  if validate_config >/dev/null 2>&1; then
-    config_status="aligned"
+  if [[ -f "$OPENCODE_CONFIG" ]] && validate_config >/dev/null 2>&1; then
+    config_status="valid"
+    config_report="$(jsonc_config_report)"
+  elif [[ ! -f "$OPENCODE_CONFIG" ]]; then
+    config_status="missing"
+    config_report=""
   else
     config_status="drifted"
+    config_report=""
   fi
   printf 'opencode_config: %s (%s)\n' "$config_status" "$OPENCODE_CONFIG"
+  if [[ "$running" == "yes" ]] && status_matches_config "$status" && runtime_report="$(native_models_report)"; then
+    report_compatibility "$config_report" "$runtime_report"
+  elif [[ "$running" != "yes" ]]; then
+    printf '%s\n' "runtime compatibility: unverified (server stopped)"
+  else
+    printf '%s\n' "runtime compatibility: unverified (native metadata unavailable or endpoint identity mismatch)"
+  fi
 }
 
 estimate_decision() {
@@ -756,20 +988,33 @@ PY
 }
 
 cmd_load() {
-  [[ $# -ge 1 ]] || die_usage "load requires an alias"
-  local alias="$1"
-  shift
-  require_alias "$alias"
+  local selection=""
+  if [[ $# -gt 0 && "$1" != -* ]]; then
+    selection="$1"
+    shift
+  fi
 
-  local context_length ttl yes source identifier estimate decision decision_kind answer
-  context_length="$(model_context_length "$alias")" || die "no default context length for alias: $alias"
+  local context_length ttl yes identifier_override installed config_report resolved native_report
+  local native_count source_max instance_count instance_id instance_context loaded association_unknown_count
+  local source identifier estimate decision decision_kind answer configured_context catalog_key post_report
+  local model_number model_key selection_number
+  context_length=""
   ttl=""
   yes=0
+  identifier_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --context-length | -c)
         [[ $# -ge 2 ]] || die_usage "missing value for $1"
         context_length="$2"
+        shift 2
+        ;;
+      --identifier)
+        [[ $# -ge 2 && -n "$2" ]] || die_usage "--identifier requires a non-empty value"
+        case "$2" in
+          *$'\t'* | *$'\n'* | *$'\r'*) die_usage "identifier must not contain tabs or line breaks" ;;
+        esac
+        identifier_override="$2"
         shift 2
         ;;
       --ttl)
@@ -786,27 +1031,128 @@ cmd_load() {
         ;;
     esac
   done
-  case "$context_length" in *[!0-9]* | "") die_usage "--context-length must be an integer" ;; esac
   if [[ -n "$ttl" ]]; then
     case "$ttl" in *[!0-9]* | "") die_usage "--ttl must be an integer number of seconds" ;; esac
   fi
 
   require_runtime_deps
-  cmd_verify
-  source="$(model_source "$alias")"
-  identifier="$(model_identifier "$alias")"
+  installed="$(installed_sources)" || exit $?
+  if [[ -f "$OPENCODE_CONFIG" ]]; then
+    validate_config
+    config_report="$(jsonc_config_report)"
+  else
+    config_report=""
+    warn "OpenCode config is missing; loading requires an explicit context and cannot establish OpenCode compatibility"
+  fi
+  if [[ -z "$selection" ]]; then
+    [[ -t 0 ]] || die_usage "load requires a model key; numbered selection is available in a TTY"
+    [[ -n "$installed" ]] || die "no installed non-embedding LM Studio models are available to select"
+    printf '%s\n' "Choose an installed model:" >&2
+    model_number=0
+    while IFS= read -r model_key; do
+      [[ -n "$model_key" ]] || continue
+      model_number=$((model_number + 1))
+      printf '  %s) %s\n' "$model_number" "$model_key" >&2
+    done <<EOF
+$installed
+EOF
+    printf 'Model number: ' >&2
+    read -r selection_number || die "could not read model selection"
+    case "$selection_number" in *[!0-9]* | "") die_usage "model selection must be a listed number" ;; esac
+    selection="$(printf '%s\n' "$installed" | sed -n "${selection_number}p")"
+    [[ -n "$selection" ]] || die_usage "model selection is out of range"
+  fi
+  case "$selection" in
+    *$'\t'* | *$'\n'* | *$'\r'*) die_usage "model key must not contain tabs or line breaks" ;;
+  esac
+  resolved="$(resolve_model "$selection" "$installed" "$config_report")"
+  if printf '%s\n' "$resolved" | grep -q '^ERROR[[:space:]]'; then
+    die_usage "$(printf '%s\n' "$resolved" | awk -F '\t' '$1=="ERROR" {print $2; exit}')"
+  fi
+  source="$(printf '%s\n' "$resolved" | awk -F '\t' '$1=="SOURCE" {print $2; exit}')"
+  identifier="$(printf '%s\n' "$resolved" | awk -F '\t' '$1=="IDENTIFIER" {print $2; exit}')"
+  configured_context="$(printf '%s\n' "$resolved" | awk -F '\t' '$1=="CONTEXT" {print $2; exit}')"
+  catalog_key="$(printf '%s\n' "$resolved" | awk -F '\t' '$1=="CATALOG" {print $2; exit}')"
+  if [[ -z "$context_length" ]]; then
+    context_length="$configured_context"
+  fi
+  [[ -n "$source" && -n "$identifier" ]] || die "could not resolve selected LM Studio model"
+  if [[ -n "$identifier_override" ]]; then
+    identifier="$identifier_override"
+  fi
+  if [[ -z "$context_length" ]]; then
+    if [[ -t 0 ]]; then
+      printf 'No configured context for %s. Context length: ' "$selection" >&2
+      read -r context_length || die "could not read context length"
+    else
+      die_usage "no configured context for $selection; pass --context-length N"
+    fi
+  fi
+  case "$context_length" in *[!0-9]* | "") die_usage "--context-length must be an integer (found: ${context_length:-<empty>})" ;; esac
+  [[ "$context_length" -gt 0 ]] || die_usage "--context-length must be greater than zero"
+  if [[ -n "$configured_context" && "$context_length" -lt "$configured_context" ]]; then
+    die "requested context $context_length is below configured OpenCode context $configured_context; refusing to create an incompatible load"
+  fi
+  case "$LOW_CONTEXT_THRESHOLD" in
+    *[!0-9]* | "") ;;
+    *)
+      if [[ "$LOW_CONTEXT_THRESHOLD" -gt 0 && "$context_length" -lt "$LOW_CONTEXT_THRESHOLD" ]]; then
+        warn "context $context_length is below advisory threshold $LOW_CONTEXT_THRESHOLD; this is not a load restriction"
+      fi
+      ;;
+  esac
+
+  cmd_start
+  if native_report="$(native_models_report)"; then
+    native_count="$(printf '%s\n' "$native_report" | awk -F '\t' -v key="$source" '$1=="MODEL" && $2==key {count++} END {print count+0}')"
+    [[ "$native_count" -le 1 ]] || die "ambiguous LM Studio runtime metadata for exact model key $source"
+    source_max="$(printf '%s\n' "$native_report" | awk -F '\t' -v key="$source" '$1=="MODEL" && $2==key {print $3; exit}')"
+    if [[ "$native_count" -eq 0 ]]; then
+      warn "no exact native runtime record for $source; maximum and loaded-instance association are unverified"
+    elif [[ -z "$source_max" ]]; then
+      warn "LM Studio did not report a maximum context for $source; load compatibility is unverified"
+    fi
+    if [[ -n "$source_max" && "$context_length" -gt "$source_max" ]]; then
+      die "requested context $context_length exceeds LM Studio maximum context $source_max for $source"
+    fi
+    association_unknown_count="$(printf '%s\n' "$native_report" | awk -F '\t' -v key="$source" '$1=="ASSOCIATION_UNKNOWN" && $2==key {count++} END {print count+0}')"
+    [[ "$association_unknown_count" -eq 0 ]] || die "loaded-instance association for $source is unverified; refusing to risk a duplicate load"
+    instance_count="$(printf '%s\n' "$native_report" | awk -F '\t' -v key="$source" '$1=="INSTANCE" && $2==key {count++} END {print count+0}')"
+    [[ "$instance_count" -le 1 ]] || die "ambiguous loaded instances for exact LM Studio model key $source; refusing to guess"
+    if [[ "$instance_count" -eq 1 ]]; then
+      instance_id="$(printf '%s\n' "$native_report" | awk -F '\t' -v key="$source" '$1=="INSTANCE" && $2==key {print $3; exit}')"
+      instance_context="$(printf '%s\n' "$native_report" | awk -F '\t' -v key="$source" '$1=="INSTANCE" && $2==key {print $4; exit}')"
+      runtime_id_count="$(printf '%s\n' "$native_report" | awk -F '\t' -v id="$instance_id" '$1=="INSTANCE" && $3==id {count++} END {print count+0}')"
+      [[ "$runtime_id_count" -eq 1 ]] || die "ambiguous loaded runtime ID $instance_id across model-key associations; refusing to guess"
+      [[ "$instance_id" == "$identifier" ]] || die "loaded instance for $source uses ID $instance_id, expected $identifier; refusing to reload or unload it automatically"
+      [[ -n "$instance_context" ]] || die "loaded instance $instance_id has unverified context; refusing to reload it"
+      [[ "$instance_context" -ge "$context_length" ]] || die "loaded instance $instance_id context $instance_context is below requested context $context_length; unload and reload manually"
+      if [[ -n "$configured_context" && "$instance_context" -lt "$configured_context" ]]; then
+        die "loaded instance $instance_id context $instance_context is below configured context $configured_context; unload and reload manually"
+      fi
+      info "reusing loaded instance $instance_id with runtime context $instance_context"
+      report_loaded_result "$source" "$identifier" "$context_length" "$configured_context" "$catalog_key" "$native_report" || return $?
+      return 0
+    fi
+  else
+    warn "LM Studio native model metadata is unavailable; maximum and runtime context are unverified"
+  fi
+  loaded="$(loaded_identifiers)" || exit $?
+  if printf '%s\n' "$loaded" | contains_line "$identifier"; then
+    die "identifier $identifier is already loaded but has no unambiguous exact model-key/runtime-context association; refusing to reload"
+  fi
 
   if ! estimate="$({ "$LMS_BIN" load "$source" --identifier "$identifier" --context-length "$context_length" --estimate-only; } 2>&1)"; then
-    die_upstream "lms load estimate failed for $alias: $estimate"
+    die_upstream "lms load estimate failed for $selection: $estimate"
   fi
   printf '%s\n' "$estimate" >&2
   decision="$(printf '%s\n' "$estimate" | estimate_decision)"
   decision_kind="$(printf '%s\n' "$decision" | awk 'NR==1 {print $1}')"
   if [[ "$decision_kind" != "auto" && "$yes" != "1" ]]; then
     if [[ ! -t 0 ]]; then
-      die "estimate for $alias requires confirmation; rerun interactively or pass --yes to override"
+      die "estimate for $selection requires confirmation; rerun interactively or pass --yes to override"
     fi
-    printf 'Estimate for %s requires confirmation. Load %s as %s? [y/N] ' "$alias" "$source" "$identifier" >&2
+    printf 'Estimate for %s requires confirmation. Load %s as %s? [y/N] ' "$source" "$source" "$identifier" >&2
     read -r answer
     case "$answer" in
       y | Y | yes | YES) ;;
@@ -822,19 +1168,27 @@ cmd_load() {
     LOAD_ARGS+=("--yes")
   fi
   if ! "$LMS_BIN" ${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}; then
-    die_upstream "lms load failed for $alias ($identifier)"
+    die_upstream "lms load failed for $source ($identifier)"
   fi
-  info "loaded $alias as $identifier"
+  info "loaded $source as $identifier"
+  if post_report="$(native_models_report)"; then
+    report_loaded_result "$source" "$identifier" "$context_length" "$configured_context" "$catalog_key" "$post_report" || return $?
+  else
+    warn "load succeeded, but runtime identity/context could not be verified"
+    [[ -n "$catalog_key" ]] || print_partial_model_fragment "" ""
+  fi
 }
 
 cmd_unload() {
   [[ $# -ge 1 ]] || die_usage "unload requires an alias or --all-local"
   require_runtime_deps
-  local target id loaded unload_rc
+  local target id loaded unload_rc exact_count runtime_report matches match_count runtime_id_count
   target="$1"
+  shift
+  [[ $# -eq 0 ]] || die_usage "unload accepts exactly one target"
   case "$target" in
     --all-local)
-      loaded="$(loaded_identifiers)"
+      loaded="$(loaded_identifiers)" || exit $?
       unload_rc=0
       while IFS= read -r id; do
         case "$id" in
@@ -853,10 +1207,25 @@ EOF
       info "unloaded loaded local/ identifiers"
       ;;
     *)
-      require_alias "$target"
-      id="$(model_identifier "$target")"
+      loaded="$(loaded_identifiers)" || exit $?
+      exact_count="$(printf '%s\n' "$loaded" | awk -v id="$target" '$0==id {count++} END {print count+0}')"
+      if [[ "$exact_count" -gt 1 ]]; then
+        die "ambiguous duplicate loaded identifier $target; refusing to unload"
+      elif [[ "$exact_count" -eq 1 ]]; then
+        id="$target"
+      else
+        if ! runtime_report="$(native_models_report)"; then
+          die "no exact loaded identifier or verified model-key association for $target"
+        fi
+        matches="$(printf '%s\n' "$runtime_report" | awk -F '\t' -v target="$target" '$1=="INSTANCE" && ($2==target || $3==target) {print $3}')"
+        match_count="$(printf '%s\n' "$matches" | awk 'NF {count++} END {print count+0}')"
+        [[ "$match_count" -eq 1 ]] || die "no unique exact loaded runtime ID associated with $target"
+        id="$matches"
+        runtime_id_count="$(printf '%s\n' "$runtime_report" | awk -F '\t' -v id="$id" '$1=="INSTANCE" && $3==id {count++} END {print count+0}')"
+        [[ "$runtime_id_count" -eq 1 ]] || die "ambiguous loaded runtime ID $id across model-key associations"
+      fi
       if ! "$LMS_BIN" unload "$id"; then
-        die_upstream "lms unload failed for $target ($id)"
+        die_upstream "lms unload failed for exact runtime ID $id"
       fi
       info "unloaded $id"
       ;;
