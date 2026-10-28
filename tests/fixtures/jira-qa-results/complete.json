@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "target_issue_key": "TEST-123",
+  "parent_story": {
+    "key": "TEST-122",
+    "summary": "Synthetic QA example"
+  },
+  "environments": [
+    {
+      "id": "ENV-1",
+      "label": "Synthetic test environment",
+      "date_window": "2026-10-27 10:00-10:05 UTC",
+      "scope": "One synthetic browser check",
+      "url": "https://example.test/",
+      "identity": "Synthetic operator alias",
+      "build": {
+        "source": "synthetic fixture",
+        "id": "build-1",
+        "time": "2026-10-27T10:00:00Z"
+      },
+      "client_deviations": [],
+      "approved_agent_checks": ["One synthetic browser check"],
+      "approved_human_checks": [],
+      "completed_human_checks": [],
+      "approved_side_effects": [],
+      "cleanup_scope": "No data changes"
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "text": "Synthetic criterion is visible.",
+      "coverage": "complete",
+      "status": "Passed",
+      "environment_id": "ENV-1",
+      "build_id": "build-1",
+      "evidence_ids": ["E-1"]
+    }
+  ],
+  "subtask_tests": [],
+  "evidence": [
+    {
+      "id": "E-1",
+      "provenance": "agent_browser",
+      "action": "Opened the synthetic route",
+      "method": "browser",
+      "path": "/",
+      "state": "Synthetic heading visible",
+      "window": "One captured synthetic check",
+      "limits": "Fixture only; no live app was checked",
+      "artifact": "Synthetic screenshot marker",
+      "environment_id": "ENV-1",
+      "build_id": "build-1"
+    }
+  ],
+  "probes": [],
+  "findings": [],
+  "observations": [],
+  "unresolved_requirements": [],
+  "design_verification": [],
+  "accessibility": [],
+  "input_parsing": [],
+  "attachments": [],
+  "closers": {
+    "not_run": [],
+    "needs_human": [],
+    "qa_data_cleanup": []
+  }
+}

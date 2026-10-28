@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "target_issue_key": "TEST-123",
+  "parent_story": {"key": "TEST-122", "summary": "Synthetic QA example"},
+  "environments": [
+    {
+      "id": "ENV-CI",
+      "label": "Synthetic CI environment",
+      "date_window": "2026-10-27 08:00-08:04 UTC",
+      "scope": "CI-only signal",
+      "url": "https://ci.example.test/run/8",
+      "identity": "Synthetic CI service alias",
+      "build": {"source": "CI", "id": "ci-8", "time": "2026-10-27T08:00:00Z"},
+      "client_deviations": [],
+      "approved_agent_checks": ["Read the synthetic CI result"],
+      "approved_human_checks": [],
+      "completed_human_checks": [],
+      "approved_side_effects": [],
+      "cleanup_scope": "No data changes"
+    },
+    {
+      "id": "ENV-TST",
+      "label": "Synthetic test environment",
+      "date_window": "2026-10-27 09:00-09:05 UTC",
+      "scope": "One synthetic browser check and a pending human review",
+      "url": "https://tst.example.test/",
+      "identity": "Synthetic QA alias",
+      "build": {"source": "local test build", "id": "tst-7", "time": "2026-10-27T09:00:00Z"},
+      "client_deviations": ["Synthetic client variation"],
+      "approved_agent_checks": ["Inspect the synthetic route"],
+      "approved_human_checks": ["Review the remaining synthetic criterion check"],
+      "completed_human_checks": ["Review the synthetic captured state"],
+      "approved_side_effects": [],
+      "cleanup_scope": "No data changes"
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "text": "Synthetic behavior is verified across the required checks.",
+      "coverage": "partial",
+      "status": "Human double-check required",
+      "environment_id": "ENV-TST",
+      "build_id": "tst-7",
+      "evidence_ids": ["E-HUMAN"]
+    }
+  ],
+  "subtask_tests": [
+    {
+      "id": "T-1",
+      "label": "Synthetic QA subtask test",
+      "status": "Not run",
+      "notes": "Steps were not supplied; none were invented.",
+      "environment_id": "ENV-TST",
+      "build_id": "tst-7",
+      "evidence_ids": []
+    }
+  ],
+  "evidence": [
+    {
+      "id": "E-CI",
+      "provenance": "ci_only",
+      "action": "Read a synthetic CI result",
+      "method": "CI job",
+      "path": "/pipeline/checks",
+      "state": "Synthetic checks passed",
+      "window": "One synthetic CI run",
+      "limits": "Does not establish live database behavior",
+      "artifact": "Synthetic CI result marker",
+      "environment_id": "ENV-CI",
+      "build_id": "ci-8"
+    },
+    {
+      "id": "E-HUMAN",
+      "provenance": "human_completed",
+      "action": "Reviewed a synthetic captured state",
+      "method": "human review",
+      "path": "synthetic screenshot marker",
+      "state": "One state reviewed; other checks remain",
+      "window": "Single supplied synthetic image",
+      "limits": "Does not settle the full criterion",
+      "artifact": "Synthetic screenshot marker",
+      "environment_id": "ENV-TST",
+      "build_id": "tst-7"
+    }
+  ],
+  "probes": [
+    {
+      "id": "P-1",
+      "label": "CI-only check",
+      "status": "Passed",
+      "notes": "CI result only; not a live check.",
+      "environment_id": "ENV-CI",
+      "build_id": "ci-8",
+      "evidence_ids": ["E-CI"]
+    }
+  ],
+  "findings": [],
+  "observations": [],
+  "unresolved_requirements": [],
+  "design_verification": [
+    {
+      "id": "DV-1",
+      "label": "Synthetic design comparison",
+      "status": "Inconclusive",
+      "notes": "No comparison artifact was supplied.",
+      "environment_id": "ENV-TST",
+      "build_id": "tst-7",
+      "evidence_ids": []
+    }
+  ],
+  "accessibility": [],
+  "input_parsing": [],
+  "attachments": [],
+  "closers": {
+    "not_run": ["The supplied subtask test steps were unavailable."],
+    "needs_human": ["Complete the remaining criterion checks."],
+    "qa_data_cleanup": ["No data was changed; no cleanup was needed."]
+  }
+}

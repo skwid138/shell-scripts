@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "target_issue_key": "TEST-123",
+  "parent_story": {"key": "TEST-122", "summary": "Synthetic QA example"},
+  "environments": [
+    {
+      "id": "ENV-UNKNOWN",
+      "label": "Synthetic environment with unavailable data",
+      "date_window": "2026-10-27 11:00-11:02 UTC",
+      "scope": "Required test record was unavailable",
+      "url": "unknown",
+      "identity": "unknown",
+      "build": {"source": "unknown", "id": "unknown", "time": "unknown"},
+      "client_deviations": [],
+      "approved_agent_checks": [],
+      "approved_human_checks": [],
+      "completed_human_checks": [],
+      "approved_side_effects": [],
+      "cleanup_scope": "No data was created"
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "text": "Synthetic record supports the required branch.",
+      "coverage": "partial",
+      "status": "Blocked by data",
+      "environment_id": "ENV-UNKNOWN",
+      "build_id": "unknown",
+      "evidence_ids": []
+    }
+  ],
+  "subtask_tests": [
+    {
+      "id": "T-1",
+      "label": "Synthetic subtask check",
+      "status": "Not run",
+      "notes": "No steps were supplied; none were invented.",
+      "environment_id": "ENV-UNKNOWN",
+      "build_id": "unknown",
+      "evidence_ids": []
+    }
+  ],
+  "evidence": [],
+  "probes": [
+    {
+      "id": "P-1",
+      "label": "Authentication precondition",
+      "status": "Inconclusive",
+      "notes": "Authentication status was not checked; no auth call was made.",
+      "environment_id": "ENV-UNKNOWN",
+      "build_id": "unknown",
+      "evidence_ids": []
+    }
+  ],
+  "findings": [],
+  "observations": [],
+  "unresolved_requirements": [],
+  "design_verification": [],
+  "accessibility": [],
+  "input_parsing": [],
+  "attachments": [],
+  "closers": {
+    "not_run": ["The approved subtask steps were unavailable."],
+    "needs_human": ["Supply the required synthetic data or perform the check manually."],
+    "qa_data_cleanup": ["No setup, mutation, or cleanup occurred."]
+  }
+}

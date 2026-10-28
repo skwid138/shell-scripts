@@ -1,0 +1,181 @@
+{
+  "version": 1,
+  "target_issue_key": "TEST-123",
+  "parent_story": {"key": "TEST-122", "summary": "Synthetic QA example"},
+  "environments": [
+    {
+      "id": "ENV-DEV",
+      "label": "Synthetic development environment",
+      "date_window": "2026-10-27 12:00-12:05 UTC",
+      "scope": "Synthetic API response and cleanup accounting",
+      "url": "https://dev.example.test/",
+      "identity": "Synthetic agent alias",
+      "build": {"source": "synthetic local build", "id": "dev-8", "time": "2026-10-27T12:00:00Z"},
+      "client_deviations": [],
+      "approved_agent_checks": ["Observe the synthetic API response"],
+      "approved_human_checks": [],
+      "completed_human_checks": [],
+      "approved_side_effects": ["Synthetic test resource creation was approved"],
+      "cleanup_scope": "Remove only synthetic resource TEST-DATA-01 and verify the result"
+    },
+    {
+      "id": "ENV-CI",
+      "label": "Synthetic CI environment",
+      "date_window": "2026-10-27 12:10-12:12 UTC",
+      "scope": "Static and CI-only evidence",
+      "url": "https://ci.example.test/run/4",
+      "identity": "Synthetic CI alias",
+      "build": {"source": "CI", "id": "ci-4", "time": "2026-10-27T12:10:00Z"},
+      "client_deviations": [],
+      "approved_agent_checks": ["Read synthetic static and CI results"],
+      "approved_human_checks": [],
+      "completed_human_checks": [],
+      "approved_side_effects": [],
+      "cleanup_scope": "No CI data changes"
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "text": "Synthetic API behavior matches the requirement.",
+      "coverage": "complete",
+      "status": "Failed",
+      "environment_id": "ENV-DEV",
+      "build_id": "dev-8",
+      "evidence_ids": ["E-API"]
+    },
+    {
+      "id": "AC-2",
+      "text": "Synthetic route status is consistent with the written requirement.",
+      "coverage": "partial",
+      "status": "Inconclusive",
+      "environment_id": "ENV-CI",
+      "build_id": "ci-4",
+      "evidence_ids": ["E-STATIC"]
+    }
+  ],
+  "subtask_tests": [],
+  "evidence": [
+    {
+      "id": "E-API",
+      "provenance": "agent_api",
+      "action": "Sent one synthetic request",
+      "method": "GET",
+      "path": "/api/synthetic-resource",
+      "state": "Observed synthetic status 403",
+      "window": "One bounded test request",
+      "limits": "Synthetic response; not a production observation",
+      "artifact": "Synthetic response marker",
+      "environment_id": "ENV-DEV",
+      "build_id": "dev-8"
+    },
+    {
+      "id": "E-STATIC",
+      "provenance": "static",
+      "action": "Compared a synthetic route declaration",
+      "method": "source inspection",
+      "path": "synthetic route declaration",
+      "state": "Static route suggests 404 while the story wording says 403",
+      "window": "One synthetic source snapshot",
+      "limits": "Static consequence; it does not replace a runtime oracle",
+      "artifact": "Synthetic source reference",
+      "environment_id": "ENV-CI",
+      "build_id": "ci-4"
+    },
+    {
+      "id": "E-CI",
+      "provenance": "ci_only",
+      "action": "Read synthetic CI result",
+      "method": "CI job",
+      "path": "/pipeline/checks",
+      "state": "Synthetic tests passed",
+      "window": "One CI run",
+      "limits": "Does not settle the route requirement",
+      "artifact": "Synthetic CI marker",
+      "environment_id": "ENV-CI",
+      "build_id": "ci-4"
+    }
+  ],
+  "probes": [
+    {
+      "id": "P-1",
+      "label": "CI-only validation",
+      "status": "Passed",
+      "notes": "CI-only; not a live API result.",
+      "environment_id": "ENV-CI",
+      "build_id": "ci-4",
+      "evidence_ids": ["E-CI"]
+    }
+  ],
+  "findings": [
+    {
+      "id": "DEF-1",
+      "summary": "Synthetic API returned a response different from the expected result",
+      "expected": "Synthetic status 200",
+      "actual": "Synthetic status 403",
+      "reproduction": "Send the one documented synthetic request",
+      "severity": "synthetic low",
+      "scope": "Synthetic development environment only",
+      "environment_id": "ENV-DEV",
+      "build_id": "dev-8",
+      "evidence_ids": ["E-API"]
+    }
+  ],
+  "observations": [
+    {
+      "id": "OBS-1",
+      "summary": "Synthetic CI was green; this observation does not assert a product violation",
+      "environment_id": "ENV-CI",
+      "build_id": "ci-4",
+      "evidence_ids": ["E-CI"]
+    }
+  ],
+  "unresolved_requirements": [
+    {
+      "id": "REQ-1",
+      "summary": "The synthetic requirement's 403 conflicts with the route's 404; expected behavior is unresolved",
+      "environment_id": "ENV-CI",
+      "build_id": "ci-4",
+      "evidence_ids": ["E-STATIC"]
+    }
+  ],
+  "design_verification": [],
+  "accessibility": [
+    {
+      "id": "A11Y-1",
+      "label": "Synthetic accessibility review",
+      "status": "Not run",
+      "notes": "No accessibility review was supplied.",
+      "environment_id": "ENV-DEV",
+      "build_id": "dev-8",
+      "evidence_ids": []
+    }
+  ],
+  "input_parsing": [
+    {
+      "id": "INPUT-1",
+      "label": "Synthetic input parsing probe",
+      "status": "Inconclusive",
+      "notes": "The expected rule is unresolved.",
+      "environment_id": "ENV-DEV",
+      "build_id": "dev-8",
+      "evidence_ids": ["E-API"]
+    }
+  ],
+  "attachments": [
+    {
+      "id": "SCREENSHOT-01",
+      "caption": "Synthetic API check, development environment, observed 403, viewport not applicable",
+      "state": "Synthetic response observed",
+      "viewport": "Not applicable",
+      "environment_id": "ENV-DEV",
+      "build_id": "dev-8",
+      "local_path": ""
+    }
+  ],
+  "closers": {
+    "not_run": ["Accessibility review was not run."],
+    "needs_human": ["Resolve the written 403/404 requirement conflict."],
+    "qa_data_cleanup": ["Synthetic resource TEST-DATA-01 is retained; cleanup verification is incomplete."]
+  }
+}

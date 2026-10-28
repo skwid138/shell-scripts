@@ -26,6 +26,8 @@ follow [`../docs/ADDING-A-SCRIPT.md`](../docs/ADDING-A-SCRIPT.md).
 | [`gh-pr-checks-summary.sh`](gh-pr-checks-summary.sh) | Fetch GitHub PR check runs and roll them up to a single status (`passed`/`failed`/`running`/`not_found`). Filterable by check-name regex. | `sonarcloud`, `ticket-plan`, `pr-review` skills; consumed internally by `sonar-pr-issues.sh`. |
 | [`gh-pr-comments.sh`](gh-pr-comments.sh) | Fetch all review comments, threads, reviews, and review metadata for a PR via gh's GraphQL API. Handles large diff hunks via `--rawfile`. | `gh-fetch-pr-comments` skill |
 | [`jira-fetch-ticket.sh`](jira-fetch-ticket.sh) | Fetch a Jira ticket (description, AC, comments, links, attachments) via `acli`. Multiple output modes: full / summary / fields-only. | `jira-ticket`, `jira-enhance`, `ticket-plan` skills |
+| [`jira-qa-results-build.sh`](jira-qa-results-build.sh) | Build a pure, versioned ADF preview envelope from completed QA evidence. No Jira/network calls or file writes. | `jira-qa-results` skill |
+| [`jira-qa-results-publish.sh`](jira-qa-results-publish.sh) | Preview a saved QA-results envelope by default; `--write` sends one digest-checked ADF comment. Reports CLI success without claiming readback. | `jira-qa-results` skill |
 | [`jira-sprint-tickets.sh`](jira-sprint-tickets.sh) | List a project's sprint tickets for an assignee (default `currentUser()`, open sprints) via read-only `acli jira workitem search`, with validated/escaped JQL, optional repeatable `--status` filter, and `--limit`. Emits `{version, jql, count, limited, tickets:[{key, summary, status, type}]}`. | `release-deploy-checks` skill |
 | [`launchd-shutdown-check.sh`](launchd-shutdown-check.sh) | Opt-in manual exercise: run a throwaway copy of the gitleaks-audit or cache-prune LaunchAgent against stubs, stop it with `launchctl bootout` and `launchctl kill TERM`, and check nothing survives or half-publishes. Exact-service targets only; `--run` required. | Run by hand (see the top-level README) |
 | [`opencode-deps-check.sh`](opencode-deps-check.sh) | Audit `~/.config/opencode/opencode.json` for outdated or unpinned MCP-server / plugin / agent dependencies. | `update-opencode-deps` command |
@@ -53,6 +55,15 @@ For pipelines, redirect stderr if you don't want the `info` decoration:
 ```bash
 $ ./sonar-pr-issues.sh 275 2>/dev/null | jq '.counts.total'
 ```
+
+## Jira QA results
+
+`jira-qa-results-build.sh` emits a version-1 local preview envelope from one
+structured input document. `jira-qa-results-publish.sh` validates the saved
+envelope and defaults to preview; an explicit `--write`, exact issue key, and
+reviewed ADF digest are required for its single opt-in comment invocation. See
+the private OpenCode `jira-qa-results` skill for report semantics and posting
+authorization gates.
 
 ## Stable contract
 
