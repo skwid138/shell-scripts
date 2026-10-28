@@ -148,6 +148,52 @@ setup() {
   [ -z "$output" ]
 }
 
+@test "builder rejects bare relative artifact paths in freeform report text" {
+  pathlikes=(
+    "screenshots/private.png"
+    '"screenshots/private.png"'
+    "screenshots/private.jpg"
+    "screenshots/private.jpeg"
+    "reports/retained-data.json"
+    "captures/browser.gif"
+    "captures/browser.webp"
+    "captures/browser.svg"
+    "reports/retained-data.pdf"
+    "reports/retained-data.txt"
+    "exports/evidence.csv"
+    "logs/session.log"
+    "archives/results.zip"
+    "traces/network.har"
+    "recordings/check.mp4"
+    'reports\private.PNG'
+  )
+  for pathlike in "${pathlikes[@]}"; do
+    jq --arg path "$pathlike" '.closers.qa_data_cleanup = ["Retained artifact: (\($path))."]' \
+      "$FIXTURES/complete.json" >"$BATS_TEST_TMPDIR/bare-relative-artifact.json"
+    run --separate-stderr "$SCRIPT" "$BATS_TEST_TMPDIR/bare-relative-artifact.json"
+    [ "$status" -ne 0 ] || return 1
+    [ -z "$output" ] || return 1
+  done
+}
+
+@test "builder preserves API routes URLs and ordinary slash prose in freeform text" {
+  jq '.closers.qa_data_cleanup = [
+        "Root-relative API route: /api/file.json",
+        "Verified URL: https://example.test/reports/file.json",
+        "Environment/build: ENV-1/build-1",
+        "QA data/cleanup is ordinary prose."
+      ]' "$FIXTURES/complete.json" >"$BATS_TEST_TMPDIR/safe-freeform-paths.json"
+  run "$SCRIPT" "$BATS_TEST_TMPDIR/safe-freeform-paths.json"
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | jq -e '
+    .preview as $preview
+    | ($preview | contains("/api/file.json"))
+      and ($preview | contains("https://example.test/reports/file.json"))
+      and ($preview | contains("ENV-1/build-1"))
+      and ($preview | contains("QA data/cleanup is ordinary prose."))
+  ' >/dev/null
+}
+
 @test "builder renders the required report sections and closers in ADF" {
   run "$SCRIPT" "$FIXTURES/complete.json"
   [ "$status" -eq 0 ]

@@ -222,6 +222,167 @@ EOF
   done
 }
 
+@test "publisher rejects bare relative artifact paths in freeform ADF text" {
+  pathlikes=(
+    '"screenshots/private.png"'
+    "'reports/retained-data.json'"
+    "archives/evidence.zip"
+  )
+  for pathlike in "${pathlikes[@]}"; do
+    jq --arg path "$pathlike" '
+      .adf.content += [{type:"paragraph",content:[{type:"text",text:("Retained path: (" + $path + ").")}]}]
+      | .preview += "\nRetained path: (" + $path + ")."
+    ' "$ENVELOPE" >"$BATS_TEST_TMPDIR/bare-relative-artifact-path.json"
+    digest="$(jq -cS '.adf' "$BATS_TEST_TMPDIR/bare-relative-artifact-path.json" | shasum -a 256 | cut -d ' ' -f 1)"
+    jq --arg digest "$digest" '.body_digest = $digest' "$BATS_TEST_TMPDIR/bare-relative-artifact-path.json" \
+      >"$BATS_TEST_TMPDIR/re-digested-bare-relative-artifact-path.json"
+    run --separate-stderr "$SCRIPT" "$BATS_TEST_TMPDIR/re-digested-bare-relative-artifact-path.json" \
+      --key TEST-123 --expected-digest "$digest" --write
+    [ "$status" -ne 0 ] || return 1
+    [ -z "$output" ] || return 1
+    [ ! -e "$ACLI_LOG" ] || return 1
+  done
+}
+
+@test "publisher preserves API routes URLs and ordinary slash prose in freeform ADF text" {
+  jq '.adf.content += [{type:"paragraph",content:[{type:"text",text:
+        "Route: /api/file.json; URL: https://example.test/reports/file.json; Environment/build: ENV-1/build-1; QA data/cleanup is ordinary prose."
+      }]}]
+      | .preview += "\nRoute: /api/file.json; URL: https://example.test/reports/file.json; Environment/build: ENV-1/build-1; QA data/cleanup is ordinary prose."' \
+    "$ENVELOPE" >"$BATS_TEST_TMPDIR/safe-freeform-paths.json"
+  digest="$(jq -cS '.adf' "$BATS_TEST_TMPDIR/safe-freeform-paths.json" | shasum -a 256 | cut -d ' ' -f 1)"
+  jq --arg digest "$digest" '.body_digest = $digest' "$BATS_TEST_TMPDIR/safe-freeform-paths.json" \
+    >"$BATS_TEST_TMPDIR/re-digested-safe-freeform-paths.json"
+  run "$SCRIPT" "$BATS_TEST_TMPDIR/re-digested-safe-freeform-paths.json"
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | jq -e '
+    .status == "preview_only"
+      and (.preview | contains("/api/file.json"))
+      and (.preview | contains("https://example.test/reports/file.json"))
+      and (.preview | contains("ENV-1/build-1"))
+      and (.preview | contains("QA data/cleanup is ordinary prose."))
+  ' >/dev/null
+  [ ! -e "$ACLI_LOG" ]
+}
+
+@test "publisher rejects path tokens split across adjacent text nodes in one paragraph" {
+  pathpairs=(
+    "reports/|retained-data.json"
+    "/Users/example/|private.json"
+    "../private/|retained-data.json"
+  )
+  digest="$(jq -r '.body_digest' "$ENVELOPE")"
+  for pathpair in "${pathpairs[@]}"; do
+    IFS='|' read -r first second <<<"$pathpair"
+    jq --arg first "$first" --arg second "$second" '
+      .adf.content += [{type:"paragraph",content:[{type:"text",text:$first},{type:"text",text:$second}]}]
+      | .preview += "\n" + $first + $second
+    ' "$ENVELOPE" >"$BATS_TEST_TMPDIR/split-path.json"
+    digest="$(jq -cS '.adf' "$BATS_TEST_TMPDIR/split-path.json" | shasum -a 256 | cut -d ' ' -f 1)"
+    jq --arg digest "$digest" '.body_digest = $digest' "$BATS_TEST_TMPDIR/split-path.json" \
+      >"$BATS_TEST_TMPDIR/re-digested-split-path.json"
+    run --separate-stderr "$SCRIPT" "$BATS_TEST_TMPDIR/re-digested-split-path.json" \
+      --key TEST-123 --expected-digest "$digest" --write
+    [ "$status" -ne 0 ] || return 1
+    [ -z "$output" ] || return 1
+    [ ! -e "$ACLI_LOG" ] || return 1
+  done
+}
+
+@test "publisher scans logical paragraphs inside expands and table cells" {
+  jq '
+    .adf.content |= map(
+      if .type == "expand" and .attrs.title == "Environment" then
+        .content[0].content = [
+          {type:"text",text:"reports/"},
+          {type:"text",text:"retained-data.json"}
+        ]
+      else . end
+    )
+    | .preview |= sub("Environment: Synthetic test environment"; "reports/retained-data.json")
+  ' "$ENVELOPE" >"$BATS_TEST_TMPDIR/nested-expand-split-path.json"
+  digest="$(jq -cS '.adf' "$BATS_TEST_TMPDIR/nested-expand-split-path.json" | shasum -a 256 | cut -d ' ' -f 1)"
+  jq --arg digest "$digest" '.body_digest = $digest' "$BATS_TEST_TMPDIR/nested-expand-split-path.json" \
+    >"$BATS_TEST_TMPDIR/re-digested-nested-expand-split-path.json"
+  run --separate-stderr "$SCRIPT" "$BATS_TEST_TMPDIR/re-digested-nested-expand-split-path.json" \
+    --key TEST-123 --expected-digest "$digest" --write
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+  [ ! -e "$ACLI_LOG" ]
+
+  jq '
+    .adf.content |= map(
+      if .type == "expand" and .attrs.title == "Acceptance criteria" then
+        .content[0].content[1].content[0].content[0].content = [
+          {type:"text",text:"reports/"},
+          {type:"text",text:"retained-data.json"}
+        ]
+      else . end
+    )
+    | .preview |= sub("AC-1: Synthetic criterion is visible."; "reports/retained-data.json")
+  ' "$ENVELOPE" >"$BATS_TEST_TMPDIR/table-cell-split-path.json"
+  digest="$(jq -cS '.adf' "$BATS_TEST_TMPDIR/table-cell-split-path.json" | shasum -a 256 | cut -d ' ' -f 1)"
+  jq --arg digest "$digest" '.body_digest = $digest' "$BATS_TEST_TMPDIR/table-cell-split-path.json" \
+    >"$BATS_TEST_TMPDIR/re-digested-table-cell-split-path.json"
+  run --separate-stderr "$SCRIPT" "$BATS_TEST_TMPDIR/re-digested-table-cell-split-path.json" \
+    --key TEST-123 --expected-digest "$digest" --write
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+  [ ! -e "$ACLI_LOG" ]
+}
+
+@test "publisher concatenates benign adjacent paragraph text in its preview" {
+  jq '.adf.content += [{type:"paragraph",content:[
+        {type:"text",text:"Synthetic adjacent "},
+        {type:"text",text:"paragraph text."}
+      ]}]
+      | .preview += "\nSynthetic adjacent paragraph text."' \
+    "$ENVELOPE" >"$BATS_TEST_TMPDIR/adjacent-benign-text.json"
+  digest="$(jq -cS '.adf' "$BATS_TEST_TMPDIR/adjacent-benign-text.json" | shasum -a 256 | cut -d ' ' -f 1)"
+  jq --arg digest "$digest" '.body_digest = $digest' "$BATS_TEST_TMPDIR/adjacent-benign-text.json" \
+    >"$BATS_TEST_TMPDIR/re-digested-adjacent-benign-text.json"
+  run "$SCRIPT" "$BATS_TEST_TMPDIR/re-digested-adjacent-benign-text.json"
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | jq -e '
+    .status == "preview_only"
+      and (.preview | endswith("Synthetic adjacent paragraph text."))
+      and ((.preview | contains("Synthetic adjacent \nparagraph text.")) | not)
+  ' >/dev/null
+  [ ! -e "$ACLI_LOG" ]
+}
+
+@test "publisher does not join separate paragraphs or table cells when scanning paths" {
+  jq '.adf.content += [
+        {type:"paragraph",content:[{type:"text",text:"reports/"}]},
+        {type:"paragraph",content:[{type:"text",text:"retained-data.json"}]}
+      ]
+      | .preview += "\nreports/\nretained-data.json"' \
+    "$ENVELOPE" >"$BATS_TEST_TMPDIR/separate-paragraph-path-pieces.json"
+  digest="$(jq -cS '.adf' "$BATS_TEST_TMPDIR/separate-paragraph-path-pieces.json" | shasum -a 256 | cut -d ' ' -f 1)"
+  jq --arg digest "$digest" '.body_digest = $digest' "$BATS_TEST_TMPDIR/separate-paragraph-path-pieces.json" \
+    >"$BATS_TEST_TMPDIR/re-digested-separate-paragraph-path-pieces.json"
+  run "$SCRIPT" "$BATS_TEST_TMPDIR/re-digested-separate-paragraph-path-pieces.json"
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | jq -e '.status == "preview_only"' >/dev/null
+
+  jq '
+    .adf.content |= map(
+      if .type == "expand" and .attrs.title == "Acceptance criteria" then
+        .content[0].content[1].content[0].content[0].content[0].text = "reports/"
+        | .content[0].content[1].content[1].content[0].content[0].text = "retained-data.json"
+      else . end
+    )
+    | .preview = ([.adf.content[] | (if .type == "expand" then [.attrs.title] else [] end)[], (.. | objects | select(.type == "text") | .text)] | join("\n"))
+  ' "$ENVELOPE" >"$BATS_TEST_TMPDIR/separate-cell-path-pieces.json"
+  digest="$(jq -cS '.adf' "$BATS_TEST_TMPDIR/separate-cell-path-pieces.json" | shasum -a 256 | cut -d ' ' -f 1)"
+  jq --arg digest "$digest" '.body_digest = $digest' "$BATS_TEST_TMPDIR/separate-cell-path-pieces.json" \
+    >"$BATS_TEST_TMPDIR/re-digested-separate-cell-path-pieces.json"
+  run "$SCRIPT" "$BATS_TEST_TMPDIR/re-digested-separate-cell-path-pieces.json"
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | jq -e '.status == "preview_only"' >/dev/null
+  [ ! -e "$ACLI_LOG" ]
+}
+
 @test "publisher validates the evidence artifact column as marker or durable URL text" {
   jq '.adf.content |= map(
         if .type == "expand" and .attrs.title == "Evidence register" then
@@ -407,6 +568,44 @@ EOF
   ' >/dev/null
   [ "$(wc -l <"$ACLI_LOG" | tr -d ' ')" -eq 1 ]
   [[ "$output" != *"results"* ]]
+}
+
+@test "publisher treats a success-shaped response with missing status as uncertain" {
+  digest="$(jq -r '.body_digest' "$ENVELOPE")"
+  export ACLI_RESPONSE='{"results":[{"message":"synthetic-secret marker","id":"TEST-123"}],"totalCount":1,"successCount":1}'
+  export ACLI_STDERR='synthetic-secret from stderr'
+  run --separate-stderr "$SCRIPT" "$ENVELOPE" --key TEST-123 --expected-digest "$digest" --write
+  [ "$status" -eq 5 ]
+  [[ "$output" != *"synthetic-secret"* ]]
+  [[ "$stderr" != *"synthetic-secret"* ]]
+  printf '%s\n' "$output" | jq -e '
+    .status == "uncertain" and
+    .comment_id == null and
+    .comment_reference == "unknown" and
+    (.message | contains("do not retry automatically"))
+  ' >/dev/null
+  [ "$(wc -l <"$ACLI_LOG" | tr -d ' ')" -eq 1 ]
+  body_path="$(sed -n '8p' "$ACLI_ARGS")"
+  [ ! -e "$body_path" ]
+}
+
+@test "publisher treats a FAILED response with otherwise valid counts as uncertain" {
+  digest="$(jq -r '.body_digest' "$ENVELOPE")"
+  export ACLI_RESPONSE='{"results":[{"status":"FAILED","message":"synthetic-failed-secret marker","id":"TEST-123"}],"totalCount":1,"successCount":1}'
+  export ACLI_STDERR='synthetic-failed-secret from stderr'
+  run --separate-stderr "$SCRIPT" "$ENVELOPE" --key TEST-123 --expected-digest "$digest" --write
+  [ "$status" -eq 5 ]
+  [[ "$output" != *"synthetic-failed-secret"* ]]
+  [[ "$stderr" != *"synthetic-failed-secret"* ]]
+  printf '%s\n' "$output" | jq -e '
+    .status == "uncertain" and
+    .comment_id == null and
+    .comment_reference == "unknown" and
+    (.message | contains("do not retry automatically"))
+  ' >/dev/null
+  [ "$(wc -l <"$ACLI_LOG" | tr -d ' ')" -eq 1 ]
+  body_path="$(sed -n '8p' "$ACLI_ARGS")"
+  [ ! -e "$body_path" ]
 }
 
 @test "publisher rejects multiple, partial, and mismatched create results" {

@@ -155,7 +155,8 @@ if ! envelope="$(jq -sc '
       or ($text | test("//[^/[:space:]]+/[^/[:space:]]+"))
       or ($text | test("\\.\\.?[\\\\/][^[:space:]]+"))
       or ($text | test("~[/\\\\][^[:space:]]+"))
-      or ($text | test("file://"));
+      or ($text | test("file://"))
+      or ($text | test("(?i)(^|[^[:alnum:]_/\\\\])([[:alnum:]_.-]+[/\\\\])+[[:alnum:]_.-]+\\.(png|jpg|jpeg|gif|webp|svg|pdf|json|txt|log|csv|zip|har|mp4)(?=$|[^[:alnum:]_.-])"));
   def safe_evidence_path:
     . as $path
     | type == "string" and length > 0
@@ -200,8 +201,16 @@ if ! envelope="$(jq -sc '
       end;
   def block_texts:
     . as $block
-    | (if $block.type == "expand" then [$block.attrs.title] else [] end)
-      + [$block | .. | objects | select(.type == "text") | .text];
+    | if $block.type == "heading" or $block.type == "paragraph" then
+        [($block | paragraph_text)]
+      elif $block.type == "expand" then
+        [$block.attrs.title] + [
+          $block.content[] |
+          if .type == "paragraph" then paragraph_text
+          elif .type == "table" then (.content[] | .content[] | cell_text)
+          else empty end
+        ]
+      else [] end;
   def adf_texts: [.content[] | block_texts[]];
   def valid_handoff:
     . as $a

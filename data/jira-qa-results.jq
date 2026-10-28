@@ -49,6 +49,8 @@ def outcome_rows_valid($rows; $input):
     and resolves_evidence(.; $input));
 def title($parent): "Agent-assisted manual QA — \($parent.key): \($parent.summary)";
 def without_http_urls: gsub("https?://[^[:space:]<>]+"; "");
+def has_bare_relative_artifact_path:
+  test("(?i)(^|[^[:alnum:]_/\\\\])([[:alnum:]_.-]+[/\\\\])+[[:alnum:]_.-]+\\.(png|jpg|jpeg|gif|webp|svg|pdf|json|txt|log|csv|zip|har|mp4)(?=$|[^[:alnum:]_.-])");
 def has_local_path:
   without_http_urls as $text
   | ($text | test("/(Users|Volumes|mnt|private/var|tmp|var/folders|home|root|workspace|workspaces|Applications|Library|System)(/|$)"))
@@ -57,7 +59,8 @@ def has_local_path:
     or ($text | test("//[^/[:space:]]+/[^/[:space:]]+"))
     or ($text | test("\\.\\.?[\\\\/][^[:space:]]+"))
     or ($text | test("~[/\\\\][^[:space:]]+"))
-    or ($text | test("file://"));
+    or ($text | test("file://"))
+    or ($text | has_bare_relative_artifact_path);
 def safe_evidence_path:
   . as $path
   | nonempty_string
