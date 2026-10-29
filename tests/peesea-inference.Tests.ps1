@@ -14,10 +14,20 @@ function Get-PeeseaCatalogFixtureMetadata {
       Vision = $false
     }
   }
+  if ($Profile.Name -eq 'Qwen27B') {
+    return [pscustomobject]@{
+      DisplayName = 'Qwen3.8 27B'
+      Publisher = 'qwen'
+      SizeBytes = 17742040464
+      ParamsString = '27B'
+      Architecture = 'qwen35'
+      Vision = $true
+    }
+  }
   return [pscustomobject]@{
-    DisplayName = 'Qwen3.8 27B'
-    Publisher = 'qwen'
-    SizeBytes = 17742040464
+    DisplayName = 'Swift 1.5 Qwen3.8 27B'
+    Publisher = 'ukisai'
+    SizeBytes = 18370006848
     ParamsString = '27B'
     Architecture = 'qwen35'
     Vision = $true
@@ -67,7 +77,7 @@ function New-PeeseaStandaloneModelFixture {
   )
 
   $metadata = Get-PeeseaCatalogFixtureMetadata -Profile $Profile
-  return [pscustomobject]@{
+  $fixture = [pscustomobject]@{
     type = 'llm'
     modelKey = $Profile.ModelKey
     format = 'gguf'
@@ -76,6 +86,11 @@ function New-PeeseaStandaloneModelFixture {
     path = $Path
     deviceIdentifier = $null
   }
+  if ($Profile.IdentityKind -eq 'StandalonePhysical') {
+    $fixture | Add-Member -NotePropertyName indexedModelIdentifier -NotePropertyValue $Profile.IndexedModelIdentifier
+    $fixture | Add-Member -NotePropertyName quantization -NotePropertyValue ([pscustomobject]@{ name = $Profile.QuantizationName; bits = 4 })
+  }
+  return $fixture
 }
 
 function New-PeeseaVariantDetailFixture {
@@ -117,10 +132,12 @@ function Get-PeeseaCatalogJsonFixture {
 
   $coder = Get-PeeseaProfile -Model Coder
   $qwen = Get-PeeseaProfile -Model Qwen27B
+  $swift = Get-PeeseaProfile -Model Swift27B
   if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
     return @(
       (New-PeeseaCatalogBaseFixture -Profile $coder)
       (New-PeeseaCatalogBaseFixture -Profile $qwen)
+      (New-PeeseaStandaloneModelFixture -Profile $swift -Path $swift.IndexedModelIdentifier)
     )
   }
   if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[2] -eq '--json') {
@@ -232,6 +249,7 @@ Describe 'Peesea inference launcher' {
     Mock Enter-PeeseaLaunchLock { $true }
     Mock Exit-PeeseaLaunchLock {}
     Mock Get-PeeseaCurrentUserSid { 'S-1-5-21-test-user' }
+    Mock Write-Host {}
     Mock Get-PeeseaProcessRecords { @() }
     Mock Get-PeeseaProcessRecordById { $null }
     Mock Get-PeeseaProcessOwnerSid { $null }
@@ -268,6 +286,60 @@ Describe 'Peesea inference launcher' {
     Assert-MockCalled Get-PeeseaCurrentUserSid -Times 1 -Scope It
     Assert-MockCalled Invoke-PeeseaLms -Times 0 -Scope It
     Assert-MockCalled Exit-PeeseaLaunchLock -Times 1 -Scope It
+  }
+
+  It 'announces cleanup and profile validation before their blocking operations' {
+    $global:PeeseaTestPhaseTimeline = @()
+    Mock Write-Host {
+      $global:PeeseaTestPhaseTimeline += 'phase:' + [string]::Join('', @($Object))
+    }
+    Mock Get-PeeseaCurrentUserSid {
+      $global:PeeseaTestPhaseTimeline += 'cleanup'
+      'S-1-5-21-test-user'
+    }
+    Mock Get-PeeseaLmsJson {
+      $global:PeeseaTestPhaseTimeline += 'metadata:' + ($Arguments -join ' ')
+      Get-PeeseaCatalogJsonFixture -Arguments $Arguments
+    }
+    Mock Get-PeeseaServerStatus {
+      $global:PeeseaTestPhaseTimeline += 'server-status'
+      [pscustomobject]@{ Running = $true; Port = 1234 }
+    }
+    Mock Get-PeeseaLoadedModels {
+      $global:PeeseaTestLoadedReadCount++
+      $global:PeeseaTestPhaseTimeline += "models:$($global:PeeseaTestLoadedReadCount)"
+      $profile = Get-PeeseaProfile -Model Coder
+      @(New-PeeseaLoadedLlmFixture -Profile $profile)
+    }
+
+    $result = Invoke-PeeseaInference -Model Coder
+    $timeline = @($global:PeeseaTestPhaseTimeline)
+    $cleanupPhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Starting approved process cleanup' })
+    $cleanupIndex = [array]::IndexOf($timeline, 'cleanup')
+    $validationPhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Validating Coder profile and downloaded model identity' })
+    $metadataIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -eq 'metadata:ls --json' })
+    $serverCheckPhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Checking LM Studio server status' })
+    $serverStatusIndex = [array]::IndexOf($timeline, 'server-status')
+    $serverReusePhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Reusing verified LM Studio server' })
+    $modelCheckPhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Checking loaded model state' })
+    $modelReadIndex = [array]::IndexOf($timeline, 'models:1')
+    $modelReusePhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Reusing verified loaded Coder model' })
+    $finalVerificationPhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Verifying final model and server state' })
+    $finalModelReadIndex = [array]::IndexOf($timeline, 'models:2')
+
+    $cleanupPhaseIndex | Should BeGreaterThan -1
+    $cleanupPhaseIndex | Should BeLessThan $cleanupIndex
+    $cleanupIndex | Should BeLessThan $validationPhaseIndex
+    $validationPhaseIndex | Should BeLessThan $metadataIndex
+    $metadataIndex | Should BeLessThan $serverCheckPhaseIndex
+    $serverCheckPhaseIndex | Should BeLessThan $serverStatusIndex
+    $serverStatusIndex | Should BeLessThan $serverReusePhaseIndex
+    $serverReusePhaseIndex | Should BeLessThan $modelCheckPhaseIndex
+    $modelCheckPhaseIndex | Should BeLessThan $modelReadIndex
+    $modelReadIndex | Should BeLessThan $modelReusePhaseIndex
+    $modelReusePhaseIndex | Should BeLessThan $finalVerificationPhaseIndex
+    $finalVerificationPhaseIndex | Should BeLessThan $finalModelReadIndex
+    (@($result.PSObject.Properties.Name) -join ',') | Should Be 'Ready,ExitCode,Message'
   }
 
   It 'continues launching when a noncritical process cleanup inventory fails' {
@@ -723,6 +795,47 @@ Describe 'Peesea inference launcher' {
     $global:PeeseaOtherProfileVariantQueries.Count | Should Be 1
   }
 
+  It 'loads Swift 1.5 by its exact standalone Q4_K_M path and preserves the embedding model' {
+    $global:PeeseaTestLoadedReadCount = 0
+    $global:PeeseaTestLmsCalls = @()
+    $global:PeeseaSwiftVariantQueries = @()
+    Mock Get-PeeseaLmsJson {
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq 'swift-1.5-qwen3.8-27b') {
+        $global:PeeseaSwiftVariantQueries += ,@($Arguments)
+      }
+      Get-PeeseaCatalogJsonFixture -Arguments $Arguments
+    }
+    Mock Get-PeeseaLoadedModels {
+      $global:PeeseaTestLoadedReadCount++
+      $profile = Get-PeeseaProfile -Model Swift27B
+      $embedding = New-PeeseaLoadedEmbeddingFixture
+      if ($global:PeeseaTestLoadedReadCount -eq 1) { return @($embedding) }
+      return @(
+        $embedding
+        (New-PeeseaLoadedLlmFixture -Profile $profile -CatalogPath $profile.IndexedModelIdentifier -IndexedModelIdentifier $profile.IndexedModelIdentifier -SelectedVariant '' -QuantizationName 'Q4_K_M' -VariantKeys @())
+      )
+    }
+    Mock Invoke-PeeseaLms {
+      $global:PeeseaTestLmsCalls += ,@($Arguments)
+      [pscustomobject]@{ ExitCode = 0; Output = '' }
+    }
+
+    $profile = Get-PeeseaProfile -Model Swift27B
+    $result = Invoke-PeeseaInference -Model Swift27B
+
+    $result.Ready | Should Be $true
+    $result.Message | Should Match 'Ready: loaded Swift27B'
+    $loadCalls = @($global:PeeseaTestLmsCalls | Where-Object { $_[0] -eq 'load' })
+    $loadCalls.Count | Should Be 1
+    $loadCalls[0][1] | Should Be 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
+    ($loadCalls[0] -contains '--exact') | Should Be $true
+    $loadCalls[0][$loadCalls[0].IndexOf('--context-length') + 1] | Should Be '81920'
+    $loadCalls[0][$loadCalls[0].IndexOf('--identifier') + 1] | Should Be 'swift-1.5-qwen3.8-27b'
+    @($global:PeeseaTestLmsCalls | Where-Object { $_[0] -eq 'unload' -and $_[1] -eq 'text-embedding-nomic-embed-text-v1.5' }).Count | Should Be 0
+    $global:PeeseaSwiftVariantQueries.Count | Should Be 0
+    $profile.QuantizationName | Should Be 'Q4_K_M'
+  }
+
   It 'loads a standalone physical-path record with its exact original selector' {
     $profile = Get-PeeseaProfile -Model Coder
     $relativePhysicalPath = 'lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf'
@@ -996,7 +1109,37 @@ Describe 'Peesea inference launcher' {
     (Test-PeeseaProcessObjectIdentity -ProcessRecord $original -ProcessObject $processObject) | Should Be $false
   }
 
-  It 'treats the Swift catalog model as unknown and refuses to act on it' {
+  It 'treats an unknown local LLM as unknown and refuses to act on it' {
+    Mock Get-PeeseaLoadedModels {
+      @([pscustomobject]@{
+        Type = 'llm'
+        Identifier = 'unknown-qwen3.8-27b'
+        ModelKey = 'unknown-qwen3.8-27b'
+        CatalogPath = 'ukisai/other-model/unknown.gguf'
+        IndexedModelIdentifier = 'ukisai/other-model/unknown.gguf'
+        SelectedVariant = ''
+        VariantKeys = @()
+        QuantizationName = 'Q4_K_L'
+        DeviceIdentifier = $null
+        ContextLength = 81920
+        Status = 'idle'
+        Queued = 0
+      })
+    }
+
+    $swift = @(Get-PeeseaLoadedModels)
+    (Get-PeeseaProfileForLoadedModel -LoadedModel $swift[0]) | Should Be $null
+
+    $result = Invoke-PeeseaInference -Model Qwen27B
+
+    $result.Ready | Should Be $false
+    $result.ExitCode | Should Be 1
+    $result.Message | Should Match 'unknown catalog or physical identity'
+    Assert-MockCalled Invoke-PeeseaLms -Times 0 -Scope It
+    Assert-MockCalled Exit-PeeseaLaunchLock -Times 1 -Scope It
+  }
+
+  It 'does not classify or unload the original Swift Q4_K_L model as Swift 1.5' {
     Mock Get-PeeseaLoadedModels {
       @([pscustomobject]@{
         Type = 'llm'
@@ -1014,10 +1157,7 @@ Describe 'Peesea inference launcher' {
       })
     }
 
-    $swift = @(Get-PeeseaLoadedModels)
-    (Get-PeeseaProfileForLoadedModel -LoadedModel $swift[0]) | Should Be $null
-
-    $result = Invoke-PeeseaInference -Model Qwen27B
+    $result = Invoke-PeeseaInference -Model Swift27B
 
     $result.Ready | Should Be $false
     $result.ExitCode | Should Be 1
@@ -1202,6 +1342,7 @@ Describe 'LM Studio CLI JSON boundary' {
     $global:PeeseaRawCatalogSnapshot = @'
 [
   {"type":"llm","modelKey":"swift-qwen3.8-27b","format":"gguf","displayName":"Swift Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-Qwen3.8-27B-GGUF/Swift-Qwen3.8-27B-Q4_K_L.gguf","sizeBytes":19960648224,"indexedModelIdentifier":"ukisai/Swift-Qwen3.8-27B-GGUF/Swift-Qwen3.8-27B-Q4_K_L.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_L","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144},
+  {"type":"llm","modelKey":"swift-1.5-qwen3.8-27b","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144},
   {"type":"llm","modelKey":"qwen/qwen3.8-27b","format":"gguf","displayName":"Qwen3.8 27B","publisher":"qwen","path":"qwen/qwen3.8-27b","sizeBytes":17742040464,"indexedModelIdentifier":"qwen/qwen3.8-27b","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"variants":["qwen/qwen3.8-27b@q4_k_m"],"selectedVariant":"qwen/qwen3.8-27b@q4_k_m","vision":true,"trainedForToolUse":true,"maxContextLength":262144},
   {"type":"llm","modelKey":"qwen/qwen3-coder-30b","format":"gguf","displayName":"Qwen3 Coder 30B","publisher":"qwen","path":"qwen/qwen3-coder-30b","sizeBytes":18632365388,"indexedModelIdentifier":"qwen/qwen3-coder-30b","deviceIdentifier":null,"paramsString":"30B-A3B","architecture":"qwen3moe","quantization":{"name":"Q4_K_M","bits":4},"variants":["qwen/qwen3-coder-30b@q4_k_m"],"selectedVariant":"qwen/qwen3-coder-30b@q4_k_m","vision":false,"trainedForToolUse":true,"maxContextLength":262144},
   {"type":"embedding","modelKey":"text-embedding-nomic-embed-text-v1.5","format":"gguf","displayName":"Nomic Embed Text v1.5","publisher":"nomic-ai","path":"nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q4_K_M.gguf","sizeBytes":84106624,"indexedModelIdentifier":"nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q4_K_M.gguf","deviceIdentifier":null,"architecture":"nomic-bert","quantization":{"name":"Q4_K_M","bits":4},"maxContextLength":2048}
@@ -1241,8 +1382,10 @@ Describe 'LM Studio CLI JSON boundary' {
     $loaded = @(Get-PeeseaLoadedModels)
     $mappedProfile = Get-PeeseaProfileForLoadedModel -LoadedModel $loaded[0]
 
-    $records.Count | Should Be 4
+    $records.Count | Should Be 5
     $records[0].modelKey | Should Be 'swift-qwen3.8-27b'
+    $records[1].modelKey | Should Be 'swift-1.5-qwen3.8-27b'
+    $records[1].path | Should Be 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
     $coderTarget.LmsPath | Should Be 'qwen/qwen3-coder-30b'
     $coderTarget.VariantKey | Should Be 'qwen/qwen3-coder-30b@q4_k_m'
     $coderTarget.IndexedModelIdentifier | Should Be 'qwen/qwen3-coder-30b@lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf'
@@ -1493,6 +1636,497 @@ Describe 'LM Studio CLI JSON boundary' {
 
   AfterEach {
     Remove-Variable -Name PeeseaCliFixture, PeeseaContextFixtures, PeeseaContextFixtureIndex, PeeseaBaseCliJson, PeeseaDetailCliJson, PeeseaLmsCallLog, PeeseaLsJson, PeeseaQwenVariantJson, PeeseaLoadedQwenJson -Scope Global -ErrorAction SilentlyContinue
+  }
+}
+
+Describe 'Peesea streamed process adapter' {
+  It 'streams an ANSI progress chunk before the child exits and preserves argument boundaries' {
+    $fakeRoot = Join-Path $env:TEMP ('peesea progress fake ' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fakeRoot | Out-Null
+    $fakeScript = Join-Path $fakeRoot 'fake action.ps1'
+    $childResultPath = Join-Path $fakeRoot 'child result.txt'
+    $powershellPath = Join-Path $PSHOME 'powershell.exe'
+    $token = 'token with spaces "and quotes" plus trailing slash\'
+    $global:PeeseaFakePowerShellPath = $powershellPath
+    $fakeChild = @'
+param([string]$ChildResultPath, [string]$Token)
+[Console]::Out.Write(([char]27).ToString() + '[2KPEESEA_PROGRESS_TOKEN')
+[Console]::Out.Flush()
+Start-Sleep -Milliseconds 400
+[IO.File]::WriteAllText($ChildResultPath, 'progress-emitted-before-exit|' + $Token)
+exit 0
+'@
+    [IO.File]::WriteAllText($fakeScript, $fakeChild, [Text.Encoding]::Unicode)
+    Mock Get-Command {
+      if ($Name -eq 'lms') {
+        return [pscustomobject]@{ Source = $global:PeeseaFakePowerShellPath }
+      }
+      throw "Unexpected command discovery in the native progress test: $Name"
+    }
+    try {
+      $result = Invoke-PeeseaLms -Arguments @(
+        '-NoProfile', '-NonInteractive', '-File', $fakeScript, $childResultPath, $token
+      )
+
+      $result.ExitCode | Should Be 0
+      $result.Output | Should Be ''
+      (Get-Content -LiteralPath $childResultPath -Raw) | Should Be "progress-emitted-before-exit|$token"
+      ($result -is [System.Array]) | Should Be $false
+    } finally {
+      Remove-Variable -Name PeeseaFakePowerShellPath -Scope Global -ErrorAction SilentlyContinue
+      if (Test-Path -LiteralPath $fakeRoot) {
+        Remove-Item -LiteralPath $fakeRoot -Recurse -Force
+      }
+    }
+  }
+
+  It 'observes ANSI progress before native-child exit through the outer controller result capture' {
+    $fakeRoot = Join-Path $env:TEMP ('peesea temporal progress fake ' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fakeRoot | Out-Null
+    $wrapperScript = Join-Path $fakeRoot 'outer controller harness.ps1'
+    $nativeScript = Join-Path $fakeRoot 'fake native load.ps1'
+    $releasePath = Join-Path $fakeRoot 'release native child.flag'
+    $nativeDonePath = Join-Path $fakeRoot 'native child result.txt'
+    $controllerResultPath = Join-Path $fakeRoot 'controller result.json'
+    $fakeNative = @'
+param([string]$ReleasePath, [string]$DonePath)
+[Console]::Out.Write(([char]27).ToString() + '[2KPEESEA_TEMPORAL_PROGRESS_TOKEN')
+[Console]::Out.Flush()
+$deadline = [DateTime]::UtcNow.AddSeconds(7)
+while (-not (Test-Path -LiteralPath $ReleasePath) -and [DateTime]::UtcNow -lt $deadline) {
+  Start-Sleep -Milliseconds 25
+}
+if (Test-Path -LiteralPath $ReleasePath) {
+  [IO.File]::WriteAllText($DonePath, 'released-before-native-exit')
+  exit 0
+}
+[IO.File]::WriteAllText($DonePath, 'native-child-timed-out')
+exit 19
+'@
+    [IO.File]::WriteAllText($nativeScript, $fakeNative, [Text.Encoding]::Unicode)
+$fakeWrapper = @'
+param([string]$LauncherScript, [string]$NativeScript, [string]$ReleasePath, [string]$NativeDonePath, [string]$ResultPath, [string]$UseOldCapture)
+. $LauncherScript
+if ($UseOldCapture -eq 'True') {
+  function Invoke-PeeseaStreamedNativeCall {
+    param([string]$ExecutablePath, [string[]]$Arguments)
+    $discardedOutput = & $ExecutablePath @Arguments 2>&1
+    return [int]$LASTEXITCODE
+  }
+}
+$global:PeeseaOuterLoadedState = 'empty'
+$global:PeeseaOuterLockReleased = $false
+$global:PeeseaOuterNativeScript = $NativeScript
+$global:PeeseaOuterReleasePath = $ReleasePath
+$global:PeeseaOuterNativeDonePath = $NativeDonePath
+function Invoke-PeeseaCleanup {}
+function Enter-PeeseaLaunchLock { return 'owned-fake-lock' }
+function Exit-PeeseaLaunchLock { param($Lock); $global:PeeseaOuterLockReleased = $true }
+function Test-PeeseaModelFile { param([string]$Path); return $true }
+function Get-PeeseaServerStatus { return [pscustomobject]@{ Running = $true; Port = 1234 } }
+function Get-PeeseaServerListener {
+  param([int]$Port)
+  $path = Join-Path $env:LOCALAPPDATA 'Programs\LM Studio\LM Studio.exe'
+  return [pscustomobject]@{
+    Exists = $true; Port = 1234; LocalAddress = '0.0.0.0'; ProcessName = 'LM Studio.exe'
+    ProcessPath = $path; ExpectedProcessPath = $path
+  }
+}
+function Get-PeeseaLoadedModels {
+  if ($global:PeeseaOuterLoadedState -ne 'loaded') { return @() }
+  $profile = Get-PeeseaProfile -Model Coder
+  return @([pscustomobject]@{
+    Type = 'llm'; Identifier = $profile.Identifier; ModelKey = $profile.ModelKey
+    CatalogPath = $profile.CatalogPath; IndexedModelIdentifier = $profile.ModelKey
+    SelectedVariant = $profile.VariantKey; VariantKeys = @($profile.VariantKey)
+    QuantizationName = $profile.QuantizationName; DeviceIdentifier = $null
+    ContextLength = 81920; Status = 'idle'; Queued = 0
+  })
+}
+function Invoke-PeeseaLms {
+  param([string[]]$Arguments)
+  if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+    return [pscustomobject]@{ ExitCode = 0; Output = $global:PeeseaOuterBaseJson }
+  }
+  if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq 'qwen/qwen3-coder-30b') {
+    return [pscustomobject]@{ ExitCode = 0; Output = $global:PeeseaOuterDetailJson }
+  }
+  if ($Arguments[0] -eq 'load') {
+    $exitCode = Invoke-PeeseaStreamedNativeCall -ExecutablePath (Join-Path $PSHOME 'powershell.exe') -Arguments @(
+      '-NoProfile', '-NonInteractive', '-File', $global:PeeseaOuterNativeScript,
+      $global:PeeseaOuterReleasePath, $global:PeeseaOuterNativeDonePath
+    )
+    if ($exitCode -eq 0) { $global:PeeseaOuterLoadedState = 'loaded' }
+    return [pscustomobject]@{ ExitCode = $exitCode; Output = '' }
+  }
+  throw "Unexpected fake lms call: $($Arguments -join ' ')"
+}
+$global:PeeseaOuterBaseJson = '[{"type":"llm","modelKey":"qwen/qwen3-coder-30b","format":"gguf","displayName":"Qwen3 Coder 30B","publisher":"qwen","path":"qwen/qwen3-coder-30b","sizeBytes":18632365388,"indexedModelIdentifier":"qwen/qwen3-coder-30b","deviceIdentifier":null,"paramsString":"30B-A3B","architecture":"qwen3moe","quantization":{"name":"Q4_K_M","bits":4},"variants":["qwen/qwen3-coder-30b@q4_k_m"],"selectedVariant":"qwen/qwen3-coder-30b@q4_k_m","vision":false,"trainedForToolUse":true,"maxContextLength":262144}]'
+$global:PeeseaOuterDetailJson = '[{"type":"llm","modelKey":"qwen/qwen3-coder-30b@q4_k_m","format":"gguf","displayName":"Qwen3 Coder 30B","publisher":"qwen","path":"qwen/qwen3-coder-30b","sizeBytes":18632365388,"indexedModelIdentifier":"qwen/qwen3-coder-30b@lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"30B-A3B","architecture":"qwen3moe","quantization":{"name":"Q4_K_M","bits":4},"vision":false,"trainedForToolUse":true,"maxContextLength":262144}]'
+$result = Invoke-PeeseaInference -Model Coder
+[IO.File]::WriteAllText($ResultPath, (ConvertTo-Json -InputObject ([pscustomobject]@{
+  Ready = $result.Ready
+  ExitCode = $result.ExitCode
+  Message = $result.Message
+  ResultProperties = @($result.PSObject.Properties.Name) -join ','
+  LockReleased = $global:PeeseaOuterLockReleased
+}) -Compress))
+'@
+    [IO.File]::WriteAllText($wrapperScript, $fakeWrapper, [Text.Encoding]::Unicode)
+    $powershellPath = Join-Path $PSHOME 'powershell.exe'
+    $process = $null
+    $modes = @(
+      [pscustomobject]@{ Name = 'old-capture'; UseOldCapture = $true; ExpectProgressBeforeRelease = $false }
+      [pscustomobject]@{ Name = 'streamed'; UseOldCapture = $false; ExpectProgressBeforeRelease = $true }
+    )
+
+    try {
+      foreach ($mode in $modes) {
+        $releasePath = Join-Path $fakeRoot ($mode.Name + '.release')
+        $nativeDonePath = Join-Path $fakeRoot ($mode.Name + '.native-result')
+        $controllerResultPath = Join-Path $fakeRoot ($mode.Name + '.controller-result')
+        $wrapperArguments = @(
+          '-NoProfile', '-NonInteractive', '-File', $wrapperScript,
+          $script:PeeseaInferenceScript, $nativeScript, $releasePath, $nativeDonePath,
+          $controllerResultPath, [string]$mode.UseOldCapture
+        )
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $powershellPath
+        $startInfo.Arguments = (($wrapperArguments | ForEach-Object {
+              ConvertTo-PeeseaNativeCommandLineArgument -Argument $_
+            }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $false
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw "Could not start the $($mode.Name) controller fake process." }
+        $ownedPid = $process.Id
+        $ownedStartTime = $process.StartTime
+
+        $buffer = New-Object char[] 512
+        $capturedOutput = ''
+        $observedBeforeRelease = $false
+        $readTask = $process.StandardOutput.ReadAsync($buffer, 0, $buffer.Length)
+        $observeSeconds = if ($mode.UseOldCapture) { 3 } else { 4 }
+        $observeDeadline = [DateTime]::UtcNow.AddSeconds($observeSeconds)
+        while (-not $observedBeforeRelease -and -not $process.HasExited -and
+          [DateTime]::UtcNow -lt $observeDeadline) {
+          if ($readTask.Wait(100)) {
+            $readCount = $readTask.Result
+            if ($readCount -le 0) { break }
+            $capturedOutput += [string]::new($buffer, 0, $readCount)
+            $observedBeforeRelease = $capturedOutput.Contains('PEESEA_TEMPORAL_PROGRESS_TOKEN')
+            if (-not $observedBeforeRelease) {
+              $readTask = $process.StandardOutput.ReadAsync($buffer, 0, $buffer.Length)
+            }
+          }
+        }
+
+        $wrapperWasAliveBeforeRelease = -not $process.HasExited
+        $resultWasAbsentBeforeRelease = -not (Test-Path -LiteralPath $controllerResultPath)
+        [IO.File]::WriteAllText($releasePath, 'release')
+        $process.WaitForExit(8000) | Should Be $true
+        if (-not $readTask.IsCompleted) { $readTask.Wait(1000) | Out-Null }
+        if ($readTask.IsCompleted) {
+          $remainingCount = $readTask.Result
+          if ($remainingCount -gt 0) {
+            $capturedOutput += [string]::new($buffer, 0, $remainingCount)
+          }
+        }
+        $controllerResult = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $controllerResultPath -Raw)
+
+        $observedBeforeRelease | Should Be $mode.ExpectProgressBeforeRelease
+        if ($mode.ExpectProgressBeforeRelease) {
+          $progressIndex = $capturedOutput.IndexOf('PEESEA_TEMPORAL_PROGRESS_TOKEN')
+          ($progressIndex -gt 3) | Should Be $true
+          $progressSequence = $capturedOutput.Substring($progressIndex - 4, 4 + 'PEESEA_TEMPORAL_PROGRESS_TOKEN'.Length)
+          $progressSequence | Should Be (([char]27).ToString() + '[2KPEESEA_TEMPORAL_PROGRESS_TOKEN')
+        }
+        $wrapperWasAliveBeforeRelease | Should Be $true
+        $resultWasAbsentBeforeRelease | Should Be $true
+        (Get-Content -LiteralPath $nativeDonePath -Raw) | Should Be 'released-before-native-exit'
+        $controllerResult.Ready | Should Be $true
+        $controllerResult.ExitCode | Should Be 0
+        $controllerResult.Message | Should Match 'Ready: loaded Coder'
+        $controllerResult.Message | Should Not Match 'PEESEA_TEMPORAL_PROGRESS_TOKEN'
+        $controllerResult.ResultProperties | Should Be 'Ready,ExitCode,Message'
+        $controllerResult.LockReleased | Should Be $true
+        $process.Dispose()
+        $process = $null
+      }
+    } finally {
+      foreach ($modeName in @('old-capture', 'streamed')) {
+        [IO.File]::WriteAllText((Join-Path $fakeRoot ($modeName + '.release')), 'release')
+      }
+      if ($null -ne $process -and -not $process.HasExited) {
+        try {
+          $process.WaitForExit(8000) | Out-Null
+        } catch { }
+        if (-not $process.HasExited) {
+          $currentProcess = Get-Process -Id $ownedPid -ErrorAction SilentlyContinue
+          if ($null -ne $currentProcess -and $currentProcess.StartTime -eq $ownedStartTime) {
+            $process.Kill()
+            $process.WaitForExit()
+          }
+        }
+      }
+      if ($null -ne $process) { $process.Dispose() }
+      if (Test-Path -LiteralPath $fakeRoot) {
+        Remove-Item -LiteralPath $fakeRoot -Recurse -Force
+      }
+    }
+  }
+}
+
+Describe 'Peesea launcher completion' {
+  It 'exposes an explicit keep-console-open switch for desktop launchers' {
+    $scriptCommand = Get-Command -Name $script:PeeseaInferenceScript -CommandType ExternalScript
+
+    $scriptCommand.Parameters.ContainsKey('KeepConsoleOpen') | Should Be $true
+  }
+
+  It 'keeps desktop success and failure results visible in a NoExit shell' {
+    $fakeRoot = Join-Path $env:TEMP ('peesea desktop completion fake ' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fakeRoot | Out-Null
+    $harness = Join-Path $fakeRoot 'desktop harness.ps1'
+    $fakeHarness = @'
+param([string]$LauncherScript, [int]$ExitCode, [string]$Message, [string]$CompletionMarker)
+. $LauncherScript
+$global:PeeseaFakeLauncherResult = [pscustomobject]@{
+  Ready = ($ExitCode -eq 0)
+  ExitCode = $ExitCode
+  Message = $Message
+}
+function Invoke-PeeseaInference {
+  param([ValidateSet('Coder', 'Qwen27B')][string]$Model = 'Coder')
+  return $global:PeeseaFakeLauncherResult
+}
+try {
+  Invoke-PeeseaLauncherEntryPoint -Model Coder -KeepConsoleOpen | Out-Null
+  [IO.File]::WriteAllText($CompletionMarker, 'entry-returned')
+} catch {
+  [IO.File]::WriteAllText($CompletionMarker, 'entry-failed:' + $_.Exception.Message)
+  exit 91
+}
+'@
+    [IO.File]::WriteAllText($harness, $fakeHarness, [Text.Encoding]::Unicode)
+    $powershellPath = Join-Path $PSHOME 'powershell.exe'
+
+    try {
+      foreach ($case in @(
+        [pscustomobject]@{ ExitCode = 0; Message = 'Ready: reused Coder' }
+        [pscustomobject]@{ ExitCode = 1; Message = 'Inference launcher failed: fake error' }
+      )) {
+        $completionMarker = Join-Path $fakeRoot ('completion-' + $case.ExitCode + '.txt')
+        $arguments = @(
+          '-NoProfile', '-NoLogo', '-NoExit', '-File', $harness,
+          $script:PeeseaInferenceScript, [string]$case.ExitCode, $case.Message, $completionMarker
+        )
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $powershellPath
+        $startInfo.Arguments = (($arguments | ForEach-Object {
+              ConvertTo-PeeseaNativeCommandLineArgument -Argument $_
+            }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'Could not start the desktop completion fake process.' }
+        try {
+          $deadline = [DateTime]::UtcNow.AddSeconds(5)
+          while (-not (Test-Path -LiteralPath $completionMarker) -and
+            -not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 25
+          }
+          (Test-Path -LiteralPath $completionMarker) | Should Be $true
+          $process.HasExited | Should Be $false
+          (Get-Content -LiteralPath $completionMarker -Raw) | Should Be 'entry-returned'
+
+          $process.StandardInput.WriteLine('exit')
+          $process.StandardInput.Flush()
+          $process.WaitForExit(5000) | Should Be $true
+          $output = $process.StandardOutput.ReadToEnd()
+          $output | Should Match ([regex]::Escape($case.Message))
+        } finally {
+          if (-not $process.HasExited) {
+            try {
+              $process.StandardInput.WriteLine('exit')
+              $process.StandardInput.Flush()
+            } catch { }
+            if (-not $process.WaitForExit(2000)) {
+              $process.Kill()
+              $process.WaitForExit()
+            }
+          }
+          $process.Dispose()
+        }
+      }
+    } finally {
+      if (Test-Path -LiteralPath $fakeRoot) {
+        Remove-Item -LiteralPath $fakeRoot -Recurse -Force
+      }
+    }
+  }
+
+  It 'preserves headless zero and nonzero process exits without prompts' {
+    $fakeRoot = Join-Path $env:TEMP ('peesea headless completion fake ' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fakeRoot | Out-Null
+    $harness = Join-Path $fakeRoot 'headless harness.ps1'
+    $fakeHarness = @'
+param([string]$LauncherScript, [int]$ExitCode, [string]$Message, [string]$ReturnedMarker)
+. $LauncherScript
+$global:PeeseaFakeLauncherResult = [pscustomobject]@{
+  Ready = ($ExitCode -eq 0)
+  ExitCode = $ExitCode
+  Message = $Message
+}
+function Invoke-PeeseaInference {
+  param([ValidateSet('Coder', 'Qwen27B')][string]$Model = 'Coder')
+  return $global:PeeseaFakeLauncherResult
+}
+Invoke-PeeseaLauncherEntryPoint -Model Coder | Out-Null
+[IO.File]::WriteAllText($ReturnedMarker, 'unexpected-return')
+exit 99
+'@
+    [IO.File]::WriteAllText($harness, $fakeHarness, [Text.Encoding]::Unicode)
+    $powershellPath = Join-Path $PSHOME 'powershell.exe'
+
+    try {
+      foreach ($case in @(
+        [pscustomobject]@{ ExitCode = 0; Message = 'Ready: loaded Coder' }
+        [pscustomobject]@{ ExitCode = 1; Message = 'Inference launcher failed: fake error' }
+      )) {
+        $returnedMarker = Join-Path $fakeRoot ('unexpected-return-' + $case.ExitCode + '.txt')
+        $arguments = @(
+          '-NoProfile', '-NoLogo', '-NonInteractive', '-File', $harness,
+          $script:PeeseaInferenceScript, [string]$case.ExitCode, $case.Message, $returnedMarker
+        )
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $powershellPath
+        $startInfo.Arguments = (($arguments | ForEach-Object {
+              ConvertTo-PeeseaNativeCommandLineArgument -Argument $_
+            }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'Could not start the headless completion fake process.' }
+        try {
+          $process.WaitForExit(5000) | Should Be $true
+          $process.ExitCode | Should Be $case.ExitCode
+          (Test-Path -LiteralPath $returnedMarker) | Should Be $false
+          $output = $process.StandardOutput.ReadToEnd()
+          $output | Should Match ([regex]::Escape($case.Message))
+        } finally {
+          if (-not $process.HasExited) {
+            try {
+              $process.StandardInput.WriteLine('exit')
+              $process.StandardInput.Flush()
+            } catch { }
+            if (-not $process.WaitForExit(2000)) {
+              $process.Kill()
+              $process.WaitForExit()
+            }
+          }
+          $process.Dispose()
+        }
+      }
+    } finally {
+      if (Test-Path -LiteralPath $fakeRoot) {
+        Remove-Item -LiteralPath $fakeRoot -Recurse -Force
+      }
+    }
+  }
+}
+
+Describe 'Peesea Swift profile resolution' {
+  It 'binds the observed Swift 1.5 record to the exact ukisai Q4_K_M physical GGUF' {
+    $global:PeeseaSwiftCatalogJson = @'
+[{"type":"llm","modelKey":"swift-1.5-qwen3.8-27b","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144}]
+'@
+    $global:PeeseaSwiftLmsCalls = @()
+    Mock Test-PeeseaModelFile { $true }
+    Mock Invoke-PeeseaLms {
+      $global:PeeseaSwiftLmsCalls += ,@($Arguments)
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        return [pscustomobject]@{ ExitCode = 0; Output = $global:PeeseaSwiftCatalogJson }
+      }
+      throw "Unexpected Swift catalog command: $($Arguments -join ' ')"
+    }
+
+    $profile = Get-PeeseaProfile -Model Swift27B
+    $target = Resolve-PeeseaTarget -Profile $profile
+    $expectedPhysicalPath = Join-Path $env:USERPROFILE '.lmstudio\models\ukisai\Swift-1.5-Qwen3.8-27B-GGUF\Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
+
+    $profile.IdentityKind | Should Be 'StandalonePhysical'
+    $profile.ModelPath | Should Be $expectedPhysicalPath
+    $target.IdentityKind | Should Be 'StandalonePhysical'
+    $target.LmsPath | Should Be 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
+    $target.PhysicalPath | Should Be $expectedPhysicalPath
+    $target.VariantKey | Should Be $null
+    $target.IndexedModelIdentifier | Should Be 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
+    $target.QuantizationName | Should Be 'Q4_K_M'
+    $global:PeeseaSwiftLmsCalls.Count | Should Be 2
+  }
+
+  It 'rejects IQ4_NL metadata even when the standalone row reports the Q4_K_M file size' {
+    $global:PeeseaSwiftCatalogJson = @'
+[{"type":"llm","modelKey":"swift-1.5-qwen3.8-27b","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"IQ4_NL","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144}]
+'@
+    $global:PeeseaSwiftLmsCalls = @()
+    Mock Test-PeeseaModelFile { $true }
+    Mock Invoke-PeeseaLms {
+      $global:PeeseaSwiftLmsCalls += ,@($Arguments)
+      [pscustomobject]@{ ExitCode = 0; Output = $global:PeeseaSwiftCatalogJson }
+    }
+    $profile = Get-PeeseaProfile -Model Swift27B
+    $threw = $false
+
+    try {
+      Resolve-PeeseaTarget -Profile $profile | Out-Null
+    } catch {
+      $threw = $_.Exception.Message -match 'different quantization'
+    }
+
+    $threw | Should Be $true
+    @($global:PeeseaSwiftLmsCalls | Where-Object { $_.Count -eq 2 -and $_[0] -eq 'ls' -and $_[1] -eq '--json' }).Count | Should Be 1
+    @($global:PeeseaSwiftLmsCalls | Where-Object { $_.Count -eq 3 }).Count | Should Be 0
+  }
+
+  It 'maps a loaded Swift standalone record without inventing a catalog variant' {
+    $global:PeeseaSwiftLoadedJson = @'
+[{"type":"llm","modelKey":"swift-1.5-qwen3.8-27b","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"identifier":"swift-1.5-qwen3.8-27b","ttlMs":null,"vision":true,"trainedForToolUse":true,"maxContextLength":262144,"contextLength":81920,"status":"idle","queued":0,"parallel":4,"engineConfigFileEnabled":false}]
+'@
+    Mock Invoke-PeeseaLms {
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ps' -and $Arguments[1] -eq '--json') {
+        return [pscustomobject]@{ ExitCode = 0; Output = $global:PeeseaSwiftLoadedJson }
+      }
+      throw "Unexpected Swift loaded-model command: $($Arguments -join ' ')"
+    }
+
+    $loaded = @(Get-PeeseaLoadedModels)
+    $profile = Get-PeeseaProfileForLoadedModel -LoadedModel $loaded[0]
+
+    $loaded.Count | Should Be 1
+    $profile.Name | Should Be 'Swift27B'
+    $loaded[0].CatalogPath | Should Be 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
+    $loaded[0].IndexedModelIdentifier | Should Be 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
+    $loaded[0].SelectedVariant | Should Be ''
+    $loaded[0].QuantizationName | Should Be 'Q4_K_M'
+    $loaded[0].ContextLength | Should Be 81920
+    Assert-MockCalled Invoke-PeeseaLms -Times 1 -Scope It
+  }
+
+  AfterEach {
+    Remove-Variable -Name PeeseaSwiftCatalogJson, PeeseaSwiftLmsCalls, PeeseaSwiftLoadedJson -Scope Global -ErrorAction SilentlyContinue
   }
 }
 

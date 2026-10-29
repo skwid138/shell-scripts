@@ -164,8 +164,10 @@ agent/chrome_mcp.sh --check
 ```
 
 Shell scripts accept `-h` / `--help`. For the Windows Peesea PowerShell
-launcher, use `Get-Help .\personal\peesea-inference.ps1` and its `-Model`
-parameter.
+launcher, use `Get-Help .\personal\peesea-inference.ps1`. Its `-Model`
+parameter selects Coder (the default), Qwen27B, or Swift27B. Desktop shortcuts
+can use `-KeepConsoleOpen` with PowerShell `-NoExit`; direct/headless
+invocation still terminates with its normal 0/1 exit code.
 
 ### Personal launchers (`personal/`)
 
@@ -184,14 +186,24 @@ A few scripts here are interactive launchers wired up via aliases in
   `opensession --local` calls `local-models start` only; it does not load a
   model or imply `--restart`. See [`docs/local-models.md`](docs/local-models.md).
 - `personal/peesea-inference.ps1` (Windows/Peesea only) — launch the known
-  Qwen3 Coder profile by default, or select Qwen3.8 27B with
-  `-Model Qwen27B`. Existing compatible server/model instances are reused;
-  a required switch or reload unloads only exact instances of the two known
-  LLMs and leaves embeddings loaded. On each invocation, it closes Firefox
-  and Edge gracefully and may stop its explicitly listed Windows background
-  helpers, including OneDrive. Switching can interrupt a prediction on the
-  unloaded model; LM Studio does not expose a reliable active-prediction
-  count. It does not force-close browsers or terminate unrelated processes.
+  Qwen3 Coder profile by default, or select Qwen3.8 27B (`-Model Qwen27B`) or
+  Swift 1.5 Qwen3.8 27B Q4_K_M (`-Model Swift27B`). Swift uses its exact
+  standalone `ukisai/Swift-1.5-Qwen3.8-27B-GGUF` file path; the older Swift
+  Q4_K_L artifact is not a selectable profile. Native model-action output passes
+  through while JSON metadata queries remain quiet. Existing compatible
+  server/model instances are reused; a required switch or reload unloads
+  only exact, physically corroborated instances of the three known LLMs and
+  leaves embeddings loaded. On each invocation, it closes Firefox and Edge
+  gracefully and may stop its explicitly listed Windows background helpers,
+  including OneDrive. Switching can interrupt a prediction on the unloaded
+  model; LM Studio does not expose a reliable active-prediction count. It does
+  not force-close browsers or terminate unrelated processes.
+- **User-reported Windows RTX 4090 setting:** NVIDIA Control Panel has a
+  per-program `CUDA - Sysmem Fallback Policy = Prefer No Sysmem Fallback`
+  preference for `%USERPROFILE%\.lmstudio\extensions\backends\llama.cpp-win-x86_64-nvidia-cuda12-avx2-2.66.0\llama-server.exe`.
+  This is user-reported, not independently verified. The launcher does not set
+  or verify this preference; manually recheck it after LM Studio backend
+  updates. It does not guarantee GPU fit or prevent every explicit CPU placement.
 - `personal/cache-prune.sh` (no alias) — conservative
   developer-cache cleanup (uv, pnpm, npm, Docker via OrbStack). Dry-run
   by default; `--apply` prunes. `--install` / `--uninstall` manage a monthly
@@ -453,8 +465,9 @@ with `JOBS=N make test` for debugging.
 
 ### Windows Peesea inference tests (manual)
 
-The PowerShell launcher has a mocked Pester 3.4.0 suite. Run it from a Windows
-PowerShell 5.1 session on Peesea:
+The PowerShell launcher has a mocked Pester 3.4.0 suite covering catalog and
+standalone identities, native action output, desktop completion, and safe
+headless exit behavior. Run it from a Windows PowerShell 5.1 session on Peesea:
 
 ```powershell
 Import-Module Pester -RequiredVersion 3.4.0

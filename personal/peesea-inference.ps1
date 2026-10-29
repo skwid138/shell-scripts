@@ -5,29 +5,37 @@ Launch the selected Peesea LM Studio inference profile.
 .DESCRIPTION
 Runs the approved per-user process cleanup, then starts or reuses the known
 LM Studio server and selected local model. Coder is the default profile;
-Qwen27B selects Qwen3.8 27B. A profile switch or reload can interrupt a
+Qwen27B selects Qwen3.8 27B, and Swift27B selects the standalone Swift 1.5 Q4_K_M
+GGUF. A profile switch or reload can interrupt a
 prediction on a known model, and LM Studio does not expose a reliable active
 prediction count. Browsers are closed gracefully; unrelated processes are
 left alone.
 
 .PARAMETER Model
-Select Coder (the default) or Qwen27B.
+Select Coder (the default), Qwen27B, or Swift27B.
+
+.PARAMETER KeepConsoleOpen
+Return to the desktop PowerShell console after displaying the final result.
 
 .EXAMPLE
 Get-Help .\personal\peesea-inference.ps1
 
 .EXAMPLE
 .\personal\peesea-inference.ps1 -Model Qwen27B
+
+.EXAMPLE
+.\personal\peesea-inference.ps1 -Model Swift27B
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet('Coder', 'Qwen27B')]
-  [string]$Model = 'Coder'
+  [ValidateSet('Coder', 'Qwen27B', 'Swift27B')]
+  [string]$Model = 'Coder',
+  [switch]$KeepConsoleOpen
 )
 
 function Get-PeeseaProfile {
   param(
-    [ValidateSet('Coder', 'Qwen27B')]
+    [ValidateSet('Coder', 'Qwen27B', 'Swift27B')]
     [string]$Model = 'Coder'
   )
 
@@ -35,6 +43,7 @@ function Get-PeeseaProfile {
   if ($Model -eq 'Coder') {
     return [pscustomobject]@{
       Name = 'Coder'
+      IdentityKind = 'CatalogVariant'
       ModelKey = 'qwen/qwen3-coder-30b'
       CatalogPath = 'qwen/qwen3-coder-30b'
       Identifier = 'qwen3-coder-4090'
@@ -48,15 +57,36 @@ function Get-PeeseaProfile {
     }
   }
 
+  if ($Model -eq 'Qwen27B') {
+    return [pscustomobject]@{
+      IdentityKind = 'CatalogVariant'
+      Name = 'Qwen27B'
+      ModelKey = 'qwen/qwen3.8-27b'
+      CatalogPath = 'qwen/qwen3.8-27b'
+      Identifier = 'qwen/qwen3.8-27b'
+      VariantKey = 'qwen/qwen3.8-27b@q4_k_m'
+      QuantizationName = 'Q4_K_M'
+      IndexedModelIdentifier = 'qwen/qwen3.8-27b@lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf'
+      ModelPath = Join-Path $root 'Qwen3.8-27B-GGUF\Qwen3.8-27B-Q4_K_M.gguf'
+      MinimumContext = 81920
+      Port = 1234
+      Bind = '0.0.0.0'
+    }
+  }
+
+  # NVIDIA's user-managed Prefer No Sysmem Fallback profile is tied to a
+  # versioned llama-server.exe path; recheck it after backend updates. This
+  # launcher neither enforces the preference nor guarantees GPU memory fit.
   return [pscustomobject]@{
-    Name = 'Qwen27B'
-    ModelKey = 'qwen/qwen3.8-27b'
-    CatalogPath = 'qwen/qwen3.8-27b'
-    Identifier = 'qwen/qwen3.8-27b'
-    VariantKey = 'qwen/qwen3.8-27b@q4_k_m'
+    IdentityKind = 'StandalonePhysical'
+    Name = 'Swift27B'
+    ModelKey = 'swift-1.5-qwen3.8-27b'
+    CatalogPath = $null
+    Identifier = 'swift-1.5-qwen3.8-27b'
+    VariantKey = $null
     QuantizationName = 'Q4_K_M'
-    IndexedModelIdentifier = 'qwen/qwen3.8-27b@lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf'
-    ModelPath = Join-Path $root 'Qwen3.8-27B-GGUF\Qwen3.8-27B-Q4_K_M.gguf'
+    IndexedModelIdentifier = 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
+    ModelPath = Join-Path $env:USERPROFILE '.lmstudio\models\ukisai\Swift-1.5-Qwen3.8-27B-GGUF\Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
     MinimumContext = 81920
     Port = 1234
     Bind = '0.0.0.0'
@@ -91,6 +121,56 @@ function Exit-PeeseaLaunchLock {
   }
 }
 
+function ConvertTo-PeeseaNativeCommandLineArgument {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$Argument)
+
+  $builder = New-Object System.Text.StringBuilder
+  [void]$builder.Append('"')
+  $backslashCount = 0
+  foreach ($character in $Argument.ToCharArray()) {
+    if ($character -eq [char]92) {
+      $backslashCount++
+      continue
+    }
+    if ($character -eq [char]34) {
+      if ($backslashCount -gt 0) {
+        [void]$builder.Append(('\' * (($backslashCount * 2) + 1)))
+      } else {
+        [void]$builder.Append('\')
+      }
+      [void]$builder.Append('"')
+      $backslashCount = 0
+      continue
+    }
+    if ($backslashCount -gt 0) {
+      [void]$builder.Append(('\' * $backslashCount))
+      $backslashCount = 0
+    }
+    [void]$builder.Append($character)
+  }
+  if ($backslashCount -gt 0) {
+    [void]$builder.Append(('\' * ($backslashCount * 2)))
+  }
+  [void]$builder.Append('"')
+  return $builder.ToString()
+}
+
+function Invoke-PeeseaStreamedNativeCall {
+  param(
+    [Parameter(Mandatory)][string]$ExecutablePath,
+    [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments
+  )
+
+  $argumentLine = (($Arguments | ForEach-Object {
+      ConvertTo-PeeseaNativeCommandLineArgument -Argument $_
+    }) -join ' ')
+  $process = Start-Process -FilePath $ExecutablePath -ArgumentList $argumentLine -NoNewWindow -Wait -PassThru -ErrorAction Stop
+  if ($null -eq $process) {
+    throw "Could not start LM Studio CLI at $ExecutablePath."
+  }
+  return [int]$process.ExitCode
+}
+
 function Invoke-PeeseaLms {
   param([Parameter(Mandatory)][string[]]$Arguments)
 
@@ -101,6 +181,18 @@ function Invoke-PeeseaLms {
     $lmsPath = Join-Path $env:USERPROFILE '.lmstudio\bin\lms.exe'
     if (-not (Test-Path -LiteralPath $lmsPath -PathType Leaf)) {
       throw "LM Studio CLI was not found on PATH or at $lmsPath."
+    }
+  }
+
+  $isJsonMetadataCall = $Arguments.Count -ge 2 -and $Arguments[-1] -eq '--json' -and (
+    $Arguments[0] -in @('ls', 'ps') -or
+    ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'server' -and $Arguments[1] -eq 'status')
+  )
+  if (-not $isJsonMetadataCall) {
+    $exitCode = Invoke-PeeseaStreamedNativeCall -ExecutablePath $lmsPath -Arguments $Arguments
+    return [pscustomobject]@{
+      ExitCode = $exitCode
+      Output = ''
     }
   }
 
@@ -186,6 +278,10 @@ function Get-PeeseaStandaloneTarget {
   if (-not (Test-PeeseaSamePath $physicalPath $Profile.ModelPath)) {
     throw "Standalone path for $($Profile.Name) does not identify its known local physical model."
   }
+  if ($Profile.IdentityKind -eq 'StandalonePhysical' -and
+    $Record.indexedModelIdentifier -cne $Profile.IndexedModelIdentifier) {
+    throw "Standalone index for $($Profile.Name) does not identify its known local physical model."
+  }
 
   $selectedVariant = $null
   if ($null -ne $Record.selectedVariant -and [string]$Record.selectedVariant -ne '') {
@@ -242,7 +338,7 @@ function Resolve-PeeseaTarget {
   }
   $base = $baseModels[0]
 
-  if ($base.path -cne $Profile.CatalogPath) {
+  if ($Profile.IdentityKind -eq 'StandalonePhysical' -or $base.path -cne $Profile.CatalogPath) {
     $target = Get-PeeseaStandaloneTarget -Record $base -Profile $Profile
     $confirmedCatalog = @(Get-PeeseaLmsJson -Arguments @('ls', '--json'))
     $confirmedBases = @($confirmedCatalog | Where-Object {
@@ -633,16 +729,19 @@ function Assert-PeeseaServerIdentity {
 function Ensure-PeeseaServer {
   param([Parameter(Mandatory)]$Profile)
 
+  Write-Host "Checking LM Studio server status on port $($Profile.Port)..."
   $status = Get-PeeseaServerStatus
   $listeners = @(Get-PeeseaServerListener -Port $Profile.Port)
   if ($status.Running) {
     Assert-PeeseaServerIdentity -Status $status -Listeners $listeners -Profile $Profile
+    Write-Host "Reusing verified LM Studio server on port $($Profile.Port)."
     return
   }
   if ($listeners.Count -gt 0) {
     throw "Port $($Profile.Port) has a listener while LM Studio reports the server stopped; refusing to hijack it."
   }
 
+  Write-Host "LM Studio server is not running; starting it on port $($Profile.Port)..."
   Invoke-PeeseaLmsChecked -Arguments @('server', 'start', '--bind', $Profile.Bind, '--port', [string]$Profile.Port) | Out-Null
   for ($attempt = 0; $attempt -lt 20; $attempt++) {
     $status = Get-PeeseaServerStatus
@@ -688,12 +787,13 @@ function Get-PeeseaProfileForLoadedModel {
   if ($null -ne $LoadedModel.DeviceIdentifier) {
     return $null
   }
-  foreach ($name in @('Coder', 'Qwen27B')) {
+  foreach ($name in @('Coder', 'Qwen27B', 'Swift27B')) {
     $knownProfile = Get-PeeseaProfile -Model $name
     if ($LoadedModel.ModelKey -cne $knownProfile.ModelKey) {
       continue
     }
-    if ($LoadedModel.CatalogPath -ceq $knownProfile.CatalogPath) {
+    if ($knownProfile.IdentityKind -eq 'CatalogVariant' -and
+      $LoadedModel.CatalogPath -ceq $knownProfile.CatalogPath) {
       $loadedCatalogMetadataMatches =
         $LoadedModel.IndexedModelIdentifier -ceq $knownProfile.ModelKey -and
         $LoadedModel.SelectedVariant -ceq $knownProfile.VariantKey -and
@@ -725,7 +825,10 @@ function Get-PeeseaProfileForLoadedModel {
         ([string]::IsNullOrEmpty([string]$LoadedModel.QuantizationName) -or
           $LoadedModel.QuantizationName -ceq $knownProfile.QuantizationName) -and
         (@($LoadedModel.VariantKeys).Count -eq 0 -or
-          @($LoadedModel.VariantKeys | Where-Object { $_ -ceq $knownProfile.VariantKey }).Count -eq 1)
+          @($LoadedModel.VariantKeys | Where-Object { $_ -ceq $knownProfile.VariantKey }).Count -eq 1) -and
+        ($knownProfile.IdentityKind -ne 'StandalonePhysical' -or
+          [string]::IsNullOrEmpty([string]$LoadedModel.IndexedModelIdentifier) -or
+          $LoadedModel.IndexedModelIdentifier -ceq $knownProfile.IndexedModelIdentifier)
       if ((Test-PeeseaSamePath $physicalPath $knownProfile.ModelPath) -and $variantMetadataMatches) {
         return $knownProfile
       }
@@ -749,7 +852,7 @@ function Assert-PeeseaUniqueLoadedIdentifiers {
 
 function Invoke-PeeseaInference {
   param(
-    [ValidateSet('Coder', 'Qwen27B')]
+    [ValidateSet('Coder', 'Qwen27B', 'Swift27B')]
     [string]$Model = 'Coder'
   )
 
@@ -765,11 +868,14 @@ function Invoke-PeeseaInference {
   }
 
   try {
+    Write-Host 'Starting approved process cleanup...'
     Invoke-PeeseaCleanup
+    Write-Host "Validating $Model profile and downloaded model identity..."
     $profile = Get-PeeseaProfile -Model $Model
     $target = Resolve-PeeseaTarget -Profile $profile
     Ensure-PeeseaServer -Profile $profile
 
+    Write-Host "Checking loaded model state for $($profile.Name)..."
     $loaded = @(Get-PeeseaLoadedModels)
     Assert-PeeseaUniqueLoadedIdentifiers -LoadedModels $loaded
     $loadedLlms = @($loaded | Where-Object { $_.Type -eq 'llm' })
@@ -794,6 +900,13 @@ function Invoke-PeeseaInference {
     $toUnload = @($knownLoaded | Where-Object {
         $_.Profile.Name -ne $profile.Name -or -not $targetCompatible
       })
+    if ($targetCompatible) {
+      Write-Host "Reusing verified loaded $($profile.Name) model; no load action is needed."
+    } elseif ($toUnload.Count -gt 0) {
+      Write-Host "Switching/reloading a known model to $($profile.Name)..."
+    } else {
+      Write-Host "Loading $($profile.Name) model..."
+    }
     if ($toUnload.Count -gt 0) {
       Assert-PeeseaTargetSelectionUnchanged -Profile $profile -ExpectedTarget $target
     }
@@ -822,6 +935,7 @@ function Invoke-PeeseaInference {
       Invoke-PeeseaLmsChecked -Arguments $loadArguments | Out-Null
     }
 
+    Write-Host "Verifying final model and server state for $($profile.Name)..."
     $verifiedLoaded = @(Get-PeeseaLoadedModels)
     Assert-PeeseaUniqueLoadedIdentifiers -LoadedModels $verifiedLoaded
     $verifiedTarget = @()
@@ -856,8 +970,19 @@ function Invoke-PeeseaInference {
   }
 }
 
-if ($MyInvocation.InvocationName -ne '.') {
+function Invoke-PeeseaLauncherEntryPoint {
+  param(
+    [ValidateSet('Coder', 'Qwen27B', 'Swift27B')]
+    [string]$Model = 'Coder',
+    [switch]$KeepConsoleOpen
+  )
+
   $result = Invoke-PeeseaInference -Model $Model
   if ($result.Message) { Write-Host $result.Message }
+  if ($KeepConsoleOpen) { return }
   exit $result.ExitCode
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+  Invoke-PeeseaLauncherEntryPoint -Model $Model -KeepConsoleOpen:$KeepConsoleOpen | Out-Null
 }
