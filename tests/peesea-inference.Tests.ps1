@@ -246,6 +246,10 @@ Describe 'Peesea inference launcher' {
     $global:PeeseaTestCleanupActions = @()
     $global:PeeseaTestProcessRecords = @()
     $global:PeeseaTestStart = $null
+    $global:PeeseaTestPhaseTimeline = $null
+    $global:PeeseaTestNvidiaSmiOutput = '18000, 24564, 6564'
+    $global:PeeseaTestNvidiaSmiExitCode = 0
+    $global:PeeseaTestNvidiaSmiPath = 'C:\Windows\System32\nvidia-smi.exe'
     Mock Enter-PeeseaLaunchLock { $true }
     Mock Exit-PeeseaLaunchLock {}
     Mock Get-PeeseaCurrentUserSid { 'S-1-5-21-test-user' }
@@ -276,6 +280,103 @@ Describe 'Peesea inference launcher' {
       @(New-PeeseaLoadedLlmFixture -Profile $profile)
     }
     Mock Invoke-PeeseaLms { [pscustomobject]@{ ExitCode = 0; Output = '' } }
+    Mock Get-PeeseaNvidiaSmiPath {
+      if ($null -ne $global:PeeseaTestPhaseTimeline) {
+        $global:PeeseaTestPhaseTimeline += 'gpu-query'
+      }
+      $global:PeeseaTestNvidiaSmiPath
+    }
+    Mock Invoke-PeeseaNvidiaSmi {
+      [pscustomobject]@{
+        ExitCode = $global:PeeseaTestNvidiaSmiExitCode
+        Output = $global:PeeseaTestNvidiaSmiOutput
+      }
+    }
+  }
+
+  It 'prints a VRAM summary after the model and server are verified' {
+    $global:PeeseaTestHostOutput = @()
+    Mock Write-Host {
+      $global:PeeseaTestHostOutput += [string]::Join('', @($Object))
+    }
+
+    $result = Invoke-PeeseaInference -Model Coder
+
+    $result.Ready | Should Be $true
+    (@($result.PSObject.Properties.Name) -join ',') | Should Be 'Ready,ExitCode,Message'
+    ($global:PeeseaTestHostOutput -join "`n") | Should Match 'VRAM: 18,000 MiB used / 24,564 MiB total; 6,564 MiB free \(usage below the 23,800 MiB advisory threshold'
+    Assert-MockCalled Invoke-PeeseaNvidiaSmi -Times 1 -Scope It
+  }
+
+  It 'reports the free VRAM value returned by nvidia-smi instead of deriving it' {
+    $global:PeeseaTestNvidiaSmiOutput = '20123, 24564, 4321'
+    $global:PeeseaTestHostOutput = @()
+    Mock Write-Host {
+      $global:PeeseaTestHostOutput += [string]::Join('', @($Object))
+    }
+
+    $result = Invoke-PeeseaInference -Model Coder
+
+    $result.Ready | Should Be $true
+    ($global:PeeseaTestHostOutput -join "`n") | Should Match '20,123 MiB used / 24,564 MiB total; 4,321 MiB free'
+    ($global:PeeseaTestHostOutput -join "`n") | Should Not Match '4,441 MiB free'
+  }
+
+  It 'marks usage at or above the advisory threshold without changing readiness' {
+    $global:PeeseaTestNvidiaSmiOutput = '24000, 24564, 564'
+    $global:PeeseaTestHostOutput = @()
+    Mock Write-Host {
+      $global:PeeseaTestHostOutput += [string]::Join('', @($Object))
+    }
+
+    $result = Invoke-PeeseaInference -Model Coder
+
+    $result.Ready | Should Be $true
+    ($global:PeeseaTestHostOutput -join "`n") | Should Match 'usage at or above the 23,800 MiB advisory threshold'
+  }
+
+  It 'keeps a verified launcher ready when nvidia-smi is unavailable' {
+    $global:PeeseaTestNvidiaSmiPath = $null
+    $global:PeeseaTestHostOutput = @()
+    Mock Write-Host {
+      $global:PeeseaTestHostOutput += [string]::Join('', @($Object))
+    }
+
+    $result = Invoke-PeeseaInference -Model Coder
+
+    $result.Ready | Should Be $true
+    $result.ExitCode | Should Be 0
+    ($global:PeeseaTestHostOutput -join "`n") | Should Match 'VRAM unavailable: nvidia-smi executable was not found'
+    Assert-MockCalled Invoke-PeeseaNvidiaSmi -Times 0 -Scope It
+  }
+
+  It 'keeps a verified launcher ready when nvidia-smi exits unsuccessfully' {
+    $global:PeeseaTestNvidiaSmiExitCode = 3
+    $global:PeeseaTestNvidiaSmiOutput = 'driver query failed'
+    $global:PeeseaTestHostOutput = @()
+    Mock Write-Host {
+      $global:PeeseaTestHostOutput += [string]::Join('', @($Object))
+    }
+
+    $result = Invoke-PeeseaInference -Model Coder
+
+    $result.Ready | Should Be $true
+    $result.ExitCode | Should Be 0
+    ($global:PeeseaTestHostOutput -join "`n") | Should Match 'VRAM unavailable: nvidia-smi failed with exit code 3'
+  }
+
+  It 'keeps a verified launcher ready when nvidia-smi returns malformed output' {
+    $global:PeeseaTestNvidiaSmiOutput = '18000, 24564'
+    $global:PeeseaTestHostOutput = @()
+    Mock Write-Host {
+      $global:PeeseaTestHostOutput += [string]::Join('', @($Object))
+    }
+
+    $result = Invoke-PeeseaInference -Model Coder
+
+    $result.Ready | Should Be $true
+    $result.ExitCode | Should Be 0
+    ($global:PeeseaTestHostOutput -join "`n") | Should Match 'VRAM unavailable: nvidia-smi returned a malformed GPU memory record'
   }
 
   It 'reuses a verified same-model server and model while still running cleanup' {
@@ -326,6 +427,8 @@ Describe 'Peesea inference launcher' {
     $modelReusePhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Reusing verified loaded Coder model' })
     $finalVerificationPhaseIndex = [array]::FindIndex($timeline, [Predicate[string]]{ param($entry) $entry -match 'Verifying final model and server state' })
     $finalModelReadIndex = [array]::IndexOf($timeline, 'models:2')
+    $finalServerStatusIndex = [array]::LastIndexOf($timeline, 'server-status')
+    $gpuQueryIndex = [array]::IndexOf($timeline, 'gpu-query')
 
     $cleanupPhaseIndex | Should BeGreaterThan -1
     $cleanupPhaseIndex | Should BeLessThan $cleanupIndex
@@ -339,6 +442,8 @@ Describe 'Peesea inference launcher' {
     $modelReadIndex | Should BeLessThan $modelReusePhaseIndex
     $modelReusePhaseIndex | Should BeLessThan $finalVerificationPhaseIndex
     $finalVerificationPhaseIndex | Should BeLessThan $finalModelReadIndex
+    $finalModelReadIndex | Should BeLessThan $finalServerStatusIndex
+    $finalServerStatusIndex | Should BeLessThan $gpuQueryIndex
     (@($result.PSObject.Properties.Name) -join ',') | Should Be 'Ready,ExitCode,Message'
   }
 
@@ -391,6 +496,7 @@ Describe 'Peesea inference launcher' {
     $loadCalls = @($global:PeeseaTestLmsCalls | Where-Object { $_[0] -eq 'load' })
     $loadCalls.Count | Should Be 1
     $loadCalls[0][1] | Should Be 'qwen/qwen3-coder-30b'
+    Assert-MockCalled Invoke-PeeseaNvidiaSmi -Times 1 -Scope It
   }
 
   It 'reloads a known physical model that has the wrong API identifier' {
@@ -1243,6 +1349,7 @@ Describe 'Peesea inference launcher' {
     $result.Ready | Should Be $false
     $result.ExitCode | Should Be 1
     $result.Message | Should Match 'exit code 7'
+    Assert-MockCalled Get-PeeseaNvidiaSmiPath -Times 0 -Scope It
     Assert-MockCalled Exit-PeeseaLaunchLock -Times 1 -Scope It
   }
 
@@ -1296,6 +1403,13 @@ Describe 'Peesea inference launcher' {
 }
 
 Describe 'LM Studio CLI JSON boundary' {
+  BeforeEach {
+    Mock Get-PeeseaNvidiaSmiPath { 'nvidia-smi-test.exe' }
+    Mock Invoke-PeeseaNvidiaSmi {
+      [pscustomobject]@{ ExitCode = 0; Output = '18000, 24564, 6564' }
+    }
+  }
+
   It 'accepts the pinned server status JSON shape' {
     Mock Invoke-PeeseaLms {
       [pscustomobject]@{ ExitCode = 0; Output = '{"running":true,"port":1234}' }
@@ -1743,6 +1857,7 @@ function Get-PeeseaLoadedModels {
     ContextLength = 81920; Status = 'idle'; Queued = 0
   })
 }
+function Get-PeeseaNvidiaSmiPath { return $null }
 function Invoke-PeeseaLms {
   param([string[]]$Arguments)
   if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
@@ -2131,6 +2246,13 @@ Describe 'Peesea Swift profile resolution' {
 }
 
 Describe 'Peesea loaded catalog identity verification' {
+  BeforeEach {
+    Mock Get-PeeseaNvidiaSmiPath { 'nvidia-smi-test.exe' }
+    Mock Invoke-PeeseaNvidiaSmi {
+      [pscustomobject]@{ ExitCode = 0; Output = '18000, 24564, 6564' }
+    }
+  }
+
   It 'does not unload a catalog-loaded Coder when its selected detail points to a different GGUF' {
     $global:PeeseaBoundaryLoadedState = 'coder-loaded'
     $global:PeeseaBoundaryLmsCalls = @()
@@ -2244,6 +2366,13 @@ Describe 'Peesea loaded catalog identity verification' {
 }
 
 Describe 'Peesea native listener adapter' {
+  BeforeEach {
+    Mock Get-PeeseaNvidiaSmiPath { 'nvidia-smi-test.exe' }
+    Mock Invoke-PeeseaNvidiaSmi {
+      [pscustomobject]@{ ExitCode = 0; Output = '18000, 24564, 6564' }
+    }
+  }
+
   It 'starts the server when Windows reports no matching listener instances' {
     $global:PeeseaListenerQueryCount = 0
     $global:PeeseaListenerStatusCount = 0

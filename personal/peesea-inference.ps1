@@ -771,6 +771,73 @@ function New-PeeseaResult {
   return [pscustomobject]@{ Ready = $Ready; ExitCode = $ExitCode; Message = $Message }
 }
 
+function Get-PeeseaNvidiaSmiPath {
+  $command = Get-Command nvidia-smi -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($command) { return [string]$command.Source }
+  return $null
+}
+
+function Invoke-PeeseaNvidiaSmi {
+  param([Parameter(Mandatory)][string]$ExecutablePath)
+
+  $output = & $ExecutablePath '--query-gpu=memory.used,memory.total,memory.free' '--format=csv,noheader,nounits' 2>&1
+  $exitCode = $LASTEXITCODE
+  return [pscustomobject]@{
+    ExitCode = [int]$exitCode
+    Output = ($output -join [Environment]::NewLine)
+  }
+}
+
+function Get-PeeseaGpuMemory {
+  $executablePath = Get-PeeseaNvidiaSmiPath
+  if ([string]::IsNullOrWhiteSpace($executablePath)) {
+    throw 'nvidia-smi executable was not found.'
+  }
+
+  $result = Invoke-PeeseaNvidiaSmi -ExecutablePath $executablePath
+  if ($result.ExitCode -ne 0) {
+    throw "nvidia-smi failed with exit code $($result.ExitCode): $($result.Output)"
+  }
+
+  $lines = @($result.Output -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($lines.Count -ne 1) {
+    throw 'nvidia-smi did not return exactly one GPU memory record.'
+  }
+  $values = @($lines[0].Split(','))
+  if ($values.Count -ne 3) {
+    throw 'nvidia-smi returned a malformed GPU memory record.'
+  }
+
+  [long]$usedMiB = 0
+  [long]$totalMiB = 0
+  [long]$freeMiB = 0
+  if (-not [long]::TryParse($values[0].Trim(), [ref]$usedMiB) -or
+    -not [long]::TryParse($values[1].Trim(), [ref]$totalMiB) -or
+    -not [long]::TryParse($values[2].Trim(), [ref]$freeMiB) -or
+    $usedMiB -lt 0 -or $totalMiB -le 0 -or $freeMiB -lt 0 -or
+    $usedMiB -gt $totalMiB -or $freeMiB -gt $totalMiB) {
+    throw 'nvidia-smi returned invalid GPU memory values.'
+  }
+
+  return [pscustomobject]@{
+    UsedMiB = $usedMiB
+    TotalMiB = $totalMiB
+    FreeMiB = $freeMiB
+  }
+}
+
+function Write-PeeseaVramSummary {
+  try {
+    $memory = Get-PeeseaGpuMemory
+  } catch {
+    Write-Host "VRAM unavailable: $($_.Exception.Message)"
+    return
+  }
+
+  $thresholdPosition = if ($memory.UsedMiB -lt 23800) { 'below' } else { 'at or above' }
+  Write-Host ('VRAM: {0:N0} MiB used / {1:N0} MiB total; {2:N0} MiB free (usage {3} the 23,800 MiB advisory threshold; this does not guarantee inference fit).' -f $memory.UsedMiB, $memory.TotalMiB, $memory.FreeMiB, $thresholdPosition)
+}
+
 function Invoke-PeeseaLmsChecked {
   param([Parameter(Mandatory)][string[]]$Arguments)
 
@@ -957,6 +1024,7 @@ function Invoke-PeeseaInference {
     }
     Assert-PeeseaTargetSelectionUnchanged -Profile $profile -ExpectedTarget $target
     Confirm-PeeseaServerReady -Profile $profile
+    Write-PeeseaVramSummary
     $action = if ($reused) { 'reused' } else { 'loaded' }
     return New-PeeseaResult -Ready $true -ExitCode 0 -Message "Ready: $action $($profile.Name) ($($profile.Identifier)), context $($verifiedTarget[0].ContextLength), server port $($profile.Port)."
   } catch {
