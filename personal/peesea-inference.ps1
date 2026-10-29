@@ -36,7 +36,11 @@ function Get-PeeseaProfile {
     return [pscustomobject]@{
       Name = 'Coder'
       ModelKey = 'qwen/qwen3-coder-30b'
+      CatalogPath = 'qwen/qwen3-coder-30b'
       Identifier = 'qwen3-coder-4090'
+      VariantKey = 'qwen/qwen3-coder-30b@q4_k_m'
+      QuantizationName = 'Q4_K_M'
+      IndexedModelIdentifier = 'qwen/qwen3-coder-30b@lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf'
       ModelPath = Join-Path $root 'Qwen3-Coder-30B-A3B-Instruct-GGUF\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf'
       MinimumContext = 81920
       Port = 1234
@@ -47,7 +51,11 @@ function Get-PeeseaProfile {
   return [pscustomobject]@{
     Name = 'Qwen27B'
     ModelKey = 'qwen/qwen3.8-27b'
+    CatalogPath = 'qwen/qwen3.8-27b'
     Identifier = 'qwen/qwen3.8-27b'
+    VariantKey = 'qwen/qwen3.8-27b@q4_k_m'
+    QuantizationName = 'Q4_K_M'
+    IndexedModelIdentifier = 'qwen/qwen3.8-27b@lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf'
     ModelPath = Join-Path $root 'Qwen3.8-27B-GGUF\Qwen3.8-27B-Q4_K_M.gguf'
     MinimumContext = 81920
     Port = 1234
@@ -150,31 +158,157 @@ function ConvertTo-PeeseaPhysicalModelPath {
   return $physicalPath
 }
 
+function Assert-PeeseaCatalogBaseRecord {
+  param(
+    [Parameter(Mandatory)]$Record,
+    [Parameter(Mandatory)]$Profile
+  )
+
+  if ($Record.path -cne $Profile.CatalogPath) {
+    throw "LM Studio catalog path for $($Profile.Name) does not match the known logical base key."
+  }
+  if ($Record.selectedVariant -cne $Profile.VariantKey) {
+    throw "Selected LM Studio variant for $($Profile.Name) changed or is not the expected $($Profile.VariantKey)."
+  }
+  $expectedVariants = @($Record.variants | Where-Object { $_ -ceq $Profile.VariantKey })
+  if ($expectedVariants.Count -ne 1 -or $Record.quantization.name -cne $Profile.QuantizationName) {
+    throw "LM Studio base record for $($Profile.Name) does not uniquely confirm the expected $($Profile.QuantizationName) variant."
+  }
+}
+
+function Get-PeeseaStandaloneTarget {
+  param(
+    [Parameter(Mandatory)]$Record,
+    [Parameter(Mandatory)]$Profile
+  )
+
+  $physicalPath = ConvertTo-PeeseaPhysicalModelPath -LmsPath ([string]$Record.path)
+  if (-not (Test-PeeseaSamePath $physicalPath $Profile.ModelPath)) {
+    throw "Standalone path for $($Profile.Name) does not identify its known local physical model."
+  }
+
+  $selectedVariant = $null
+  if ($null -ne $Record.selectedVariant -and [string]$Record.selectedVariant -ne '') {
+    $selectedVariant = [string]$Record.selectedVariant
+    if ($selectedVariant -cne $Profile.VariantKey) {
+      throw "Standalone record for $($Profile.Name) reports a different selected variant."
+    }
+  }
+  if ($null -ne $Record.variants) {
+    $variantList = @($Record.variants)
+    if ($variantList.Count -gt 0) {
+      $expectedVariant = @($variantList | Where-Object { $_ -ceq $Profile.VariantKey })
+      if ($expectedVariant.Count -ne 1) {
+        throw "Standalone record for $($Profile.Name) contains ambiguous variant metadata."
+      }
+    }
+  }
+
+  $quantizationName = $null
+  if ($null -ne $Record.quantization -and [string]$Record.quantization.name -ne '') {
+    $quantizationName = [string]$Record.quantization.name
+    if ($quantizationName -cne $Profile.QuantizationName) {
+      throw "Standalone record for $($Profile.Name) reports a different quantization."
+    }
+  }
+  $indexedModelIdentifier = $null
+  if ($null -ne $Record.indexedModelIdentifier) {
+    $indexedModelIdentifier = [string]$Record.indexedModelIdentifier
+  }
+
+  return [pscustomobject]@{
+    Profile = $Profile
+    IdentityKind = 'StandalonePhysical'
+    PhysicalPath = $physicalPath
+    LmsPath = [string]$Record.path
+    VariantKey = $selectedVariant
+    IndexedModelIdentifier = $indexedModelIdentifier
+    QuantizationName = $quantizationName
+  }
+}
+
 function Resolve-PeeseaTarget {
   param([Parameter(Mandatory)]$Profile)
 
   if (-not (Test-PeeseaModelFile -Path $Profile.ModelPath)) {
     throw "The known $($Profile.Name) model file is missing: $($Profile.ModelPath)"
   }
-  $models = @(Get-PeeseaLmsJson -Arguments @('ls', '--json'))
-  $candidates = @($models | Where-Object {
-      $_.type -eq 'llm' -and $_.modelKey -eq $Profile.ModelKey -and $_.path -and
-      [string]::IsNullOrEmpty([string]$_.deviceIdentifier)
-    })
-  $matches = @()
-  foreach ($candidate in $candidates) {
-    $physicalPath = ConvertTo-PeeseaPhysicalModelPath -LmsPath ([string]$candidate.path)
-    if ([string]::Equals($physicalPath, [string]$Profile.ModelPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-      $matches += [pscustomobject]@{ LmsPath = [string]$candidate.path; PhysicalPath = $physicalPath }
+  $catalog = @(Get-PeeseaLmsJson -Arguments @('ls', '--json'))
+  $baseModels = @($catalog | Where-Object {
+      $_.type -ceq 'llm' -and $_.modelKey -ceq $Profile.ModelKey -and $null -eq $_.deviceIdentifier
+  })
+  if ($baseModels.Count -ne 1) {
+    throw "Expected one local LM Studio catalog record for $($Profile.Name); found $($baseModels.Count)."
+  }
+  $base = $baseModels[0]
+
+  if ($base.path -cne $Profile.CatalogPath) {
+    $target = Get-PeeseaStandaloneTarget -Record $base -Profile $Profile
+    $confirmedCatalog = @(Get-PeeseaLmsJson -Arguments @('ls', '--json'))
+    $confirmedBases = @($confirmedCatalog | Where-Object {
+        $_.type -ceq 'llm' -and $_.modelKey -ceq $Profile.ModelKey -and $null -eq $_.deviceIdentifier
+      })
+    if ($confirmedBases.Count -ne 1) {
+      throw "Standalone identity for $($Profile.Name) became ambiguous during resolution."
     }
+    $confirmedTarget = Get-PeeseaStandaloneTarget -Record $confirmedBases[0] -Profile $Profile
+    if ($confirmedTarget.LmsPath -cne $target.LmsPath -or
+      $confirmedTarget.VariantKey -cne $target.VariantKey -or
+      $confirmedTarget.IndexedModelIdentifier -cne $target.IndexedModelIdentifier -or
+      $confirmedTarget.QuantizationName -cne $target.QuantizationName) {
+      throw "Standalone identity for $($Profile.Name) changed during resolution."
+    }
+    return $target
   }
-  if ($matches.Count -ne 1) {
-    throw "Expected exactly one downloaded LM Studio LLM at the known $($Profile.Name) path; found $($matches.Count)."
+
+  Assert-PeeseaCatalogBaseRecord -Record $base -Profile $Profile
+  $variantRecords = @(Get-PeeseaLmsJson -Arguments @('ls', $Profile.ModelKey, '--json'))
+  $variantMatches = @($variantRecords | Where-Object {
+      $_.type -ceq 'llm' -and $_.modelKey -ceq $Profile.VariantKey
+    })
+  if ($variantMatches.Count -ne 1) {
+    throw "Expected one exact LM Studio detail record for $($Profile.VariantKey); found $($variantMatches.Count)."
   }
+  $variant = $variantMatches[0]
+  if ($variant.path -cne $Profile.CatalogPath -or $null -ne $variant.deviceIdentifier -or
+    $variant.quantization.name -cne $Profile.QuantizationName -or
+    $variant.indexedModelIdentifier -cne $Profile.IndexedModelIdentifier) {
+    throw "LM Studio detail record for $($Profile.VariantKey) does not bind to the known local physical file and quantization."
+  }
+
+  $confirmedCatalog = @(Get-PeeseaLmsJson -Arguments @('ls', '--json'))
+  $confirmedBases = @($confirmedCatalog | Where-Object {
+      $_.type -ceq 'llm' -and $_.modelKey -ceq $Profile.ModelKey -and $null -eq $_.deviceIdentifier
+    })
+  if ($confirmedBases.Count -ne 1) {
+    throw "LM Studio catalog selection for $($Profile.Name) became ambiguous during resolution."
+  }
+  Assert-PeeseaCatalogBaseRecord -Record $confirmedBases[0] -Profile $Profile
+
   return [pscustomobject]@{
     Profile = $Profile
-    PhysicalPath = $matches[0].PhysicalPath
-    LmsPath = $matches[0].LmsPath
+    IdentityKind = 'CatalogVariant'
+    PhysicalPath = $Profile.ModelPath
+    LmsPath = [string]$base.path
+    VariantKey = [string]$variant.modelKey
+    IndexedModelIdentifier = [string]$variant.indexedModelIdentifier
+    QuantizationName = [string]$variant.quantization.name
+  }
+}
+
+function Assert-PeeseaTargetSelectionUnchanged {
+  param(
+    [Parameter(Mandatory)]$Profile,
+    [Parameter(Mandatory)]$ExpectedTarget
+  )
+
+  $currentTarget = Resolve-PeeseaTarget -Profile $Profile
+  if ($currentTarget.IdentityKind -cne $ExpectedTarget.IdentityKind -or
+    $currentTarget.LmsPath -cne $ExpectedTarget.LmsPath -or
+    $currentTarget.VariantKey -cne $ExpectedTarget.VariantKey -or
+    $currentTarget.IndexedModelIdentifier -cne $ExpectedTarget.IndexedModelIdentifier -or
+    $currentTarget.QuantizationName -cne $ExpectedTarget.QuantizationName) {
+    throw "Selected LM Studio variant for $($Profile.Name) changed during launch; no further model action will be taken."
   }
 }
 
@@ -230,17 +364,15 @@ function Get-PeeseaLoadedModels {
       throw "LM Studio did not report a valid context for loaded LLM $($model.identifier)."
     }
     $deviceIdentifier = $model.deviceIdentifier
-    $rawPath = [string]$model.path
-    $physicalPath = $rawPath
-    if ($model.type -eq 'llm' -and [string]::IsNullOrEmpty([string]$deviceIdentifier)) {
-      $physicalPath = ConvertTo-PeeseaPhysicalModelPath -LmsPath $rawPath
-    }
     [pscustomobject]@{
       Type = [string]$model.type
       Identifier = [string]$model.identifier
       ModelKey = [string]$model.modelKey
-      ModelPath = $physicalPath
-      LmsPath = $rawPath
+      CatalogPath = [string]$model.path
+      IndexedModelIdentifier = [string]$model.indexedModelIdentifier
+      SelectedVariant = [string]$model.selectedVariant
+      VariantKeys = @($model.variants)
+      QuantizationName = if ($model.quantization) { [string]$model.quantization.name } else { '' }
       DeviceIdentifier = $deviceIdentifier
       ContextLength = $context
       Status = [string]$model.status
@@ -553,13 +685,52 @@ function Invoke-PeeseaLmsChecked {
 function Get-PeeseaProfileForLoadedModel {
   param([Parameter(Mandatory)]$LoadedModel)
 
-  if (-not [string]::IsNullOrEmpty([string]$LoadedModel.DeviceIdentifier)) {
+  if ($null -ne $LoadedModel.DeviceIdentifier) {
     return $null
   }
   foreach ($name in @('Coder', 'Qwen27B')) {
     $knownProfile = Get-PeeseaProfile -Model $name
-    if (Test-PeeseaSamePath $LoadedModel.ModelPath $knownProfile.ModelPath) {
-      return $knownProfile
+    if ($LoadedModel.ModelKey -cne $knownProfile.ModelKey) {
+      continue
+    }
+    if ($LoadedModel.CatalogPath -ceq $knownProfile.CatalogPath) {
+      $loadedCatalogMetadataMatches =
+        $LoadedModel.IndexedModelIdentifier -ceq $knownProfile.ModelKey -and
+        $LoadedModel.SelectedVariant -ceq $knownProfile.VariantKey -and
+        @($LoadedModel.VariantKeys | Where-Object { $_ -ceq $knownProfile.VariantKey }).Count -eq 1 -and
+        $LoadedModel.QuantizationName -ceq $knownProfile.QuantizationName
+      if (-not $loadedCatalogMetadataMatches) {
+        return $null
+      }
+
+      try {
+        # A logical loaded identity does not prove which GGUF the selected variant binds to.
+        $resolvedTarget = Resolve-PeeseaTarget -Profile $knownProfile
+        if ($resolvedTarget.IdentityKind -eq 'CatalogVariant' -and
+          $resolvedTarget.VariantKey -ceq $knownProfile.VariantKey -and
+          $resolvedTarget.IndexedModelIdentifier -ceq $knownProfile.IndexedModelIdentifier -and
+          $resolvedTarget.QuantizationName -ceq $knownProfile.QuantizationName) {
+          return $knownProfile
+        }
+      } catch {
+        return $null
+      }
+      return $null
+    }
+    try {
+      $physicalPath = ConvertTo-PeeseaPhysicalModelPath -LmsPath $LoadedModel.CatalogPath
+      $variantMetadataMatches =
+        ([string]::IsNullOrEmpty([string]$LoadedModel.SelectedVariant) -or
+          $LoadedModel.SelectedVariant -ceq $knownProfile.VariantKey) -and
+        ([string]::IsNullOrEmpty([string]$LoadedModel.QuantizationName) -or
+          $LoadedModel.QuantizationName -ceq $knownProfile.QuantizationName) -and
+        (@($LoadedModel.VariantKeys).Count -eq 0 -or
+          @($LoadedModel.VariantKeys | Where-Object { $_ -ceq $knownProfile.VariantKey }).Count -eq 1)
+      if ((Test-PeeseaSamePath $physicalPath $knownProfile.ModelPath) -and $variantMetadataMatches) {
+        return $knownProfile
+      }
+    } catch {
+      continue
     }
   }
   return $null
@@ -606,7 +777,7 @@ function Invoke-PeeseaInference {
     foreach ($loadedLlm in $loadedLlms) {
       $knownProfile = Get-PeeseaProfileForLoadedModel -LoadedModel $loadedLlm
       if ($null -eq $knownProfile) {
-        throw "Loaded LLM '$($loadedLlm.Identifier)' has an unknown physical model path; refusing to unload or load."
+        throw "Loaded LLM '$($loadedLlm.Identifier)' has an unknown catalog or physical identity; refusing to unload or load."
       }
       $knownLoaded += [pscustomobject]@{ Profile = $knownProfile; Model = $loadedLlm }
     }
@@ -623,6 +794,9 @@ function Invoke-PeeseaInference {
     $toUnload = @($knownLoaded | Where-Object {
         $_.Profile.Name -ne $profile.Name -or -not $targetCompatible
       })
+    if ($toUnload.Count -gt 0) {
+      Assert-PeeseaTargetSelectionUnchanged -Profile $profile -ExpectedTarget $target
+    }
     foreach ($entry in $toUnload) {
       Write-Warning 'Switching/reloading a known model may interrupt its active prediction; LM Studio does not expose a reliable active-prediction count.'
       Invoke-PeeseaLmsChecked -Arguments @('unload', $entry.Model.Identifier) | Out-Null
@@ -640,6 +814,7 @@ function Invoke-PeeseaInference {
     }
 
     if (-not $targetCompatible) {
+      Assert-PeeseaTargetSelectionUnchanged -Profile $profile -ExpectedTarget $target
       $loadArguments = @(
         'load', $target.LmsPath, '--exact', '--context-length', [string]$profile.MinimumContext,
         '--gpu', 'max', '--identifier', $profile.Identifier
@@ -649,19 +824,24 @@ function Invoke-PeeseaInference {
 
     $verifiedLoaded = @(Get-PeeseaLoadedModels)
     Assert-PeeseaUniqueLoadedIdentifiers -LoadedModels $verifiedLoaded
-    $verifiedTarget = @($verifiedLoaded | Where-Object {
-        $_.Type -eq 'llm' -and (Test-PeeseaSamePath $_.ModelPath $target.PhysicalPath) -and
-        $_.Identifier -eq $profile.Identifier -and $_.ContextLength -ge $profile.MinimumContext
-      })
-    if ($verifiedTarget.Count -ne 1) {
-      throw "LM Studio did not verify exactly one loaded $($profile.Name) model with identifier $($profile.Identifier) and context at least $($profile.MinimumContext)."
+    $verifiedTarget = @()
+    $otherLlms = @()
+    foreach ($loadedLlm in @($verifiedLoaded | Where-Object { $_.Type -eq 'llm' })) {
+      $knownProfile = Get-PeeseaProfileForLoadedModel -LoadedModel $loadedLlm
+      if ($null -eq $knownProfile -or $knownProfile.Name -ne $profile.Name) {
+        $otherLlms += $loadedLlm
+      } elseif ($loadedLlm.Identifier -eq $profile.Identifier -and
+        $loadedLlm.ContextLength -ge $profile.MinimumContext) {
+        $verifiedTarget += $loadedLlm
+      }
     }
-    $otherLlms = @($verifiedLoaded | Where-Object {
-        $_.Type -eq 'llm' -and -not (Test-PeeseaSamePath $_.ModelPath $target.PhysicalPath)
-      })
+    if ($verifiedTarget.Count -ne 1) {
+      throw "LM Studio did not verify exactly one loaded $($profile.Name) variant ($($profile.VariantKey)) with identifier $($profile.Identifier) and context at least $($profile.MinimumContext)."
+    }
     if ($otherLlms.Count -gt 0) {
       throw 'An unexpected LLM appeared during launch; refusing to report Ready.'
     }
+    Assert-PeeseaTargetSelectionUnchanged -Profile $profile -ExpectedTarget $target
     Confirm-PeeseaServerReady -Profile $profile
     $action = if ($reused) { 'reused' } else { 'loaded' }
     return New-PeeseaResult -Ready $true -ExitCode 0 -Message "Ready: $action $($profile.Name) ($($profile.Identifier)), context $($verifiedTarget[0].ContextLength), server port $($profile.Port)."
