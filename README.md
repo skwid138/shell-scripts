@@ -119,6 +119,10 @@ documented in the header comment at the top of
   guard with an explicit `BASH_VERSINFO` check and emit a `brew install bash`
   hint on failure. See `docs/CONVENTIONS.md` for the portability rule.
 - Optional per-script: `gh`, `jq`, `acli` (Atlassian), `gcloud`, Chrome.
+- Windows-only exception: `personal/peesea-inference.ps1` requires Windows
+  PowerShell 5.1, LM Studio, and its `lms` CLI. Its manual Windows test gate
+  uses the already-installed Pester 3.4.0; this is not a repository-wide
+  dependency.
 
 ## Setup
 
@@ -159,7 +163,9 @@ agent/branch-to-ticket.sh
 agent/chrome_mcp.sh --check
 ```
 
-Every script takes `-h` / `--help`.
+Shell scripts accept `-h` / `--help`. For the Windows Peesea PowerShell
+launcher, use `Get-Help .\personal\peesea-inference.ps1` and its `-Model`
+parameter.
 
 ### Personal launchers (`personal/`)
 
@@ -177,6 +183,15 @@ A few scripts here are interactive launchers wired up via aliases in
   Studio local models surfaced through OpenCode's static `lmstudio` provider.
   `opensession --local` calls `local-models start` only; it does not load a
   model or imply `--restart`. See [`docs/local-models.md`](docs/local-models.md).
+- `personal/peesea-inference.ps1` (Windows/Peesea only) — launch the known
+  Qwen3 Coder profile by default, or select Qwen3.8 27B with
+  `-Model Qwen27B`. Existing compatible server/model instances are reused;
+  a required switch or reload unloads only exact instances of the two known
+  LLMs and leaves embeddings loaded. On each invocation, it closes Firefox
+  and Edge gracefully and may stop its explicitly listed Windows background
+  helpers, including OneDrive. Switching can interrupt a prediction on the
+  unloaded model; LM Studio does not expose a reliable active-prediction
+  count. It does not force-close browsers or terminate unrelated processes.
 - `personal/cache-prune.sh` (no alias) — conservative
   developer-cache cleanup (uv, pnpm, npm, Docker via OrbStack). Dry-run
   by default; `--apply` prunes. `--install` / `--uninstall` manage a monthly
@@ -435,6 +450,22 @@ GitHub-hosted runners; `brew install parallel` for local dev). The
 `JOBS` env var controls worker count and defaults to the CPU count
 (`sysctl -n hw.ncpu` on macOS, `nproc` on Linux, fallback 4); override
 with `JOBS=N make test` for debugging.
+
+### Windows Peesea inference tests (manual)
+
+The PowerShell launcher has a mocked Pester 3.4.0 suite. Run it from a Windows
+PowerShell 5.1 session on Peesea:
+
+```powershell
+Import-Module Pester -RequiredVersion 3.4.0
+$result = Invoke-Pester -Script .\tests\peesea-inference.Tests.ps1 -PassThru
+if ($result.FailedCount -gt 0) { exit 1 }
+```
+
+This Windows-only suite is not part of `make test` or CI and adds no permanent
+module dependency. It mocks LM Studio, process, lock, and listener operations;
+passing it does not validate live model loading, inference, GPU capacity, or
+performance.
 
 ### Pre-commit hook (optional)
 
