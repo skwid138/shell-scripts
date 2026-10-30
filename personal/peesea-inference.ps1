@@ -82,6 +82,7 @@ function Get-PeeseaProfile {
     Name = 'Swift27B'
     ModelKey = 'swift-1.5-qwen3.8-27b'
     CatalogPath = $null
+    CatalogSelector = 'swift-1.5-qwen3.8-27b@q4_k_m'
     Identifier = 'swift-1.5-qwen3.8-27b'
     VariantKey = $null
     QuantizationName = 'Q4_K_M'
@@ -329,9 +330,10 @@ function Resolve-PeeseaTarget {
   if (-not (Test-PeeseaModelFile -Path $Profile.ModelPath)) {
     throw "The known $($Profile.Name) model file is missing: $($Profile.ModelPath)"
   }
+  $catalogSelector = if ($Profile.CatalogSelector) { $Profile.CatalogSelector } else { $Profile.ModelKey }
   $catalog = @(Get-PeeseaLmsJson -Arguments @('ls', '--json'))
   $baseModels = @($catalog | Where-Object {
-      $_.type -ceq 'llm' -and $_.modelKey -ceq $Profile.ModelKey -and $null -eq $_.deviceIdentifier
+      $_.type -ceq 'llm' -and $_.modelKey -ceq $catalogSelector -and $null -eq $_.deviceIdentifier
   })
   if ($baseModels.Count -ne 1) {
     throw "Expected one local LM Studio catalog record for $($Profile.Name); found $($baseModels.Count)."
@@ -342,7 +344,7 @@ function Resolve-PeeseaTarget {
     $target = Get-PeeseaStandaloneTarget -Record $base -Profile $Profile
     $confirmedCatalog = @(Get-PeeseaLmsJson -Arguments @('ls', '--json'))
     $confirmedBases = @($confirmedCatalog | Where-Object {
-        $_.type -ceq 'llm' -and $_.modelKey -ceq $Profile.ModelKey -and $null -eq $_.deviceIdentifier
+        $_.type -ceq 'llm' -and $_.modelKey -ceq $catalogSelector -and $null -eq $_.deviceIdentifier
       })
     if ($confirmedBases.Count -ne 1) {
       throw "Standalone identity for $($Profile.Name) became ambiguous during resolution."
@@ -856,7 +858,12 @@ function Get-PeeseaProfileForLoadedModel {
   }
   foreach ($name in @('Coder', 'Qwen27B', 'Swift27B')) {
     $knownProfile = Get-PeeseaProfile -Model $name
-    if ($LoadedModel.ModelKey -cne $knownProfile.ModelKey) {
+    $modelKeyMatches = $LoadedModel.ModelKey -ceq $knownProfile.ModelKey
+    if (-not $modelKeyMatches -and $knownProfile.IdentityKind -eq 'StandalonePhysical' -and
+      $knownProfile.CatalogSelector) {
+      $modelKeyMatches = $LoadedModel.ModelKey -ceq $knownProfile.CatalogSelector
+    }
+    if (-not $modelKeyMatches) {
       continue
     }
     if ($knownProfile.IdentityKind -eq 'CatalogVariant' -and

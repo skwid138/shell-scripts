@@ -73,13 +73,15 @@ function New-PeeseaCatalogBaseFixture {
 function New-PeeseaStandaloneModelFixture {
   param(
     [Parameter(Mandatory)]$Profile,
-    [Parameter(Mandatory)][string]$Path
+    [Parameter(Mandatory)][string]$Path,
+    [string]$ModelKey
   )
 
   $metadata = Get-PeeseaCatalogFixtureMetadata -Profile $Profile
+  if (-not $PSBoundParameters.ContainsKey('ModelKey')) { $ModelKey = $Profile.ModelKey }
   $fixture = [pscustomobject]@{
     type = 'llm'
-    modelKey = $Profile.ModelKey
+    modelKey = $ModelKey
     format = 'gguf'
     displayName = $metadata.DisplayName
     publisher = $metadata.Publisher
@@ -137,7 +139,7 @@ function Get-PeeseaCatalogJsonFixture {
     return @(
       (New-PeeseaCatalogBaseFixture -Profile $coder)
       (New-PeeseaCatalogBaseFixture -Profile $qwen)
-      (New-PeeseaStandaloneModelFixture -Profile $swift -Path $swift.IndexedModelIdentifier)
+      (New-PeeseaStandaloneModelFixture -Profile $swift -Path $swift.IndexedModelIdentifier -ModelKey $swift.CatalogSelector)
     )
   }
   if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[2] -eq '--json') {
@@ -157,7 +159,8 @@ function New-PeeseaLoadedLlmFixture {
     [string]$SelectedVariant,
     [string]$QuantizationName,
     [object]$DeviceIdentifier,
-    [string[]]$VariantKeys
+    [string[]]$VariantKeys,
+    [string]$ModelKey
   )
 
   if (-not $PSBoundParameters.ContainsKey('Identifier')) { $Identifier = $Profile.Identifier }
@@ -166,10 +169,11 @@ function New-PeeseaLoadedLlmFixture {
   if (-not $PSBoundParameters.ContainsKey('SelectedVariant')) { $SelectedVariant = $Profile.VariantKey }
   if (-not $PSBoundParameters.ContainsKey('QuantizationName')) { $QuantizationName = $Profile.QuantizationName }
   if (-not $PSBoundParameters.ContainsKey('VariantKeys')) { $VariantKeys = @($Profile.VariantKey) }
+  if (-not $PSBoundParameters.ContainsKey('ModelKey')) { $ModelKey = $Profile.ModelKey }
   return [pscustomobject]@{
     Type = 'llm'
     Identifier = $Identifier
-    ModelKey = $Profile.ModelKey
+    ModelKey = $ModelKey
     CatalogPath = $CatalogPath
     IndexedModelIdentifier = $IndexedModelIdentifier
     SelectedVariant = $SelectedVariant
@@ -1456,7 +1460,7 @@ Describe 'LM Studio CLI JSON boundary' {
     $global:PeeseaRawCatalogSnapshot = @'
 [
   {"type":"llm","modelKey":"swift-qwen3.8-27b","format":"gguf","displayName":"Swift Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-Qwen3.8-27B-GGUF/Swift-Qwen3.8-27B-Q4_K_L.gguf","sizeBytes":19960648224,"indexedModelIdentifier":"ukisai/Swift-Qwen3.8-27B-GGUF/Swift-Qwen3.8-27B-Q4_K_L.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_L","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144},
-  {"type":"llm","modelKey":"swift-1.5-qwen3.8-27b","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144},
+  {"type":"llm","modelKey":"swift-1.5-qwen3.8-27b@q4_k_m","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144},
   {"type":"llm","modelKey":"qwen/qwen3.8-27b","format":"gguf","displayName":"Qwen3.8 27B","publisher":"qwen","path":"qwen/qwen3.8-27b","sizeBytes":17742040464,"indexedModelIdentifier":"qwen/qwen3.8-27b","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"variants":["qwen/qwen3.8-27b@q4_k_m"],"selectedVariant":"qwen/qwen3.8-27b@q4_k_m","vision":true,"trainedForToolUse":true,"maxContextLength":262144},
   {"type":"llm","modelKey":"qwen/qwen3-coder-30b","format":"gguf","displayName":"Qwen3 Coder 30B","publisher":"qwen","path":"qwen/qwen3-coder-30b","sizeBytes":18632365388,"indexedModelIdentifier":"qwen/qwen3-coder-30b","deviceIdentifier":null,"paramsString":"30B-A3B","architecture":"qwen3moe","quantization":{"name":"Q4_K_M","bits":4},"variants":["qwen/qwen3-coder-30b@q4_k_m"],"selectedVariant":"qwen/qwen3-coder-30b@q4_k_m","vision":false,"trainedForToolUse":true,"maxContextLength":262144},
   {"type":"embedding","modelKey":"text-embedding-nomic-embed-text-v1.5","format":"gguf","displayName":"Nomic Embed Text v1.5","publisher":"nomic-ai","path":"nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q4_K_M.gguf","sizeBytes":84106624,"indexedModelIdentifier":"nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q4_K_M.gguf","deviceIdentifier":null,"architecture":"nomic-bert","quantization":{"name":"Q4_K_M","bits":4},"maxContextLength":2048}
@@ -1498,7 +1502,7 @@ Describe 'LM Studio CLI JSON boundary' {
 
     $records.Count | Should Be 5
     $records[0].modelKey | Should Be 'swift-qwen3.8-27b'
-    $records[1].modelKey | Should Be 'swift-1.5-qwen3.8-27b'
+    $records[1].modelKey | Should Be 'swift-1.5-qwen3.8-27b@q4_k_m'
     $records[1].path | Should Be 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf'
     $coderTarget.LmsPath | Should Be 'qwen/qwen3-coder-30b'
     $coderTarget.VariantKey | Should Be 'qwen/qwen3-coder-30b@q4_k_m'
@@ -2163,9 +2167,41 @@ exit 99
 }
 
 Describe 'Peesea Swift profile resolution' {
+  It 'selects the exact Q4_K_M catalog record while preserving Swift loaded and API identity' {
+    $profile = Get-PeeseaProfile -Model Swift27B
+    $global:PeeseaSwiftCatalogJson = ConvertTo-Json -InputObject @(
+      (New-PeeseaStandaloneModelFixture -Profile $profile -Path 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf' -ModelKey 'swift-1.5-qwen3.8-27b@q4_k_s')
+      (New-PeeseaStandaloneModelFixture -Profile $profile -Path 'ukisai/Swift-1.0-Qwen3.8-27B-GGUF/Swift-1.0-Qwen3.8-27B-Q4_K_M.gguf' -ModelKey 'swift-1.0-qwen3.8-27b')
+      (New-PeeseaStandaloneModelFixture -Profile $profile -Path $profile.IndexedModelIdentifier -ModelKey 'swift-1.5-qwen3.8-27b@q4_k_m')
+    ) -Depth 8 -Compress
+    $global:PeeseaSwiftLmsCalls = @()
+    Mock Test-PeeseaModelFile { $true }
+    Mock Invoke-PeeseaLms {
+      $global:PeeseaSwiftLmsCalls += ,@($Arguments)
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        return [pscustomobject]@{ ExitCode = 0; Output = $global:PeeseaSwiftCatalogJson }
+      }
+      throw "Unexpected Swift catalog command: $($Arguments -join ' ')"
+    }
+
+    $target = Resolve-PeeseaTarget -Profile $profile
+    $loaded = New-PeeseaLoadedLlmFixture -Profile $profile -CatalogPath $profile.IndexedModelIdentifier -IndexedModelIdentifier $profile.IndexedModelIdentifier -SelectedVariant '' -QuantizationName 'Q4_K_M' -VariantKeys @()
+    $loadedProfile = Get-PeeseaProfileForLoadedModel -LoadedModel $loaded
+
+    $target.IdentityKind | Should Be 'StandalonePhysical'
+    $target.LmsPath | Should Be $profile.IndexedModelIdentifier
+    $target.PhysicalPath | Should Be $profile.ModelPath
+    $target.IndexedModelIdentifier | Should Be $profile.IndexedModelIdentifier
+    $profile.ModelKey | Should Be 'swift-1.5-qwen3.8-27b'
+    $profile.Identifier | Should Be 'swift-1.5-qwen3.8-27b'
+    $loadedProfile.ModelKey | Should Be 'swift-1.5-qwen3.8-27b'
+    $loadedProfile.Identifier | Should Be 'swift-1.5-qwen3.8-27b'
+    $global:PeeseaSwiftLmsCalls.Count | Should Be 2
+  }
+
   It 'binds the observed Swift 1.5 record to the exact ukisai Q4_K_M physical GGUF' {
     $global:PeeseaSwiftCatalogJson = @'
-[{"type":"llm","modelKey":"swift-1.5-qwen3.8-27b","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144}]
+[{"type":"llm","modelKey":"swift-1.5-qwen3.8-27b@q4_k_m","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"Q4_K_M","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144}]
 '@
     $global:PeeseaSwiftLmsCalls = @()
     Mock Test-PeeseaModelFile { $true }
@@ -2194,7 +2230,7 @@ Describe 'Peesea Swift profile resolution' {
 
   It 'rejects IQ4_NL metadata even when the standalone row reports the Q4_K_M file size' {
     $global:PeeseaSwiftCatalogJson = @'
-[{"type":"llm","modelKey":"swift-1.5-qwen3.8-27b","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"IQ4_NL","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144}]
+[{"type":"llm","modelKey":"swift-1.5-qwen3.8-27b@q4_k_m","format":"gguf","displayName":"Swift 1.5 Qwen3.8 27B","publisher":"ukisai","path":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","sizeBytes":18370006848,"indexedModelIdentifier":"ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf","deviceIdentifier":null,"paramsString":"27B","architecture":"qwen35","quantization":{"name":"IQ4_NL","bits":4},"vision":true,"trainedForToolUse":true,"maxContextLength":262144}]
 '@
     $global:PeeseaSwiftLmsCalls = @()
     Mock Test-PeeseaModelFile { $true }
@@ -2238,6 +2274,22 @@ Describe 'Peesea Swift profile resolution' {
     $loaded[0].QuantizationName | Should Be 'Q4_K_M'
     $loaded[0].ContextLength | Should Be 81920
     Assert-MockCalled Invoke-PeeseaLms -Times 1 -Scope It
+  }
+
+  It 'recognizes the exact qualified Swift loaded key without bypassing physical identity checks' {
+    $profile = Get-PeeseaProfile -Model Swift27B
+    $qualified = New-PeeseaLoadedLlmFixture -Profile $profile -CatalogPath $profile.IndexedModelIdentifier -IndexedModelIdentifier $profile.IndexedModelIdentifier -SelectedVariant '' -QuantizationName 'Q4_K_M' -VariantKeys @() -ModelKey $profile.CatalogSelector
+
+    (Get-PeeseaProfileForLoadedModel -LoadedModel $qualified).Name | Should Be 'Swift27B'
+
+    $wrongKey = New-PeeseaLoadedLlmFixture -Profile $profile -CatalogPath $profile.IndexedModelIdentifier -IndexedModelIdentifier $profile.IndexedModelIdentifier -SelectedVariant '' -QuantizationName 'Q4_K_M' -VariantKeys @() -ModelKey 'swift-1.5-qwen3.8-27b@q4_k_s'
+    (Get-PeeseaProfileForLoadedModel -LoadedModel $wrongKey) | Should Be $null
+
+    $wrongPath = New-PeeseaLoadedLlmFixture -Profile $profile -CatalogPath 'ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf' -IndexedModelIdentifier $profile.IndexedModelIdentifier -SelectedVariant '' -QuantizationName 'Q4_K_M' -VariantKeys @() -ModelKey $profile.CatalogSelector
+    (Get-PeeseaProfileForLoadedModel -LoadedModel $wrongPath) | Should Be $null
+
+    $wrongQuantization = New-PeeseaLoadedLlmFixture -Profile $profile -CatalogPath $profile.IndexedModelIdentifier -IndexedModelIdentifier $profile.IndexedModelIdentifier -SelectedVariant '' -QuantizationName 'Q4_K_S' -VariantKeys @() -ModelKey $profile.CatalogSelector
+    (Get-PeeseaProfileForLoadedModel -LoadedModel $wrongQuantization) | Should Be $null
   }
 
   AfterEach {
