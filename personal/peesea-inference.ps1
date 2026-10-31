@@ -6,13 +6,16 @@ Launch the selected Peesea LM Studio inference profile.
 Runs the approved per-user process cleanup, then starts or reuses the known
 LM Studio server and selected local model. Coder is the default profile;
 Qwen27B selects Qwen3.8 27B, and Swift27B selects the standalone Swift 1.5 Q4_K_M
-GGUF. A profile switch or reload can interrupt a
+GGUF. Devstral24B, GPTOSS20B, Gemma26B, GLMFlash, and LagunaXS use their known
+local files and LM Studio's saved per-model load defaults without context/GPU
+overrides. A profile switch or reload can interrupt a
 prediction on a known model, and LM Studio does not expose a reliable active
 prediction count. Browsers are closed gracefully; unrelated processes are
 left alone.
 
 .PARAMETER Model
-Select Coder (the default), Qwen27B, or Swift27B.
+Select Coder (the default), Qwen27B, Swift27B, Devstral24B, GPTOSS20B,
+Gemma26B, GLMFlash, or LagunaXS.
 
 .PARAMETER KeepConsoleOpen
 Return to the desktop PowerShell console after displaying the final result.
@@ -28,14 +31,14 @@ Get-Help .\personal\peesea-inference.ps1
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet('Coder', 'Qwen27B', 'Swift27B')]
+  [ValidateSet('Coder', 'Qwen27B', 'Swift27B', 'Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')]
   [string]$Model = 'Coder',
   [switch]$KeepConsoleOpen
 )
 
 function Get-PeeseaProfile {
   param(
-    [ValidateSet('Coder', 'Qwen27B', 'Swift27B')]
+    [ValidateSet('Coder', 'Qwen27B', 'Swift27B', 'Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')]
     [string]$Model = 'Coder'
   )
 
@@ -69,6 +72,93 @@ function Get-PeeseaProfile {
       IndexedModelIdentifier = 'qwen/qwen3.8-27b@lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf'
       ModelPath = Join-Path $root 'Qwen3.8-27B-GGUF\Qwen3.8-27B-Q4_K_M.gguf'
       MinimumContext = 81920
+      Port = 1234
+      Bind = '0.0.0.0'
+    }
+  }
+
+  if ($Model -eq 'Devstral24B') {
+    return [pscustomobject]@{
+      IdentityKind = 'CatalogVariant'
+      Name = 'Devstral24B'
+      ModelKey = 'mistralai/devstral-small-2-2512'
+      CatalogPath = 'mistralai/devstral-small-2-2512'
+      Identifier = 'mistralai/devstral-small-2-2512'
+      VariantKey = 'mistralai/devstral-small-2-2512@q4_k_m'
+      QuantizationName = 'Q4_K_M'
+      IndexedModelIdentifier = 'mistralai/devstral-small-2-2512@lmstudio-community/Devstral-Small-2-24B-Instruct-2512-GGUF/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf'
+      ModelPath = Join-Path $root 'Devstral-Small-2-24B-Instruct-2512-GGUF\Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf'
+      UseSavedLoadDefaults = [bool]$true
+      Port = 1234
+      Bind = '0.0.0.0'
+    }
+  }
+
+  if ($Model -eq 'GPTOSS20B') {
+    return [pscustomobject]@{
+      IdentityKind = 'StandalonePhysical'
+      Name = 'GPTOSS20B'
+      ModelKey = 'gpt-oss-20b'
+      CatalogPath = $null
+      CatalogSelector = 'gpt-oss-20b'
+      Identifier = 'gpt-oss-20b'
+      VariantKey = $null
+      QuantizationName = 'F16'
+      IndexedModelIdentifier = 'unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-F16.gguf'
+      ModelPath = Join-Path $env:USERPROFILE '.lmstudio\models\unsloth\gpt-oss-20b-GGUF\gpt-oss-20b-F16.gguf'
+      UseSavedLoadDefaults = [bool]$true
+      Port = 1234
+      Bind = '0.0.0.0'
+    }
+  }
+
+  if ($Model -eq 'Gemma26B') {
+    return [pscustomobject]@{
+      IdentityKind = 'CatalogVariant'
+      Name = 'Gemma26B'
+      ModelKey = 'google/gemma-4-26b-a4b-qat'
+      CatalogPath = 'google/gemma-4-26b-a4b-qat'
+      Identifier = 'google/gemma-4-26b-a4b-qat'
+      VariantKey = 'google/gemma-4-26b-a4b-qat@q4_0'
+      QuantizationName = 'Q4_0'
+      IndexedModelIdentifier = 'google/gemma-4-26b-a4b-qat@lmstudio-community/gemma-4-26B-A4B-it-QAT-GGUF/gemma-4-26B-A4B-it-QAT-Q4_0.gguf'
+      ModelPath = Join-Path $root 'gemma-4-26B-A4B-it-QAT-GGUF\gemma-4-26B-A4B-it-QAT-Q4_0.gguf'
+      UseSavedLoadDefaults = [bool]$true
+      Port = 1234
+      Bind = '0.0.0.0'
+    }
+  }
+
+  if ($Model -eq 'GLMFlash') {
+    return [pscustomobject]@{
+      IdentityKind = 'CatalogVariant'
+      Name = 'GLMFlash'
+      ModelKey = 'zai-org/glm-4.7-flash'
+      CatalogPath = 'zai-org/glm-4.7-flash'
+      Identifier = 'zai-org/glm-4.7-flash'
+      VariantKey = 'zai-org/glm-4.7-flash@q4_k_m'
+      QuantizationName = 'Q4_K_M'
+      IndexedModelIdentifier = 'zai-org/glm-4.7-flash@lmstudio-community/GLM-4.7-Flash-GGUF/GLM-4.7-Flash-Q4_K_M.gguf'
+      ModelPath = Join-Path $root 'GLM-4.7-Flash-GGUF\GLM-4.7-Flash-Q4_K_M.gguf'
+      UseSavedLoadDefaults = [bool]$true
+      Port = 1234
+      Bind = '0.0.0.0'
+    }
+  }
+
+  if ($Model -eq 'LagunaXS') {
+    return [pscustomobject]@{
+      IdentityKind = 'StandalonePhysical'
+      Name = 'LagunaXS'
+      ModelKey = 'laguna-xs-2.1-apex' # gitleaks:allow -- public model catalog ID, not a credential
+      CatalogPath = $null
+      CatalogSelector = 'laguna-xs-2.1-apex'
+      Identifier = 'laguna-xs-2.1-apex'
+      VariantKey = $null
+      QuantizationName = $null
+      IndexedModelIdentifier = 'mudler/Laguna-XS-2.1-APEX-GGUF/Laguna-XS-2.1-APEX-I-Compact.gguf'
+      ModelPath = Join-Path $env:USERPROFILE '.lmstudio\models\mudler\Laguna-XS-2.1-APEX-GGUF\Laguna-XS-2.1-APEX-I-Compact.gguf'
+      UseSavedLoadDefaults = [bool]$true
       Port = 1234
       Bind = '0.0.0.0'
     }
@@ -856,7 +946,7 @@ function Get-PeeseaProfileForLoadedModel {
   if ($null -ne $LoadedModel.DeviceIdentifier) {
     return $null
   }
-  foreach ($name in @('Coder', 'Qwen27B', 'Swift27B')) {
+  foreach ($name in @('Coder', 'Qwen27B', 'Swift27B', 'Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')) {
     $knownProfile = Get-PeeseaProfile -Model $name
     $modelKeyMatches = $LoadedModel.ModelKey -ceq $knownProfile.ModelKey
     if (-not $modelKeyMatches -and $knownProfile.IdentityKind -eq 'StandalonePhysical' -and
@@ -924,9 +1014,36 @@ function Assert-PeeseaUniqueLoadedIdentifiers {
   }
 }
 
+function Test-PeeseaProfileUsesSavedLoadDefaults {
+  param([Parameter(Mandatory)]$Profile)
+
+  $policy = $Profile.PSObject.Properties['UseSavedLoadDefaults']
+  if ($null -eq $policy) { return $false }
+  if ($policy.Value -isnot [bool]) {
+    throw "Saved-load-default policy for $($Profile.Name) must be a Boolean."
+  }
+  return [bool]$policy.Value
+}
+
+function Test-PeeseaProfileContextCompatibility {
+  param(
+    [Parameter(Mandatory)]$Profile,
+    [Parameter(Mandatory)][long]$ContextLength
+  )
+
+  if (Test-PeeseaProfileUsesSavedLoadDefaults -Profile $Profile) {
+    return $ContextLength -gt 0
+  }
+  $minimumContext = $Profile.PSObject.Properties['MinimumContext']
+  if ($null -eq $minimumContext -or $minimumContext.Value -isnot [int] -or $minimumContext.Value -le 0) {
+    return $false
+  }
+  return $ContextLength -ge [long]$minimumContext.Value
+}
+
 function Invoke-PeeseaInference {
   param(
-    [ValidateSet('Coder', 'Qwen27B', 'Swift27B')]
+    [ValidateSet('Coder', 'Qwen27B', 'Swift27B', 'Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')]
     [string]$Model = 'Coder'
   )
 
@@ -946,6 +1063,7 @@ function Invoke-PeeseaInference {
     Invoke-PeeseaCleanup
     Write-Host "Validating $Model profile and downloaded model identity..."
     $profile = Get-PeeseaProfile -Model $Model
+    $usesSavedLoadDefaults = Test-PeeseaProfileUsesSavedLoadDefaults -Profile $profile
     $target = Resolve-PeeseaTarget -Profile $profile
     Ensure-PeeseaServer -Profile $profile
 
@@ -968,18 +1086,26 @@ function Invoke-PeeseaInference {
     }
     $targetCompatible = $targetModels.Count -eq 1 -and
       $targetModels[0].Model.Identifier -eq $profile.Identifier -and
-      $targetModels[0].Model.ContextLength -ge $profile.MinimumContext
+      (Test-PeeseaProfileContextCompatibility -Profile $profile -ContextLength $targetModels[0].Model.ContextLength)
     $reused = $targetCompatible
 
     $toUnload = @($knownLoaded | Where-Object {
         $_.Profile.Name -ne $profile.Name -or -not $targetCompatible
       })
     if ($targetCompatible) {
-      Write-Host "Reusing verified loaded $($profile.Name) model; no load action is needed."
+      if ($usesSavedLoadDefaults) {
+        Write-Host "Reusing verified loaded $($profile.Name) at its current context $($targetModels[0].Model.ContextLength); saved defaults were not reapplied."
+      } else {
+        Write-Host "Reusing verified loaded $($profile.Name) model; no load action is needed."
+      }
     } elseif ($toUnload.Count -gt 0) {
       Write-Host "Switching/reloading a known model to $($profile.Name)..."
     } else {
-      Write-Host "Loading $($profile.Name) model..."
+      if ($usesSavedLoadDefaults) {
+        Write-Host "Loading $($profile.Name) with LM Studio's saved per-model settings left unoverridden (no context-length or GPU flags)..."
+      } else {
+        Write-Host "Loading $($profile.Name) model..."
+      }
     }
     if ($toUnload.Count -gt 0) {
       Assert-PeeseaTargetSelectionUnchanged -Profile $profile -ExpectedTarget $target
@@ -1002,10 +1128,11 @@ function Invoke-PeeseaInference {
 
     if (-not $targetCompatible) {
       Assert-PeeseaTargetSelectionUnchanged -Profile $profile -ExpectedTarget $target
-      $loadArguments = @(
-        'load', $target.LmsPath, '--exact', '--context-length', [string]$profile.MinimumContext,
-        '--gpu', 'max', '--identifier', $profile.Identifier
-      )
+      $loadArguments = @('load', $target.LmsPath, '--exact')
+      if (-not $usesSavedLoadDefaults) {
+        $loadArguments += @('--context-length', [string]$profile.MinimumContext, '--gpu', 'max')
+      }
+      $loadArguments += @('--identifier', $profile.Identifier)
       Invoke-PeeseaLmsChecked -Arguments $loadArguments | Out-Null
     }
 
@@ -1019,12 +1146,13 @@ function Invoke-PeeseaInference {
       if ($null -eq $knownProfile -or $knownProfile.Name -ne $profile.Name) {
         $otherLlms += $loadedLlm
       } elseif ($loadedLlm.Identifier -eq $profile.Identifier -and
-        $loadedLlm.ContextLength -ge $profile.MinimumContext) {
+        (Test-PeeseaProfileContextCompatibility -Profile $profile -ContextLength $loadedLlm.ContextLength)) {
         $verifiedTarget += $loadedLlm
       }
     }
     if ($verifiedTarget.Count -ne 1) {
-      throw "LM Studio did not verify exactly one loaded $($profile.Name) variant ($($profile.VariantKey)) with identifier $($profile.Identifier) and context at least $($profile.MinimumContext)."
+      $contextRequirement = if ($usesSavedLoadDefaults) { 'a positive reported context' } else { "context at least $($profile.MinimumContext)" }
+      throw "LM Studio did not verify exactly one loaded $($profile.Name) variant ($($profile.VariantKey)) with identifier $($profile.Identifier) and $contextRequirement."
     }
     if ($otherLlms.Count -gt 0) {
       throw 'An unexpected LLM appeared during launch; refusing to report Ready.'
@@ -1047,7 +1175,7 @@ function Invoke-PeeseaInference {
 
 function Invoke-PeeseaLauncherEntryPoint {
   param(
-    [ValidateSet('Coder', 'Qwen27B', 'Swift27B')]
+    [ValidateSet('Coder', 'Qwen27B', 'Swift27B', 'Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')]
     [string]$Model = 'Coder',
     [switch]$KeepConsoleOpen
   )

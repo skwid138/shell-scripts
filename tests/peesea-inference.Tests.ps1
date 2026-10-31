@@ -24,6 +24,16 @@ function Get-PeeseaCatalogFixtureMetadata {
       Vision = $true
     }
   }
+  if ($Profile.Name -in @('Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')) {
+    return [pscustomobject]@{
+      DisplayName = 'Fixture ' + $Profile.Name
+      Publisher = 'fixture'
+      SizeBytes = 1
+      ParamsString = 'fixture'
+      Architecture = 'fixture'
+      Vision = $false
+    }
+  }
   return [pscustomobject]@{
     DisplayName = 'Swift 1.5 Qwen3.8 27B'
     Publisher = 'ukisai'
@@ -90,7 +100,9 @@ function New-PeeseaStandaloneModelFixture {
   }
   if ($Profile.IdentityKind -eq 'StandalonePhysical') {
     $fixture | Add-Member -NotePropertyName indexedModelIdentifier -NotePropertyValue $Profile.IndexedModelIdentifier
-    $fixture | Add-Member -NotePropertyName quantization -NotePropertyValue ([pscustomobject]@{ name = $Profile.QuantizationName; bits = 4 })
+    if (-not [string]::IsNullOrWhiteSpace([string]$Profile.QuantizationName)) {
+      $fixture | Add-Member -NotePropertyName quantization -NotePropertyValue ([pscustomobject]@{ name = $Profile.QuantizationName })
+    }
   }
   return $fixture
 }
@@ -1665,58 +1677,60 @@ Describe 'LM Studio CLI JSON boundary' {
   }
 
   It 'rejects a loaded LLM that reports zero context' {
-    $profile = Get-PeeseaProfile -Model Coder
-    $record = New-PeeseaPsLlmJsonFixture -Profile $profile -ContextLength 0
-    $global:PeeseaCliFixture = '[' + (ConvertTo-Json -InputObject $record -Compress) + ']'
+    $global:PeeseaCliFixture = ''
     Mock Invoke-PeeseaLms {
       [pscustomobject]@{ ExitCode = 0; Output = $global:PeeseaCliFixture }
     }
-    $threw = $false
 
-    try {
-      Get-PeeseaLoadedModels | Out-Null
-    } catch {
-      $threw = $_.Exception.Message -match 'valid context'
+    foreach ($profileName in @('Coder', 'Devstral24B')) {
+      $record = New-PeeseaPsLlmJsonFixture -Profile (Get-PeeseaProfile -Model $profileName) -ContextLength 0
+      $global:PeeseaCliFixture = '[' + (ConvertTo-Json -InputObject $record -Compress) + ']'
+      $threw = $false
+      try {
+        Get-PeeseaLoadedModels | Out-Null
+      } catch {
+        $threw = $_.Exception.Message -match 'valid context'
+      }
+      $threw | Should Be $true
     }
-
-    $threw | Should Be $true
   }
 
   It 'rejects a loaded LLM that reports negative context' {
-    $profile = Get-PeeseaProfile -Model Coder
-    $record = New-PeeseaPsLlmJsonFixture -Profile $profile -ContextLength -1
-    $global:PeeseaCliFixture = '[' + (ConvertTo-Json -InputObject $record -Compress) + ']'
+    $global:PeeseaCliFixture = ''
     Mock Invoke-PeeseaLms {
       [pscustomobject]@{ ExitCode = 0; Output = $global:PeeseaCliFixture }
     }
-    $threw = $false
 
-    try {
-      Get-PeeseaLoadedModels | Out-Null
-    } catch {
-      $threw = $_.Exception.Message -match 'valid context'
+    foreach ($profileName in @('Coder', 'Devstral24B')) {
+      $record = New-PeeseaPsLlmJsonFixture -Profile (Get-PeeseaProfile -Model $profileName) -ContextLength -1
+      $global:PeeseaCliFixture = '[' + (ConvertTo-Json -InputObject $record -Compress) + ']'
+      $threw = $false
+      try {
+        Get-PeeseaLoadedModels | Out-Null
+      } catch {
+        $threw = $_.Exception.Message -match 'valid context'
+      }
+      $threw | Should Be $true
     }
-
-    $threw | Should Be $true
   }
 
-  It 'rejects missing and non-integer loaded LLM context values' {
-    $profile = Get-PeeseaProfile -Model Coder
-    $missingContext = New-PeeseaPsLlmJsonFixture -Profile $profile
-    $missingContext.PSObject.Properties.Remove('contextLength') | Out-Null
-    $nonnumericContext = New-PeeseaPsLlmJsonFixture -Profile $profile
-    $nonnumericContext.contextLength = 'not-an-integer'
-    $global:PeeseaContextFixtures = @(
-      $missingContext
-      $nonnumericContext
-    )
+  It 'rejects missing and non-integer loaded LLM context for pinned and saved-default profiles' {
+    $global:PeeseaContextFixtures = @()
+    foreach ($profileName in @('Coder', 'Devstral24B')) {
+      $profile = Get-PeeseaProfile -Model $profileName
+      $missingContext = New-PeeseaPsLlmJsonFixture -Profile $profile
+      $missingContext.PSObject.Properties.Remove('contextLength') | Out-Null
+      $nonnumericContext = New-PeeseaPsLlmJsonFixture -Profile $profile
+      $nonnumericContext.contextLength = 'not-an-integer'
+      $global:PeeseaContextFixtures += @($missingContext, $nonnumericContext)
+    }
     Mock Invoke-PeeseaLms {
       $fixture = $global:PeeseaContextFixtures[$global:PeeseaContextFixtureIndex]
       $global:PeeseaContextFixtureIndex++
       [pscustomobject]@{ ExitCode = 0; Output = '[' + (ConvertTo-Json -InputObject $fixture -Compress) + ']' }
     }
 
-    foreach ($index in @(0, 1)) {
+    foreach ($index in @(0, 1, 2, 3)) {
       $global:PeeseaContextFixtureIndex = $index
       $threw = $false
       try {
@@ -2547,5 +2561,536 @@ Describe 'Peesea native listener adapter' {
 
   AfterEach {
     Remove-Variable -Name PeeseaListenerQueryCount, PeeseaListenerStatusCount, PeeseaListenerLmsCalls, PeeseaMissingListenerError, PeeseaProcessLookupError -Scope Global -ErrorAction SilentlyContinue
+  }
+}
+
+Describe 'LM Studio saved-default launcher profiles' {
+  It 'exposes the five metadata-verified profiles with their exact identities and physical bindings' {
+    $modelsRoot = Join-Path $env:USERPROFILE '.lmstudio\models'
+    $communityRoot = Join-Path $modelsRoot 'lmstudio-community'
+    $expectedProfiles = @(
+      [pscustomobject]@{
+        Name = 'Devstral24B'; IdentityKind = 'CatalogVariant'
+        ModelKey = 'mistralai/devstral-small-2-2512'; CatalogPath = 'mistralai/devstral-small-2-2512'
+        Identifier = 'mistralai/devstral-small-2-2512'; VariantKey = 'mistralai/devstral-small-2-2512@q4_k_m'
+        QuantizationName = 'Q4_K_M'
+        IndexedModelIdentifier = 'mistralai/devstral-small-2-2512@lmstudio-community/Devstral-Small-2-24B-Instruct-2512-GGUF/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf'
+        ModelPath = Join-Path $communityRoot 'Devstral-Small-2-24B-Instruct-2512-GGUF\Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf'
+      }
+      [pscustomobject]@{
+        Name = 'GPTOSS20B'; IdentityKind = 'StandalonePhysical'
+        ModelKey = 'gpt-oss-20b'; CatalogPath = $null; CatalogSelector = 'gpt-oss-20b'
+        Identifier = 'gpt-oss-20b'; VariantKey = $null; QuantizationName = 'F16'
+        IndexedModelIdentifier = 'unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-F16.gguf'
+        ModelPath = Join-Path $modelsRoot 'unsloth\gpt-oss-20b-GGUF\gpt-oss-20b-F16.gguf'
+      }
+      [pscustomobject]@{
+        Name = 'Gemma26B'; IdentityKind = 'CatalogVariant'
+        ModelKey = 'google/gemma-4-26b-a4b-qat'; CatalogPath = 'google/gemma-4-26b-a4b-qat'
+        Identifier = 'google/gemma-4-26b-a4b-qat'; VariantKey = 'google/gemma-4-26b-a4b-qat@q4_0'
+        QuantizationName = 'Q4_0'
+        IndexedModelIdentifier = 'google/gemma-4-26b-a4b-qat@lmstudio-community/gemma-4-26B-A4B-it-QAT-GGUF/gemma-4-26B-A4B-it-QAT-Q4_0.gguf'
+        ModelPath = Join-Path $communityRoot 'gemma-4-26B-A4B-it-QAT-GGUF\gemma-4-26B-A4B-it-QAT-Q4_0.gguf'
+      }
+      [pscustomobject]@{
+        Name = 'GLMFlash'; IdentityKind = 'CatalogVariant'
+        ModelKey = 'zai-org/glm-4.7-flash'; CatalogPath = 'zai-org/glm-4.7-flash'
+        Identifier = 'zai-org/glm-4.7-flash'; VariantKey = 'zai-org/glm-4.7-flash@q4_k_m'
+        QuantizationName = 'Q4_K_M'
+        IndexedModelIdentifier = 'zai-org/glm-4.7-flash@lmstudio-community/GLM-4.7-Flash-GGUF/GLM-4.7-Flash-Q4_K_M.gguf'
+        ModelPath = Join-Path $communityRoot 'GLM-4.7-Flash-GGUF\GLM-4.7-Flash-Q4_K_M.gguf'
+      }
+      [pscustomobject]@{
+        Name = 'LagunaXS'; IdentityKind = 'StandalonePhysical'
+        ModelKey = 'laguna-xs-2.1-apex'; CatalogPath = $null; CatalogSelector = 'laguna-xs-2.1-apex' # gitleaks:allow -- public model catalog ID, not a credential
+        Identifier = 'laguna-xs-2.1-apex'; VariantKey = $null; QuantizationName = $null
+        IndexedModelIdentifier = 'mudler/Laguna-XS-2.1-APEX-GGUF/Laguna-XS-2.1-APEX-I-Compact.gguf'
+        ModelPath = Join-Path $modelsRoot 'mudler\Laguna-XS-2.1-APEX-GGUF\Laguna-XS-2.1-APEX-I-Compact.gguf'
+      }
+    )
+
+    foreach ($expected in $expectedProfiles) {
+      $profile = Get-PeeseaProfile -Model $expected.Name
+
+      $profile.Name | Should Be $expected.Name
+      $profile.IdentityKind | Should Be $expected.IdentityKind
+      $profile.ModelKey | Should Be $expected.ModelKey
+      $profile.CatalogPath | Should Be $expected.CatalogPath
+      $profile.CatalogSelector | Should Be $expected.CatalogSelector
+      $profile.Identifier | Should Be $expected.Identifier
+      $profile.VariantKey | Should Be $expected.VariantKey
+      $profile.QuantizationName | Should Be $expected.QuantizationName
+      $profile.IndexedModelIdentifier | Should Be $expected.IndexedModelIdentifier
+      $profile.ModelPath | Should Be $expected.ModelPath
+      ($profile.UseSavedLoadDefaults -is [bool]) | Should Be $true
+      $profile.UseSavedLoadDefaults | Should Be $true
+    }
+  }
+
+  It 'accepts all eight model selectors at the script, inference, and launcher entry points' {
+    $selectorNames = @('Coder', 'Qwen27B', 'Swift27B', 'Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')
+    $commands = @(
+      (Get-Command -Name $script:PeeseaInferenceScript -CommandType ExternalScript)
+      (Get-Command -Name Invoke-PeeseaInference -CommandType Function)
+      (Get-Command -Name Invoke-PeeseaLauncherEntryPoint -CommandType Function)
+    )
+    foreach ($command in $commands) {
+      $modelParameter = $command.Parameters['Model']
+      $validateSet = @($modelParameter.Attributes | Where-Object {
+          $_ -is [System.Management.Automation.ValidateSetAttribute]
+        } | Select-Object -First 1)
+      $validateSet.Count | Should Be 1
+      foreach ($selector in $selectorNames) {
+        (@($validateSet[0].ValidValues) -contains $selector) | Should Be $true
+      }
+    }
+  }
+
+  It 'recognizes each new loaded identity only against its exact local physical binding' {
+    $selectorNames = @('Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')
+    $global:PeeseaSavedDefaultsProfile = $null
+    Mock Test-PeeseaModelFile { $true }
+    Mock Get-PeeseaLmsJson {
+      $profile = $global:PeeseaSavedDefaultsProfile
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        if ($profile.IdentityKind -eq 'CatalogVariant') {
+          return @(New-PeeseaCatalogBaseFixture -Profile $profile)
+        }
+        return @(New-PeeseaStandaloneModelFixture -Profile $profile -Path $profile.IndexedModelIdentifier -ModelKey $profile.CatalogSelector)
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $profile.ModelKey -and
+        $profile.IdentityKind -eq 'CatalogVariant') {
+        return @(New-PeeseaVariantDetailFixture -Profile $profile)
+      }
+      throw 'Unexpected mocked catalog query in known-profile mapping test.'
+    }
+
+    foreach ($selector in $selectorNames) {
+      $global:PeeseaSavedDefaultsProfile = Get-PeeseaProfile -Model $selector
+      if ($global:PeeseaSavedDefaultsProfile.IdentityKind -eq 'CatalogVariant') {
+        $loaded = New-PeeseaLoadedLlmFixture -Profile $global:PeeseaSavedDefaultsProfile
+      } else {
+        $loaded = New-PeeseaLoadedLlmFixture -Profile $global:PeeseaSavedDefaultsProfile `
+          -CatalogPath $global:PeeseaSavedDefaultsProfile.IndexedModelIdentifier `
+          -IndexedModelIdentifier $global:PeeseaSavedDefaultsProfile.IndexedModelIdentifier `
+          -SelectedVariant '' -QuantizationName $global:PeeseaSavedDefaultsProfile.QuantizationName `
+          -VariantKeys @() -ModelKey $global:PeeseaSavedDefaultsProfile.CatalogSelector
+      }
+
+      $knownProfile = Get-PeeseaProfileForLoadedModel -LoadedModel $loaded
+
+      ($null -ne $knownProfile) | Should Be $true
+      $knownProfile.Name | Should Be $selector
+      $knownProfile.Identifier | Should Be $global:PeeseaSavedDefaultsProfile.Identifier
+    }
+  }
+
+  It 'loads each new profile without context or GPU overrides and reports the actual context' {
+    $selectorNames = @('Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')
+    $global:PeeseaSavedDefaultsLoadedReadCount = 0
+    $global:PeeseaSavedDefaultsLmsCalls = @()
+
+    Mock Invoke-PeeseaCleanup {}
+    Mock Enter-PeeseaLaunchLock { 'saved-default-test-lock' }
+    Mock Exit-PeeseaLaunchLock {}
+    Mock Test-PeeseaModelFile { $true }
+    Mock Write-Host {}
+    Mock Get-PeeseaServerStatus { [pscustomobject]@{ Running = $true; Port = 1234 } }
+    Mock Get-PeeseaServerListener {
+      $expectedPath = Join-Path $env:LOCALAPPDATA 'Programs\LM Studio\LM Studio.exe'
+      [pscustomobject]@{
+        Exists = $true; Port = 1234; LocalAddress = '0.0.0.0'
+        ProcessName = 'LM Studio.exe'; ProcessPath = $expectedPath; ExpectedProcessPath = $expectedPath
+      }
+    }
+    Mock Get-PeeseaNvidiaSmiPath { $null }
+    Mock Get-PeeseaLmsJson {
+      $profile = $global:PeeseaSavedDefaultsProfile
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        if ($profile.IdentityKind -eq 'CatalogVariant') {
+          return @(New-PeeseaCatalogBaseFixture -Profile $profile)
+        }
+        return @(New-PeeseaStandaloneModelFixture -Profile $profile -Path $profile.IndexedModelIdentifier -ModelKey $profile.CatalogSelector)
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $profile.ModelKey -and
+        $profile.IdentityKind -eq 'CatalogVariant') {
+        return @(New-PeeseaVariantDetailFixture -Profile $profile)
+      }
+      throw 'Unexpected mocked catalog query in saved-default load test.'
+    }
+    Mock Get-PeeseaLoadedModels {
+      $global:PeeseaSavedDefaultsLoadedReadCount++
+      if ($global:PeeseaSavedDefaultsLoadedReadCount -eq 1) { return @() }
+      $profile = $global:PeeseaSavedDefaultsProfile
+      if ($profile.IdentityKind -eq 'CatalogVariant') {
+        return @(New-PeeseaLoadedLlmFixture -Profile $profile -ContextLength 32768)
+      }
+      return @(
+        New-PeeseaLoadedLlmFixture -Profile $profile -ContextLength 32768 `
+          -CatalogPath $profile.IndexedModelIdentifier -IndexedModelIdentifier $profile.IndexedModelIdentifier `
+          -SelectedVariant '' -QuantizationName $profile.QuantizationName -VariantKeys @() -ModelKey $profile.CatalogSelector
+      )
+    }
+    Mock Invoke-PeeseaLms {
+      $global:PeeseaSavedDefaultsLmsCalls += ,@($Arguments)
+      [pscustomobject]@{ ExitCode = 0; Output = '' }
+    }
+
+    foreach ($selector in $selectorNames) {
+      $global:PeeseaSavedDefaultsProfile = Get-PeeseaProfile -Model $selector
+      $global:PeeseaSavedDefaultsLoadedReadCount = 0
+      $global:PeeseaSavedDefaultsLmsCalls = @()
+
+      $result = Invoke-PeeseaInference -Model $selector
+
+      if (-not $result.Ready) { throw $result.Message }
+      $result.Ready | Should Be $true
+      $result.Message | Should Match 'context 32768'
+      $result.Message | Should Not Match 'null|at least|saved defaults were applied'
+      $loadCalls = @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -eq 'load' })
+      $loadCalls.Count | Should Be 1
+      $loadSelector = if ($global:PeeseaSavedDefaultsProfile.IdentityKind -eq 'CatalogVariant') {
+        $global:PeeseaSavedDefaultsProfile.ModelKey
+      } else {
+        $global:PeeseaSavedDefaultsProfile.IndexedModelIdentifier
+      }
+      ($loadCalls[0] -join ' ') | Should Be ("load $loadSelector --exact --identifier $($global:PeeseaSavedDefaultsProfile.Identifier)")
+      ($loadCalls[0] -contains '--context-length') | Should Be $false
+      ($loadCalls[0] -contains '--gpu') | Should Be $false
+    }
+  }
+
+  AfterEach {
+    Remove-Variable -Name PeeseaSavedDefaultsProfile, PeeseaSavedDefaultsLoadedReadCount, PeeseaSavedDefaultsLmsCalls -Scope Global -ErrorAction SilentlyContinue
+  }
+}
+
+Describe 'Saved-default controller behavior' {
+  BeforeEach {
+    $global:PeeseaSavedDefaultsTargetProfile = Get-PeeseaProfile -Model Devstral24B
+    $global:PeeseaSavedDefaultsLoadedReadCount = 0
+    $global:PeeseaSavedDefaultsInitiallyLoaded = $false
+    $global:PeeseaSavedDefaultsContextLength = 16384
+    $global:PeeseaSavedDefaultsLmsCalls = @()
+    $global:PeeseaSavedDefaultsHostOutput = @()
+
+    Mock Invoke-PeeseaCleanup {}
+    Mock Enter-PeeseaLaunchLock { 'saved-default-controller-test-lock' }
+    Mock Exit-PeeseaLaunchLock {}
+    Mock Test-PeeseaModelFile { $true }
+    Mock Write-Host {
+      $global:PeeseaSavedDefaultsHostOutput += [string]::Join('', @($Object))
+    }
+    Mock Get-PeeseaServerStatus { [pscustomobject]@{ Running = $true; Port = 1234 } }
+    Mock Get-PeeseaServerListener {
+      $expectedPath = Join-Path $env:LOCALAPPDATA 'Programs\LM Studio\LM Studio.exe'
+      [pscustomobject]@{
+        Exists = $true; Port = 1234; LocalAddress = '0.0.0.0'
+        ProcessName = 'LM Studio.exe'; ProcessPath = $expectedPath; ExpectedProcessPath = $expectedPath
+      }
+    }
+    Mock Get-PeeseaNvidiaSmiPath { $null }
+    Mock Get-PeeseaLmsJson {
+      $profile = $global:PeeseaSavedDefaultsTargetProfile
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        return @(New-PeeseaCatalogBaseFixture -Profile $profile)
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $profile.ModelKey) {
+        return @(New-PeeseaVariantDetailFixture -Profile $profile)
+      }
+      throw 'Unexpected mocked catalog query in saved-default controller test.'
+    }
+    Mock Get-PeeseaLoadedModels {
+      $global:PeeseaSavedDefaultsLoadedReadCount++
+      if (-not $global:PeeseaSavedDefaultsInitiallyLoaded -and $global:PeeseaSavedDefaultsLoadedReadCount -eq 1) {
+        return @()
+      }
+      return @(
+        New-PeeseaLoadedLlmFixture -Profile $global:PeeseaSavedDefaultsTargetProfile `
+          -ContextLength $global:PeeseaSavedDefaultsContextLength
+      )
+    }
+    Mock Invoke-PeeseaLms {
+      $global:PeeseaSavedDefaultsLmsCalls += ,@($Arguments)
+      [pscustomobject]@{ ExitCode = 0; Output = '' }
+    }
+  }
+
+  It 'reuses a positive current context without claiming saved defaults were reapplied' {
+    $global:PeeseaSavedDefaultsInitiallyLoaded = $true
+    $global:PeeseaSavedDefaultsContextLength = 16384
+
+    $result = Invoke-PeeseaInference -Model Devstral24B
+
+    $result.Ready | Should Be $true
+    $result.Message | Should Match 'reused Devstral24B.*context 16384'
+    $global:PeeseaSavedDefaultsHostOutput -join "`n" | Should Match 'current context 16384; saved defaults were not reapplied'
+    @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -in @('load', 'unload') }).Count | Should Be 0
+  }
+
+  It 'does not report Ready when the saved-default profile has zero final context' {
+    $global:PeeseaSavedDefaultsContextLength = 0
+
+    $result = Invoke-PeeseaInference -Model Devstral24B
+
+    $result.Ready | Should Be $false
+    $result.Message | Should Match 'positive reported context'
+    $result.Message | Should Not Match 'context at least null|at least 0'
+    $loadCalls = @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -eq 'load' })
+    $loadCalls.Count | Should Be 1
+    ($loadCalls[0] -contains '--context-length') | Should Be $false
+    ($loadCalls[0] -contains '--gpu') | Should Be $false
+  }
+
+  It 'treats the optional saved-default policy as legacy-pinned when absent under StrictMode' {
+    $legacy = Get-PeeseaProfile -Model Coder
+    $savedDefaults = Get-PeeseaProfile -Model Devstral24B
+
+    & {
+      Set-StrictMode -Version Latest
+      (Test-PeeseaProfileUsesSavedLoadDefaults -Profile $legacy) | Should Be $false
+      (Test-PeeseaProfileUsesSavedLoadDefaults -Profile $savedDefaults) | Should Be $true
+    }
+  }
+
+  It 'switches from a pinned legacy profile to a saved-default profile without unloading embeddings' {
+    $coder = Get-PeeseaProfile -Model Coder
+    $devstral = Get-PeeseaProfile -Model Devstral24B
+    $global:PeeseaSavedDefaultsTargetProfile = $devstral
+    $global:PeeseaSavedDefaultsLoadedReadCount = 0
+    $global:PeeseaSavedDefaultsLmsCalls = @()
+
+    Mock Get-PeeseaLmsJson {
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        return @(
+          (New-PeeseaCatalogBaseFixture -Profile $coder)
+          (New-PeeseaCatalogBaseFixture -Profile $devstral)
+        )
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $coder.ModelKey) {
+        return @(New-PeeseaVariantDetailFixture -Profile $coder)
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $devstral.ModelKey) {
+        return @(New-PeeseaVariantDetailFixture -Profile $devstral)
+      }
+      throw 'Unexpected mocked catalog query in legacy-to-saved-default switch test.'
+    }
+    Mock Get-PeeseaLoadedModels {
+      $global:PeeseaSavedDefaultsLoadedReadCount++
+      $embedding = New-PeeseaLoadedEmbeddingFixture
+      if ($global:PeeseaSavedDefaultsLoadedReadCount -eq 1) {
+        return @($embedding, (New-PeeseaLoadedLlmFixture -Profile $coder -ContextLength 81920))
+      }
+      if ($global:PeeseaSavedDefaultsLoadedReadCount -eq 2) { return @($embedding) }
+      return @($embedding, (New-PeeseaLoadedLlmFixture -Profile $devstral -ContextLength 32768))
+    }
+
+    $result = Invoke-PeeseaInference -Model Devstral24B
+
+    $result.Ready | Should Be $true
+    $result.Message | Should Match 'Ready: loaded Devstral24B.*context 32768'
+    $loadCalls = @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -eq 'load' })
+    $unloadCalls = @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -eq 'unload' })
+    $loadCalls.Count | Should Be 1
+    $unloadCalls.Count | Should Be 1
+    ($loadCalls[0] -join ' ') | Should Be "load $($devstral.ModelKey) --exact --identifier $($devstral.Identifier)"
+    ($loadCalls[0] -contains '--context-length') | Should Be $false
+    ($loadCalls[0] -contains '--gpu') | Should Be $false
+    $unloadCalls[0][1] | Should Be $coder.Identifier
+    @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -eq 'unload' -and $_[1] -eq 'text-embedding-nomic-embed-text-v1.5' }).Count | Should Be 0
+  }
+
+  It 'switches from a saved-default profile to a pinned legacy profile and preserves embeddings' {
+    $devstral = Get-PeeseaProfile -Model Devstral24B
+    $qwen = Get-PeeseaProfile -Model Qwen27B
+    $global:PeeseaSavedDefaultsTargetProfile = $qwen
+    $global:PeeseaSavedDefaultsLoadedReadCount = 0
+    $global:PeeseaSavedDefaultsLmsCalls = @()
+
+    Mock Get-PeeseaLmsJson {
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        return @(
+          (New-PeeseaCatalogBaseFixture -Profile $devstral)
+          (New-PeeseaCatalogBaseFixture -Profile $qwen)
+        )
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $devstral.ModelKey) {
+        return @(New-PeeseaVariantDetailFixture -Profile $devstral)
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $qwen.ModelKey) {
+        return @(New-PeeseaVariantDetailFixture -Profile $qwen)
+      }
+      throw 'Unexpected mocked catalog query in saved-default-to-legacy switch test.'
+    }
+    Mock Get-PeeseaLoadedModels {
+      $global:PeeseaSavedDefaultsLoadedReadCount++
+      $embedding = New-PeeseaLoadedEmbeddingFixture
+      if ($global:PeeseaSavedDefaultsLoadedReadCount -eq 1) {
+        return @($embedding, (New-PeeseaLoadedLlmFixture -Profile $devstral -ContextLength 32768))
+      }
+      if ($global:PeeseaSavedDefaultsLoadedReadCount -eq 2) { return @($embedding) }
+      return @($embedding, (New-PeeseaLoadedLlmFixture -Profile $qwen -ContextLength 81920))
+    }
+
+    $result = Invoke-PeeseaInference -Model Qwen27B
+
+    $result.Ready | Should Be $true
+    $result.Message | Should Match 'Ready: loaded Qwen27B.*context 81920'
+    $unloadCalls = @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -eq 'unload' })
+    $loadCalls = @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -eq 'load' })
+    $unloadCalls.Count | Should Be 1
+    $unloadCalls[0][1] | Should Be $devstral.Identifier
+    $loadCalls.Count | Should Be 1
+    ($loadCalls[0] -join ' ') | Should Be 'load qwen/qwen3.8-27b --exact --context-length 81920 --gpu max --identifier qwen/qwen3.8-27b'
+    @($global:PeeseaSavedDefaultsLmsCalls | Where-Object { $_[0] -eq 'unload' -and $_[1] -eq 'text-embedding-nomic-embed-text-v1.5' }).Count | Should Be 0
+  }
+
+  AfterEach {
+    Remove-Variable -Name PeeseaSavedDefaultsTargetProfile, PeeseaSavedDefaultsLoadedReadCount, PeeseaSavedDefaultsInitiallyLoaded, PeeseaSavedDefaultsContextLength, PeeseaSavedDefaultsLmsCalls, PeeseaSavedDefaultsHostOutput -Scope Global -ErrorAction SilentlyContinue
+  }
+}
+
+Describe 'Saved-default profile target resolution' {
+  It 'resolves each verified selector to the exact local physical model binding' {
+    $selectorNames = @('Devstral24B', 'GPTOSS20B', 'Gemma26B', 'GLMFlash', 'LagunaXS')
+    $global:PeeseaResolutionProfile = $null
+    $global:PeeseaResolutionBaseFixture = @()
+    $global:PeeseaResolutionDetailFixture = @()
+    Mock Test-PeeseaModelFile { $true }
+    Mock Get-PeeseaLmsJson {
+      $profile = $global:PeeseaResolutionProfile
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        return @($global:PeeseaResolutionBaseFixture)
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $profile.ModelKey -and
+        $profile.IdentityKind -eq 'CatalogVariant') {
+        return @($global:PeeseaResolutionDetailFixture)
+      }
+      throw 'Unexpected mocked catalog query in new-profile target resolution test.'
+    }
+
+    foreach ($selector in $selectorNames) {
+      $global:PeeseaResolutionProfile = Get-PeeseaProfile -Model $selector
+      $profile = $global:PeeseaResolutionProfile
+      if ($profile.IdentityKind -eq 'CatalogVariant') {
+        $global:PeeseaResolutionBaseFixture = @(New-PeeseaCatalogBaseFixture -Profile $profile)
+        $global:PeeseaResolutionDetailFixture = @(New-PeeseaVariantDetailFixture -Profile $profile)
+      } else {
+        $global:PeeseaResolutionBaseFixture = @(
+          New-PeeseaStandaloneModelFixture -Profile $profile -Path $profile.IndexedModelIdentifier -ModelKey $profile.CatalogSelector
+        )
+      }
+
+      $target = Resolve-PeeseaTarget -Profile $profile
+
+      $target.PhysicalPath | Should Be $profile.ModelPath
+      $target.IndexedModelIdentifier | Should Be $profile.IndexedModelIdentifier
+      $target.QuantizationName | Should Be $profile.QuantizationName
+      if ($profile.IdentityKind -eq 'CatalogVariant') {
+        $target.LmsPath | Should Be $profile.ModelKey
+        $target.VariantKey | Should Be $profile.VariantKey
+      } else {
+        $target.LmsPath | Should Be $profile.IndexedModelIdentifier
+        $target.VariantKey | Should Be $null
+      }
+    }
+  }
+
+  It 'rejects changed catalog and standalone physical metadata, including a selection race' {
+    $global:PeeseaResolutionProfile = $null
+    $global:PeeseaResolutionBaseFixture = @()
+    $global:PeeseaResolutionDetailFixture = @()
+    $global:PeeseaResolutionMode = 'normal'
+    $global:PeeseaResolutionBaseReadCount = 0
+    Mock Test-PeeseaModelFile { $true }
+    Mock Get-PeeseaLmsJson {
+      $profile = $global:PeeseaResolutionProfile
+      if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq '--json') {
+        if ($global:PeeseaResolutionMode -eq 'race') {
+          $global:PeeseaResolutionBaseReadCount++
+          if ($global:PeeseaResolutionBaseReadCount -eq 1) {
+            return @(New-PeeseaCatalogBaseFixture -Profile $profile)
+          }
+          return @(New-PeeseaCatalogBaseFixture -Profile $profile -SelectedVariant ($profile.ModelKey + '@q4_changed'))
+        }
+        return @($global:PeeseaResolutionBaseFixture)
+      }
+      if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'ls' -and $Arguments[1] -eq $profile.ModelKey) {
+        return @($global:PeeseaResolutionDetailFixture)
+      }
+      throw 'Unexpected mocked catalog query in identity mutation test.'
+    }
+    $assertTargetRejected = {
+      param($Profile)
+      $threw = $false
+      try { Resolve-PeeseaTarget -Profile $Profile | Out-Null } catch { $threw = $true }
+      $threw | Should Be $true
+    }
+
+    foreach ($selector in @('Devstral24B', 'Gemma26B', 'GLMFlash')) {
+      $profile = Get-PeeseaProfile -Model $selector
+      $global:PeeseaResolutionProfile = $profile
+      $global:PeeseaResolutionBaseFixture = @(New-PeeseaCatalogBaseFixture -Profile $profile)
+      $global:PeeseaResolutionDetailFixture = @(New-PeeseaVariantDetailFixture -Profile $profile -IndexedModelIdentifier ($profile.ModelKey + '@lmstudio-community/wrong-file.gguf'))
+      & $assertTargetRejected $profile
+
+      $global:PeeseaResolutionDetailFixture = @(New-PeeseaVariantDetailFixture -Profile $profile -Path $profile.IndexedModelIdentifier)
+      & $assertTargetRejected $profile
+
+      $global:PeeseaResolutionDetailFixture = @(New-PeeseaVariantDetailFixture -Profile $profile -QuantizationName 'UNEXPECTED')
+      & $assertTargetRejected $profile
+
+      $global:PeeseaResolutionDetailFixture = @(New-PeeseaVariantDetailFixture -Profile $profile -VariantKey ($profile.ModelKey + '@q4_wrong'))
+      & $assertTargetRejected $profile
+    }
+
+    $global:PeeseaResolutionProfile = Get-PeeseaProfile -Model Devstral24B
+    $devstral = $global:PeeseaResolutionProfile
+    $global:PeeseaResolutionBaseFixture = @(New-PeeseaCatalogBaseFixture -Profile $devstral -SelectedVariant ($devstral.ModelKey + '@q4_wrong'))
+    $global:PeeseaResolutionDetailFixture = @(New-PeeseaVariantDetailFixture -Profile $devstral)
+    & $assertTargetRejected $devstral
+
+    $global:PeeseaResolutionBaseFixture = @(
+      (New-PeeseaCatalogBaseFixture -Profile $devstral)
+      (New-PeeseaCatalogBaseFixture -Profile $devstral)
+    )
+    & $assertTargetRejected $devstral
+
+    $global:PeeseaResolutionBaseFixture = @(New-PeeseaCatalogBaseFixture -Profile $devstral -DeviceIdentifier 'remote-device')
+    & $assertTargetRejected $devstral
+
+    $global:PeeseaResolutionProfile = Get-PeeseaProfile -Model GPTOSS20B
+    $gpt = $global:PeeseaResolutionProfile
+    $global:PeeseaResolutionBaseFixture = @(
+      (New-PeeseaStandaloneModelFixture -Profile $gpt -Path 'unsloth/gpt-oss-20b-GGUF/wrong.gguf')
+    )
+    & $assertTargetRejected $gpt
+
+    $wrongGptIndex = New-PeeseaStandaloneModelFixture -Profile $gpt -Path $gpt.IndexedModelIdentifier
+    $wrongGptIndex.indexedModelIdentifier = 'unsloth/gpt-oss-20b-GGUF/wrong.gguf'
+    $global:PeeseaResolutionBaseFixture = @($wrongGptIndex)
+    & $assertTargetRejected $gpt
+
+    $global:PeeseaResolutionProfile = Get-PeeseaProfile -Model LagunaXS
+    $laguna = $global:PeeseaResolutionProfile
+    $unknownLagunaQuant = New-PeeseaStandaloneModelFixture -Profile $laguna -Path $laguna.IndexedModelIdentifier
+    $unknownLagunaQuant | Add-Member -NotePropertyName quantization -NotePropertyValue ([pscustomobject]@{ name = 'Q4_K_M'; bits = 4 })
+    $global:PeeseaResolutionBaseFixture = @($unknownLagunaQuant)
+    & $assertTargetRejected $laguna
+
+    $escapeLaguna = New-PeeseaStandaloneModelFixture -Profile $laguna -Path '../../outside/wrong.gguf'
+    $global:PeeseaResolutionBaseFixture = @($escapeLaguna)
+    & $assertTargetRejected $laguna
+
+    $global:PeeseaResolutionProfile = Get-PeeseaProfile -Model GLMFlash
+    $glm = $global:PeeseaResolutionProfile
+    $global:PeeseaResolutionMode = 'race'
+    $global:PeeseaResolutionBaseReadCount = 0
+    $global:PeeseaResolutionDetailFixture = @(New-PeeseaVariantDetailFixture -Profile $glm)
+    & $assertTargetRejected $glm
+  }
+
+  AfterEach {
+    Remove-Variable -Name PeeseaResolutionProfile, PeeseaResolutionBaseFixture, PeeseaResolutionDetailFixture, PeeseaResolutionMode, PeeseaResolutionBaseReadCount -Scope Global -ErrorAction SilentlyContinue
   }
 }
